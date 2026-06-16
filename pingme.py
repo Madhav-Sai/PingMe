@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              PingMe — Advanced Ping Scanner v3.0               ║
-║   Subnet Info · Ping Scan · TTL Fingerprint · Reverse DNS      ║
-║   History · Diff · IP Classify · Retry · Resume · Rate-Limit   ║
+║              PingMe — Advanced Ping Scanner v3.0 by Madhav       ║
+║   Subnet Info · Ping Scan · TTL Fingerprint · Reverse DNS        ║
+║   History · Diff · IP Classify · Retry · Resume · Rate-Limit     ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -296,7 +296,7 @@ def banner(no_banner: bool = False):
         return
     ts = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
     lines = [
-        f"{C.TEAL}{C.BOLD}",
+        f"{C.RED}{C.BOLD}",
         "  ██████╗ ██╗███╗   ██╗ ██████╗ ███╗   ███╗███████╗",
         "  ██╔══██╗██║████╗  ██║██╔════╝ ████╗ ████║██╔════╝",
         "  ██████╔╝██║██╔██╗ ██║██║  ███╗██╔████╔██║█████╗  ",
@@ -304,7 +304,7 @@ def banner(no_banner: bool = False):
         "  ██║     ██║██║ ╚████║╚██████╔╝██║ ╚═╝ ██║███████╗",
         "  ╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝",
         f"{C.RESET}",
-        f"  {C.PURPLE}Advanced Ping Scanner v3.0{C.RESET}  {C.DIM}│{C.RESET}  {C.DIM}{ts}{C.RESET}",
+        f"  {C.PURPLE}Advanced Ping Scanner v3.0 By Madhav {C.RESET}  {C.DIM}│{C.RESET}  {C.DIM}{ts}{C.RESET}",
         f"  {C.DIM}{'─' * 70}{C.RESET}",
     ]
     print("\n".join(lines))
