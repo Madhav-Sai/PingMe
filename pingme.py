@@ -433,90 +433,173 @@ class RateLimiter:
 
 
 # ─────────────────────────────────────────────────────────────────
+# TOOL SELECTION  (cached at module level — FIX 4)
+# ─────────────────────────────────────────────────────────────────
+_FPING_PATH: str | None = shutil.which("fping")
+_PING_PATH:  str | None = shutil.which("ping")
+
+# User-selected tool: "auto" | "fping" | "ping"
+_PING_TOOL: str = "auto"
+
+
+def _use_fping() -> bool:
+    """Return True if fping should be used for this scan."""
+    if _PING_TOOL == "fping":
+        return _FPING_PATH is not None
+    if _PING_TOOL == "ping":
+        return False
+    # auto: prefer fping if available
+    return _FPING_PATH is not None
+
+
+def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, int | None]:
+    """
+    Ping using fping. Returns (alive, ttl).
+
+    FIX 1: fping is the ONLY backend when available — OS ping never runs after.
+    FIX 2: Parse xmt/rcv summary; fail-safe to False (not returncode) if unparseable.
+    FIX 6: Add -p (inter-packet delay in ms) to avoid back-to-back flooding.
+    """
+    # Inter-packet delay: spread packets evenly within timeout window, min 10ms
+    inter_ms = max(10, int((timeout * 1000) / max(count, 1)))
+
+    try:
+        r = subprocess.run(
+            [
+                _FPING_PATH, "-c", str(count),
+                "-t", str(timeout * 1000),  # per-packet timeout (ms)
+                "-p", str(inter_ms),        # inter-packet gap (ms)  FIX 6
+                ip,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=(timeout * count) + 4,
+        )
+        stderr_out = r.stderr.decode(errors="ignore")
+
+        # Parse "ip : xmt/rcv/%loss = N/M/P%" — only rcv>0 means alive  FIX 2
+        for line in stderr_out.splitlines():
+            if "xmt/rcv" in line and "xmt/rcv/%loss =" in line:
+                try:
+                    stats = line.split("xmt/rcv/%loss =")[1].strip()
+                    parts = stats.split("/")
+                    rcv   = int(parts[1].strip())
+                    # Also try to parse TTL from per-packet lines if available
+                    ttl   = None
+                    for pkt_line in stderr_out.splitlines():
+                        ttl_m = re.search(r'ttl[=:](\d+)', pkt_line, re.IGNORECASE)
+                        if ttl_m:
+                            ttl = int(ttl_m.group(1))
+                            break
+                    return rcv > 0, ttl
+                except (IndexError, ValueError):
+                    pass  # fall through to fail-safe
+        # FIX 2: no parseable summary → fail-safe dead, never trust exit code
+        return False, None
+
+    except subprocess.TimeoutExpired:
+        return False, None
+    except Exception:
+        # FIX 7: fping found but failed to run (permission, corrupt binary, etc.)
+        # Signal caller to fall back to OS ping
+        raise
+
+
+def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, int | None]:
+    """
+    Ping using OS ping. Returns (alive, ttl).
+
+    FIX 3: Try with -i first; fall back without it if it fails (some distros reject it).
+    Parses "X received" from stdout — the only trustworthy alive signal.
+    """
+    if sys.platform == "win32":
+        cmds         = [["ping", "-n", str(count), "-w", str(timeout * 1000), ip]]
+        proc_timeout = (timeout * count) + 3
+    else:
+        # Try with inter-packet delay first, fall back without it  FIX 3
+        cmds = [
+            ["ping", "-c", str(count), "-W", str(timeout), "-i", "0.5", ip],
+            ["ping", "-c", str(count), "-W", str(timeout), ip],
+        ]
+        proc_timeout = (timeout * count) + (0.5 * count) + 3
+
+    stdout = ""
+    for cmd in cmds:
+        try:
+            r = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=proc_timeout,
+            )
+            stdout = r.stdout.decode(errors="ignore")
+            break  # succeeded — don't try fallback
+        except subprocess.TimeoutExpired:
+            return False, None
+        except Exception:
+            continue  # try next command variant
+
+    if not stdout:
+        return False, None
+
+    # Parse "X received" — the only trustworthy alive indicator
+    m = re.search(r'(\d+)\s+(?:packets?\s+)?received', stdout, re.IGNORECASE)
+    alive = (int(m.group(1)) > 0) if m else False
+
+    # Parse TTL
+    ttl = None
+    ttl_m = re.search(r'ttl[=:](\d+)', stdout, re.IGNORECASE)
+    if ttl_m:
+        ttl = int(ttl_m.group(1))
+
+    return alive, ttl
+
+
+# ─────────────────────────────────────────────────────────────────
 # SINGLE-IP PING  — returns rich result dict
 # ─────────────────────────────────────────────────────────────────
 def _ping_one(
-    ip: str,
-    timeout:      int         = 2,
-    count:        int         = 3,
+    ip:           str,
+    timeout:      int              = 2,
+    count:        int              = 3,
     rate_limiter: RateLimiter | None = None,
-    do_dns:       bool        = False,
+    do_dns:       bool             = False,
 ) -> dict:
     """
-    Ping one IP.  Returns:
-      { ip, alive, ttl, os_guess, hostname, scope, rfc }
+    Ping one IP. Cleanly separated fping / OS-ping backends.
+    Returns: { ip, alive, ttl, os_guess, hostname, scope, rfc }
 
-    FALSE-POSITIVE PREVENTION:
-      fping exits 0 on ANY ICMP response (incl. unreachable/prohibited).
-      We parse the xmt/rcv/%loss summary line from stderr directly.
-      For OS ping we parse "X received" from stdout.
+    FIX 1: fping and OS ping are mutually exclusive — never both run.
+    FIX 2: fping result parsed from stderr, fail-safe to False.
+    FIX 3: OS ping falls back without -i flag if rejected by kernel.
+    FIX 4: _use_fping() uses cached path, no per-call filesystem search.
+    FIX 6: fping uses -p for inter-packet spacing.
+    FIX 7: fping exception falls through cleanly to OS ping.
     """
     if rate_limiter:
         rate_limiter.acquire(count)
 
-    ttl:      int | None = None
-    alive:    bool       = False
-    raw_out:  str        = ""
+    alive: bool      = False
+    ttl:   int | None = None
 
-    # ── fping path ───────────────────────────────────────────────
-    if shutil.which("fping"):
+    if _use_fping():
         try:
-            r = subprocess.run(
-                ["fping", "-c", str(count), "-t", str(timeout * 1000), ip],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=(timeout * count) + 4,
-            )
-            stderr_out = r.stderr.decode(errors="ignore")
-            raw_out    = stderr_out
-            for line in stderr_out.splitlines():
-                if "xmt/rcv" in line:
-                    try:
-                        stats = line.split("xmt/rcv/%loss =")[1].strip()
-                        parts = stats.split("/")
-                        rcv   = int(parts[1].strip())
-                        alive = rcv > 0
-                    except (IndexError, ValueError):
-                        alive = r.returncode == 0
-                    break
-            else:
-                alive = r.returncode == 0
-        except subprocess.TimeoutExpired:
-            alive = False
+            alive, ttl = _ping_via_fping(ip, timeout, count)
         except Exception:
-            pass   # fall through to OS ping
-
-    # ── OS ping path (also used to grab TTL) ────────────────────
-    if sys.platform == "win32":
-        cmd          = ["ping", "-n", str(count), "-w", str(timeout * 1000), ip]
-        proc_timeout = (timeout * count) + 3
+            # FIX 7: fping found but failed to execute → fall through to OS ping
+            try:
+                alive, ttl = _ping_via_system(ip, timeout, count)
+            except Exception:
+                alive, ttl = False, None
     else:
-        cmd          = ["ping", "-c", str(count), "-W", str(timeout), "-i", "0.5", ip]
-        proc_timeout = (timeout * count) + (0.5 * count) + 3
-
-    try:
-        r2 = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=proc_timeout,
-        )
-        stdout = r2.stdout.decode(errors="ignore")
-        raw_out += stdout
-
-        # If we didn't run fping, determine alive from ping stdout
-        if not shutil.which("fping"):
-            m = re.search(r'(\d+)\s+(?:packets?\s+)?received', stdout, re.IGNORECASE)
-            alive = (int(m.group(1)) > 0) if m else (r2.returncode == 0)
-
-        # Parse TTL from any "ttl=N" or "TTL=N" in ping output
-        ttl_m = re.search(r'ttl[=:](\d+)', stdout, re.IGNORECASE)
-        if ttl_m:
-            ttl = int(ttl_m.group(1))
-    except subprocess.TimeoutExpired:
-        if not shutil.which("fping"):
-            alive = False
-    except Exception:
-        if not shutil.which("fping"):
-            alive = False
+        if _PING_PATH is None:
+            # No tool available at all
+            alive, ttl = False, None
+        else:
+            try:
+                alive, ttl = _ping_via_system(ip, timeout, count)
+            except Exception:
+                alive, ttl = False, None
 
     os_guess = ttl_to_os(ttl) if alive else ""
     hostname = reverse_dns(ip) if (alive and do_dns) else ""
@@ -871,22 +954,79 @@ def read_ip_file(path: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────
-# CHECK DEPENDENCIES
+# CHECK DEPENDENCIES + TOOL SELECTION  (FIX 5)
 # ─────────────────────────────────────────────────────────────────
-def check_deps():
-    has_fping = shutil.which("fping") is not None
-    has_ping  = shutil.which("ping")  is not None
-    print(f"\n  {C.CYAN}[deps]{C.RESET}", end="  ")
+def check_deps(ping_tool: str = "auto") -> str:
+    """
+    Detect available ping tools, honour --ping-tool flag, and
+    offer an interactive prompt if neither fping nor ping is found.
+    Returns the resolved tool name: "fping" | "ping".
+    """
+    global _PING_TOOL, _FPING_PATH, _PING_PATH
+
+    has_fping = _FPING_PATH is not None
+    has_ping  = _PING_PATH  is not None
+
+    # ── Print availability ──────────────────────────────────────
+    print(f"\n  {C.CYAN}[tools]{C.RESET}")
+    print(f"  {C.DIM}┌{'─'*44}┐{C.RESET}")
     if has_fping:
-        print(f"{C.GREEN}fping ✔{C.RESET}", end="  ")
+        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}fping  ✔  {_FPING_PATH:<32}{C.RESET}{C.DIM}│{C.RESET}")
     else:
-        print(f"{C.YELLOW}fping ✘ (using system ping — slower){C.RESET}", end="  ")
+        print(f"  {C.DIM}│{C.RESET}  {C.RED}fping  ✘  not found{'':<26}{C.RESET}{C.DIM}│{C.RESET}")
     if has_ping:
-        print(f"{C.GREEN}ping ✔{C.RESET}")
+        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}ping   ✔  {_PING_PATH:<32}{C.RESET}{C.DIM}│{C.RESET}")
     else:
-        print(f"{C.RED}ping ✘{C.RESET}")
+        print(f"  {C.DIM}│{C.RESET}  {C.RED}ping   ✘  not found{'':<26}{C.RESET}{C.DIM}│{C.RESET}")
+    print(f"  {C.DIM}└{'─'*44}┘{C.RESET}")
+
+    # ── Neither available → interactive fallback ────────────────
+    if not has_fping and not has_ping:
+        print(f"\n  {C.RED}✗ No ping tool found on PATH.{C.RESET}")
+        print(f"  {C.YELLOW}Install one of:{C.RESET}")
+        print(f"  {C.DIM}  sudo apt install fping   # Debian/Ubuntu/Kali")
+        print(f"       sudo dnf install fping   # RHEL/Fedora")
+        print(f"       brew install fping       # macOS{C.RESET}")
+        sys.exit(3)
+
+    # ── Honour --ping-tool flag ─────────────────────────────────
+    if ping_tool == "fping":
         if not has_fping:
-            print(C.err("  ✗ Neither fping nor ping found.")); sys.exit(3)
+            print(f"  {C.RED}✗ --ping-tool=fping requested but fping not found.{C.RESET}")
+            sys.exit(3)
+        _PING_TOOL = "fping"
+    elif ping_tool == "ping":
+        if not has_ping:
+            print(f"  {C.RED}✗ --ping-tool=ping requested but ping not found.{C.RESET}")
+            sys.exit(3)
+        _PING_TOOL = "ping"
+    else:
+        # auto mode: prompt user if both are available
+        if has_fping and has_ping and sys.stdin.isatty():
+            print(f"\n  {C.BOLD}{C.CYAN}Select ping backend:{C.RESET}")
+            print(f"  {C.GREEN}  [1]{C.RESET}  fping  {C.DIM}(faster, better for large subnets){C.RESET}")
+            print(f"  {C.YELLOW}  [2]{C.RESET}  ping   {C.DIM}(OS built-in, more compatible){C.RESET}")
+            print(f"  {C.DIM}  [↵]  auto-select (fping){C.RESET}\n")
+            try:
+                choice = input(f"  {C.BOLD}Choice [1/2, default=1]:{C.RESET} ").strip()
+            except (EOFError, KeyboardInterrupt):
+                choice = ""
+            if choice == "2":
+                _PING_TOOL = "ping"
+                print(f"  {C.YELLOW}→ Using: ping{C.RESET}\n")
+            else:
+                _PING_TOOL = "fping"
+                print(f"  {C.GREEN}→ Using: fping{C.RESET}\n")
+        elif has_fping:
+            _PING_TOOL = "fping"
+        else:
+            _PING_TOOL = "ping"
+
+    # Print resolved selection
+    tool_label = f"{C.GREEN}fping{C.RESET}" if _PING_TOOL == "fping" else f"{C.YELLOW}ping{C.RESET}"
+    print(f"  {C.DIM}Backend:{C.RESET}  {tool_label}")
+
+    return _PING_TOOL
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -969,6 +1109,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Reverse DNS lookup for alive hosts")
     sg.add_argument("--resume",       action="store_true",
                     help="Resume a previously interrupted scan")
+    sg.add_argument("--ping-tool",     default="auto",
+                    choices=["auto", "fping", "ping"],
+                    help="Ping backend: auto (default) | fping | ping")
     sg.add_argument("--fast",         action="store_true",
                     help="Fast mode: threads=100 timeout=1s count=1 (less accurate)")
     sg.add_argument("--no-history",   action="store_true",
@@ -1060,7 +1203,7 @@ def main():
 
     # ── scan ────────────────────────────────────────────────────
     if args.scan or args.file:
-        check_deps()
+        check_deps(ping_tool=args.ping_tool)
 
         if args.fast:
             args.threads = 100; args.timeout = 1; args.count = 1
