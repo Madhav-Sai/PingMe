@@ -320,8 +320,15 @@ def show_subnet_info(cidr: str) -> ipaddress.IPv4Network:
         print(C.err(f"\n  ✗ Invalid CIDR: {e}"))
         sys.exit(1)
 
-    hosts  = list(net.hosts())
-    total  = len(hosts)
+    total  = max(net.num_addresses - 2, 0)
+    hosts_iter = net.hosts()
+    first_host = next(hosts_iter, None)
+    last_host = None
+    if total > 0:
+        try:
+            last_host = ipaddress.ip_address(int(net.broadcast_address) - 1)
+        except Exception:
+            last_host = None
     prefix = net.prefixlen
     LABEL_W, VALUE_W = 24, 26
     BW = LABEL_W + VALUE_W + 3
@@ -352,8 +359,8 @@ def show_subnet_info(cidr: str) -> ipaddress.IPv4Network:
     print(row("IP Version",        f"IPv{net.version}",        C.CYAN))
     if total > 0:
         print(sep)
-        print(row("First Host",       str(hosts[0]),           C.GREEN))
-        print(row("Last Host",        str(hosts[-1]),          C.GREEN))
+        print(row("First Host",       str(first_host),         C.GREEN))
+        print(row("Last Host",        str(last_host),          C.GREEN))
         print(row("Total Usable IPs", f"{total:,}",            C.BOLD + C.LIME))
     print(bot)
 
@@ -749,9 +756,7 @@ def run_scan(
         save_partial(label, all_done, remaining)
         print(f"  {C.YELLOW}Partial results saved. Re-run with --resume to continue.{C.RESET}\n")
         # Return what we have so alive/dead files are still written
-        return all_done + [{"ip": ip, "alive": False, "ttl": None,
-                             "os_guess": "", "hostname": "", "scope": "", "rfc": ""}
-                           for ip in remaining]
+        return all_done
 
     print(f"\n\n  {C.DIM}Scan finished in {elapsed:.1f}s{C.RESET}\n")
     clear_partial(label)
@@ -1202,7 +1207,7 @@ def main():
             print(f"  {C.DIM}[exclude] Skipped {skipped} IPs{C.RESET}")
 
     # ── scan ────────────────────────────────────────────────────
-    if args.scan or args.file:
+    if args.scan:
         check_deps(ping_tool=args.ping_tool)
 
         if args.fast:
