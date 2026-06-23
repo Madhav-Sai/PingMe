@@ -80,7 +80,7 @@ It's built for network engineers, sysadmins, pentesters, and anyone who needs to
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/pingme.git
+git clone https://github.com/Madhav-Sai/pingme.git
 cd pingme
 
 # Make it executable
