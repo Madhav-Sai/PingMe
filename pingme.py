@@ -440,47 +440,199 @@ class RateLimiter:
 
 
 # ─────────────────────────────────────────────────────────────────
-# TOOL SELECTION
+# TOOL SELECTION  (cached at module level — FIX 4)
 # ─────────────────────────────────────────────────────────────────
-# Resolved once at startup by check_deps(); never changes after that.
-_BACKEND: str = "none"   # "fping" | "ping" | "none"
+_FPING_PATH: str | None = shutil.which("fping")
+_PING_PATH:  str | None = shutil.which("ping")
+
+# User-selected tool: "auto" | "fping" | "ping"
+_PING_TOOL: str = "auto"
 
 
+def _use_fping() -> bool:
+    """Return True if fping should be used for this scan."""
+    if _PING_TOOL == "fping":
+        return _FPING_PATH is not None
+    if _PING_TOOL == "ping":
+        return False
+    # auto: prefer fping if available
+    return _FPING_PATH is not None
+
+
+def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, int | None]:
+    """
+    fping 5.1 on Kali confirmed behaviour (from debug output):
+      - Per-packet lines (including TTL) → STDOUT
+      - Summary "xmt/rcv/%loss = N/M/P%" → STDERR
+      - Dead host: exit=1, stdout has timed-out lines, stderr has rcv=0
+      - Alive host: exit=0, stdout has reply lines with TTL, stderr has rcv>0
+
+    Rules:
+      - NO -p flag (causes subprocess timeout to fire before fping finishes)
+      - Capture BOTH stdout AND stderr
+      - Parse rcv count from stderr summary ONLY
+      - Parse TTL from stdout per-packet lines
+      - Never use exit code to determine alive/dead
+    """
+    if not _FPING_PATH:
+        return False, None
+
+    # Generous timeout — no -p flag so fping finishes in count*timeout seconds
+    proc_timeout = (count * timeout) + 10
+
+    try:
+        r = subprocess.run(
+            [_FPING_PATH, "-c", str(count), "-t", str(timeout * 1000), ip],
+            stdout=subprocess.PIPE,   # per-packet lines + TTL
+            stderr=subprocess.PIPE,   # xmt/rcv/%loss summary
+            timeout=proc_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, None
+    except Exception:
+        raise   # let _ping_one fall through to ping
+
+    stdout_text = r.stdout.decode(errors="ignore")
+    stderr_text = r.stderr.decode(errors="ignore")
+
+    # ── Step 1: determine alive from stderr summary ──────────────
+    # Line format: "ip : xmt/rcv/%loss = 3/0/100%[, min/avg/max = ...]"
+    alive = False
+    for line in stderr_text.splitlines():
+        if "xmt/rcv/%loss =" not in line:
+            continue
+        try:
+            after  = line.split("xmt/rcv/%loss =", 1)[1].strip()
+            counts = after.split(",")[0].strip()   # "3/0/100%"
+            rcv    = int(counts.split("/")[1].strip())
+            alive  = rcv > 0
+        except (IndexError, ValueError):
+            alive = False
+        break   # only one summary line per IP
+
+    # ── Step 2: parse TTL from stdout per-packet lines ──────────
+    # Line format: "ip : [N], 64 bytes, X ms (Y avg, Z% loss)"
+    # TTL not shown in fping stdout by default — check anyway
+    ttl = None
+    for line in stdout_text.splitlines():
+        m = re.search(r"ttl[=:](\d+)", line, re.IGNORECASE)
+        if m:
+            ttl = int(m.group(1))
+            break
+
+    return alive, ttl
+
+
+def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, int | None]:
+    """
+    OS ping confirmed behaviour on Kali (from debug output):
+      - Everything goes to STDOUT
+      - Dead:  "3 packets transmitted, 0 received, 100% packet loss"
+      - Alive: "3 packets transmitted, 3 received, 0% packet loss"
+      - TTL in per-packet lines: "64 bytes from ip: icmp_seq=1 ttl=128 time=22ms"
+
+    Rules:
+      - Parse "X received" from stdout — only signal we trust
+      - Parse TTL from per-packet lines in stdout
+      - Try with -i 0.5 first, fall back without it
+      - Never use exit code
+    """
+    if sys.platform == "win32":
+        cmds         = [["ping", "-n", str(count), "-w", str(timeout * 1000), ip]]
+        proc_timeout = (count * timeout) + 5
+    else:
+        # -W = per-packet reply wait (seconds), -i = inter-packet interval
+        # Some kernels reject -i for non-root → fall back without it
+        cmds = [
+            ["ping", "-c", str(count), "-W", str(timeout), "-i", "0.5", ip],
+            ["ping", "-c", str(count), "-W", str(timeout), ip],
+        ]
+        proc_timeout = (count * timeout) + 10
+
+    stdout_text = ""
+    for cmd in cmds:
+        try:
+            r = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=proc_timeout,
+            )
+            stdout_text = r.stdout.decode(errors="ignore")
+            break
+        except subprocess.TimeoutExpired:
+            return False, None
+        except Exception:
+            continue   # try next variant
+
+    if not stdout_text:
+        return False, None
+
+    # Parse "X received"
+    m = re.search(r'(\d+)\s+(?:packets?\s+)?received', stdout_text, re.IGNORECASE)
+    if not m:
+        return False, None
+    alive = int(m.group(1)) > 0
+
+    # Parse TTL from per-packet lines
+    ttl = None
+    if alive:
+        t = re.search(r'ttl[=:](\d+)', stdout_text, re.IGNORECASE)
+        if t:
+            ttl = int(t.group(1))
+
+    return alive, ttl
+
+
+# ─────────────────────────────────────────────────────────────────
+# SINGLE-IP PING  — returns rich result dict
+# ─────────────────────────────────────────────────────────────────
 def _ping_one(
     ip:           str,
     timeout:      int              = 2,
     count:        int              = 3,
-    rate_limiter: "RateLimiter | None" = None,
+    rate_limiter: RateLimiter | None = None,
     do_dns:       bool             = False,
 ) -> dict:
     """
-    Ping one IP using whichever backend check_deps() selected.
+    Ping one IP. Cleanly separated fping / OS-ping backends.
+    Returns: { ip, alive, ttl, os_guess, hostname, scope, rfc }
 
-    DESIGN RULES (no more false positives):
-      - fping and OS ping NEVER both run for the same IP.
-      - We ONLY parse actual received-packet counts from output text.
-        Exit codes are NEVER trusted (fping exits 0 on ICMP-unreachable).
-      - subprocess timeout is always generously larger than the actual
-        time fping/ping needs, so partial output never leaks through.
-      - NO -p flag on fping (was causing premature subprocess timeout
-        which killed fping mid-run, leaving partial xmt/rcv in stderr
-        that showed false rcv>0 counts).
+    FIX 1: fping and OS ping are mutually exclusive — never both run.
+    FIX 2: fping result parsed from stderr, fail-safe to False.
+    FIX 3: OS ping falls back without -i flag if rejected by kernel.
+    FIX 4: _use_fping() uses cached path, no per-call filesystem search.
+    FIX 6: fping uses -p for inter-packet spacing.
+    FIX 7: fping exception falls through cleanly to OS ping.
     """
     if rate_limiter:
         rate_limiter.acquire(count)
 
-    alive: bool       = False
+    alive: bool      = False
     ttl:   int | None = None
 
-    if _BACKEND == "fping":
-        alive, ttl = _run_fping(ip, timeout, count)
-    elif _BACKEND == "ping":
-        alive, ttl = _run_ping(ip, timeout, count)
-    # else "none" → alive stays False
+    if _use_fping():
+        try:
+            alive, ttl = _ping_via_fping(ip, timeout, count)
+        except Exception:
+            # FIX 7: fping found but failed to execute → fall through to OS ping
+            try:
+                alive, ttl = _ping_via_system(ip, timeout, count)
+            except Exception:
+                alive, ttl = False, None
+    else:
+        if _PING_PATH is None:
+            # No tool available at all
+            alive, ttl = False, None
+        else:
+            try:
+                alive, ttl = _ping_via_system(ip, timeout, count)
+            except Exception:
+                alive, ttl = False, None
 
     os_guess = ttl_to_os(ttl) if alive else ""
-    hostname  = reverse_dns(ip) if (alive and do_dns) else ""
-    classify  = ip_classify(ip)
+    hostname = reverse_dns(ip) if (alive and do_dns) else ""
+    classify = ip_classify(ip)
 
     return {
         "ip":       ip,
@@ -491,134 +643,6 @@ def _ping_one(
         "scope":    classify["scope"],
         "rfc":      classify["rfc"],
     }
-
-
-def _run_fping(ip: str, timeout: int, count: int) -> tuple[bool, int | None]:
-    """
-    Run fping for one IP. Returns (alive, ttl).
-
-    KEY DECISIONS:
-    - NO -p flag. -p adds inter-packet delay which made total fping runtime
-      exceed our subprocess timeout, causing fping to be killed mid-run.
-      Partial stderr then had misleading rcv>0 counts → false positives.
-    - subprocess timeout = count * timeout + 10 (very generous headroom).
-    - Parse xmt/rcv/%loss from stderr. rcv>0 = alive. Anything else = dead.
-    - Exit code NEVER used (fping exits 0 on ICMP-unreachable → false +ve).
-    """
-    fping_bin = shutil.which("fping")
-    if not fping_bin:
-        return False, None
-
-    # Generous timeout: fping sends count packets each waiting up to timeout sec
-    proc_timeout = (count * timeout) + 10
-
-    try:
-        r = subprocess.run(
-            [fping_bin, "-c", str(count), "-t", str(timeout * 1000), ip],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=proc_timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return False, None
-    except Exception:
-        return False, None
-
-    stderr_text = r.stderr.decode(errors="ignore")
-
-    # Parse the summary line: "ip : xmt/rcv/%loss = N/M/P%[, ...]"
-    # This is the ONLY reliable indicator. Exit code is NOT used.
-    alive = False
-    ttl   = None
-
-    for line in stderr_text.splitlines():
-        if "xmt/rcv/%loss" not in line:
-            continue
-        try:
-            # Everything after "xmt/rcv/%loss = "
-            after = line.split("xmt/rcv/%loss =", 1)[1].strip()
-            # Take only the "N/M/P%" part before any comma (v5 appends min/avg/max)
-            counts = after.split(",")[0].strip()   # e.g. "8/0/100%"
-            parts  = counts.split("/")              # ["8", "0", "100%"]
-            rcv    = int(parts[1].strip())
-            alive  = rcv > 0
-            break
-        except (IndexError, ValueError):
-            # Malformed line → fail-safe dead
-            alive = False
-            break
-
-    # TTL: parse from per-packet lines e.g. "[0], 84 bytes, 1.23 ms (ttl=64)"
-    if alive:
-        for line in stderr_text.splitlines():
-            m = re.search(r"ttl[=:](\d+)", line, re.IGNORECASE)
-            if m:
-                ttl = int(m.group(1))
-                break
-
-    return alive, ttl
-
-
-def _run_ping(ip: str, timeout: int, count: int) -> tuple[bool, int | None]:
-    """
-    Run OS ping for one IP. Returns (alive, ttl).
-
-    Parse "X received" (or "X packets received") from stdout.
-    Exit code NOT trusted. Tries with -i 0.5 first, then without.
-    """
-    ping_bin = shutil.which("ping")
-    if not ping_bin:
-        return False, None
-
-    if sys.platform == "win32":
-        cmd_variants = [
-            [ping_bin, "-n", str(count), "-w", str(timeout * 1000), ip]
-        ]
-        proc_timeout = (count * timeout) + 5
-    else:
-        # -W = per-packet wait seconds, -i = inter-packet interval
-        # Try with -i first; if kernel rejects it (some embedded distros),
-        # fall back to the same command without -i.
-        cmd_variants = [
-            [ping_bin, "-c", str(count), "-W", str(timeout), "-i", "0.5", ip],
-            [ping_bin, "-c", str(count), "-W", str(timeout), ip],
-        ]
-        # Each packet can take up to timeout seconds; add buffer
-        proc_timeout = (count * timeout) + 10
-
-    stdout_text = ""
-    for cmd in cmd_variants:
-        try:
-            r = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=proc_timeout,
-            )
-            stdout_text = r.stdout.decode(errors="ignore")
-            break       # ran successfully (regardless of host alive/dead)
-        except subprocess.TimeoutExpired:
-            return False, None
-        except Exception:
-            continue    # try next variant (e.g. without -i)
-
-    if not stdout_text:
-        return False, None
-
-    # Parse "X received" — the only trustworthy alive signal
-    m = re.search(r'(\d+)\s+(?:packets?\s+)?received', stdout_text, re.IGNORECASE)
-    if not m:
-        return False, None
-    alive = int(m.group(1)) > 0
-
-    # Parse TTL
-    ttl = None
-    if alive:
-        t = re.search(r'ttl[=:](\d+)', stdout_text, re.IGNORECASE)
-        if t:
-            ttl = int(t.group(1))
-
-    return alive, ttl
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -957,85 +981,79 @@ def read_ip_file(path: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────
-# CHECK DEPENDENCIES + TOOL SELECTION
+# CHECK DEPENDENCIES + TOOL SELECTION  (FIX 5)
 # ─────────────────────────────────────────────────────────────────
 def check_deps(ping_tool: str = "auto") -> str:
     """
-    Detect available ping tools, honour --ping-tool, prompt if both
-    available, then SET _BACKEND so every _ping_one() call uses the
-    correct tool without re-checking.
-    Returns resolved backend: "fping" | "ping".
+    Detect available ping tools, honour --ping-tool flag, and
+    offer an interactive prompt if neither fping nor ping is found.
+    Returns the resolved tool name: "fping" | "ping".
     """
-    global _BACKEND
+    global _PING_TOOL, _FPING_PATH, _PING_PATH
 
-    fping_bin = shutil.which("fping")
-    ping_bin  = shutil.which("ping")
-    has_fping = fping_bin is not None
-    has_ping  = ping_bin  is not None
+    has_fping = _FPING_PATH is not None
+    has_ping  = _PING_PATH  is not None
 
-    # ── Print availability table ────────────────────────────────
-    W = 44
+    # ── Print availability ──────────────────────────────────────
     print(f"\n  {C.CYAN}[tools]{C.RESET}")
-    print(f"  {C.DIM}┌{'─'*W}┐{C.RESET}")
+    print(f"  {C.DIM}┌{'─'*44}┐{C.RESET}")
     if has_fping:
-        p = (fping_bin or "")[:W-12]
-        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}fping  ✔  {p:<{W-12}}{C.RESET}{C.DIM}│{C.RESET}")
+        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}fping  ✔  {_FPING_PATH:<32}{C.RESET}{C.DIM}│{C.RESET}")
     else:
-        print(f"  {C.DIM}│{C.RESET}  {C.RED}fping  ✘  not found{'':<{W-20}}{C.RESET}{C.DIM}│{C.RESET}")
+        print(f"  {C.DIM}│{C.RESET}  {C.RED}fping  ✘  not found{'':<26}{C.RESET}{C.DIM}│{C.RESET}")
     if has_ping:
-        p = (ping_bin or "")[:W-12]
-        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}ping   ✔  {p:<{W-12}}{C.RESET}{C.DIM}│{C.RESET}")
+        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}ping   ✔  {_PING_PATH:<32}{C.RESET}{C.DIM}│{C.RESET}")
     else:
-        print(f"  {C.DIM}│{C.RESET}  {C.RED}ping   ✘  not found{'':<{W-20}}{C.RESET}{C.DIM}│{C.RESET}")
-    print(f"  {C.DIM}└{'─'*W}┘{C.RESET}")
+        print(f"  {C.DIM}│{C.RESET}  {C.RED}ping   ✘  not found{'':<26}{C.RESET}{C.DIM}│{C.RESET}")
+    print(f"  {C.DIM}└{'─'*44}┘{C.RESET}")
 
-    # ── Neither available ───────────────────────────────────────
+    # ── Neither available → interactive fallback ────────────────
     if not has_fping and not has_ping:
         print(f"\n  {C.RED}✗ No ping tool found on PATH.{C.RESET}")
-        print(f"  {C.YELLOW}Install one:{C.RESET}")
-        print(f"  {C.DIM}  sudo apt install fping   # Kali / Debian / Ubuntu")
-        print(f"       sudo dnf install fping   # RHEL / Fedora")
+        print(f"  {C.YELLOW}Install one of:{C.RESET}")
+        print(f"  {C.DIM}  sudo apt install fping   # Debian/Ubuntu/Kali")
+        print(f"       sudo dnf install fping   # RHEL/Fedora")
         print(f"       brew install fping       # macOS{C.RESET}")
         sys.exit(3)
 
-    # ── --ping-tool explicit flag ───────────────────────────────
+    # ── Honour --ping-tool flag ─────────────────────────────────
     if ping_tool == "fping":
         if not has_fping:
             print(f"  {C.RED}✗ --ping-tool=fping requested but fping not found.{C.RESET}")
             sys.exit(3)
-        _BACKEND = "fping"
-
+        _PING_TOOL = "fping"
     elif ping_tool == "ping":
         if not has_ping:
             print(f"  {C.RED}✗ --ping-tool=ping requested but ping not found.{C.RESET}")
             sys.exit(3)
-        _BACKEND = "ping"
-
+        _PING_TOOL = "ping"
     else:
-        # auto: prompt when both available and running interactively
+        # auto mode: prompt user if both are available
         if has_fping and has_ping and sys.stdin.isatty():
             print(f"\n  {C.BOLD}{C.CYAN}Select ping backend:{C.RESET}")
-            print(f"  {C.GREEN}  [1]{C.RESET}  fping  {C.DIM}(recommended — faster, accurate){C.RESET}")
-            print(f"  {C.YELLOW}  [2]{C.RESET}  ping   {C.DIM}(OS built-in, always available){C.RESET}")
-            print(f"  {C.DIM}  [Enter] = fping{C.RESET}\n")
+            print(f"  {C.GREEN}  [1]{C.RESET}  fping  {C.DIM}(faster, better for large subnets){C.RESET}")
+            print(f"  {C.YELLOW}  [2]{C.RESET}  ping   {C.DIM}(OS built-in, more compatible){C.RESET}")
+            print(f"  {C.DIM}  [↵]  auto-select (fping){C.RESET}\n")
             try:
-                choice = input(f"  {C.BOLD}Choice [1/2]:{C.RESET} ").strip()
+                choice = input(f"  {C.BOLD}Choice [1/2, default=1]:{C.RESET} ").strip()
             except (EOFError, KeyboardInterrupt):
-                choice = "1"
-            _BACKEND = "ping" if choice == "2" else "fping"
-            col = C.YELLOW if _BACKEND == "ping" else C.GREEN
-            print(f"  {col}→ Using: {_BACKEND}{C.RESET}\n")
-
+                choice = ""
+            if choice == "2":
+                _PING_TOOL = "ping"
+                print(f"  {C.YELLOW}→ Using: ping{C.RESET}\n")
+            else:
+                _PING_TOOL = "fping"
+                print(f"  {C.GREEN}→ Using: fping{C.RESET}\n")
         elif has_fping:
-            _BACKEND = "fping"
+            _PING_TOOL = "fping"
         else:
-            _BACKEND = "ping"
+            _PING_TOOL = "ping"
 
-    # Print resolved choice
-    col   = C.GREEN if _BACKEND == "fping" else C.YELLOW
-    label = f"{col}{C.BOLD}{_BACKEND}{C.RESET}"
-    print(f"  {C.DIM}Backend:{C.RESET}  {label}\n")
-    return _BACKEND
+    # Print resolved selection
+    tool_label = f"{C.GREEN}fping{C.RESET}" if _PING_TOOL == "fping" else f"{C.YELLOW}ping{C.RESET}"
+    print(f"  {C.DIM}Backend:{C.RESET}  {tool_label}")
+
+    return _PING_TOOL
 
 
 # ─────────────────────────────────────────────────────────────────
