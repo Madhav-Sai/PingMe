@@ -174,7 +174,22 @@ python3 pingme.py --sub 192.168.1.0/24 --scan --alive-out hosts_up.txt --dead-ou
 
 # Silent progress (no per-IP output, just the bar)
 python3 pingme.py --sub 192.168.1.0/24 --scan --quiet
+
+# Find hosts that block ICMP but accept TCP connections
+python3 pingme.py --file servers.txt --tcp-ports 22,80,443
+python3 pingme.py --sub 192.168.1.0/24 --scan --tcp-ports 22,80,443,8000-8010
 ```
+
+With `--tcp-ports`, a target is reachable when it responds to ICMP **or** accepts a TCP connection on any requested port. Results include separate `icmp_alive` and `tcp_open` fields in JSON/CSV output.
+
+**IPv6 is supported for individual addresses and practical CIDRs:**
+
+```bash
+python3 pingme.py --host 2001:db8::10
+python3 pingme.py --sub 2001:db8:1234::/120 --scan
+```
+
+IPv6 networks can be enormous. PingMe refuses CIDR scans exceeding `65,536` targets by default; use a smaller prefix or deliberately raise the limit with `--max-hosts N`.
 
 **Live output during scan:**
 
@@ -197,9 +212,9 @@ dead.txt    →  all non-responding hosts, sorted
 
 ---
 
-### 3️⃣ Scan from an IP File
+### 3️⃣ Scan from an IP or Hostname File
 
-Pass any text file with one IP per line. Blank lines and `#` comments are ignored. Invalid entries are skipped with a warning.
+Pass any text file with one IP address or hostname per line. Blank lines, inline `#` comments, and duplicate resolved addresses are ignored. Unresolvable entries are skipped with a warning. File input starts a scan automatically.
 
 ```bash
 python3 pingme.py --file myservers.txt
@@ -216,13 +231,28 @@ python3 pingme.py --file /etc/hosts_to_check.txt --threads 10 --quiet
 10.0.2.50
 10.0.2.51
 
+# Hostnames are resolved before scanning
+api.example.com
+db.example.com  # inline comments work
+
 # Invalid lines are safely skipped
 not-an-ip
 ```
 
 ---
 
-### 4️⃣ IP Classifier
+### 4️⃣ Scan Individual Hostnames
+
+Resolve and scan one or more hostnames (or individual IP addresses) directly:
+
+```bash
+python3 pingme.py --host api.example.com
+python3 pingme.py --host api.example.com db.example.com 10.0.0.10 --dns
+```
+
+---
+
+### 5️⃣ IP Classifier
 
 Check whether any IP is Public, Private, CGNAT, Loopback, Link-Local, or Multicast — with the exact RFC.
 
@@ -274,7 +304,7 @@ python3 pingme.py --ipinfo 10.0.0.1 172.20.5.5 192.168.1.1 8.8.8.8 1.1.1.1 100.6
 
 ---
 
-### 5️⃣ History & Comparison
+### 6️⃣ History & Comparison
 
 Every scan is automatically saved to `./data/` in the current working directory. Run the same target again later and compare — PingMe will tell you exactly which hosts came online and which went dark.
 
@@ -324,7 +354,7 @@ Full Scan History — Alive Counts:
 
 ---
 
-### 6️⃣ Diff Two Snapshot Files
+### 7️⃣ Diff Two Snapshot Files
 
 Compare any two `alive.txt` snapshots directly — no re-scan needed.
 
@@ -352,16 +382,20 @@ python3 pingme.py --diff /backups/scan_jan.txt ./alive.txt
 ```
 Modes:
   -s, --sub CIDR        Show subnet info (and optionally scan)
-  -f, --file FILE       Load IPs from a file (one per line)
+  -f, --file FILE       Scan IPs/hostnames from a file (one per line)
+  --host HOST [HOST ...] Scan one or more IPs or hostnames
   --diff FILE_A FILE_B  Compare two alive.txt snapshots
   --history             List all stored scan history
   --ipinfo IP [IP ...]  Classify IPs as Public/Private/Special
 
 Scan Options:
-  --scan                Run ping scan (use with --sub or --file)
+  --scan                Run ping scan (required with --sub; implied by --file/--host)
   -t, --threads N       Concurrent threads (default: 20)
   --timeout SEC         Per-packet wait in seconds (default: 6)
   --count N             Packets per host — alive if ≥1 reply (default: 8)
+  --tcp-ports PORTS     TCP connect checks, e.g. 22,80,443 or 8000-8010
+  --tcp-timeout SEC     TCP connect timeout per port (default: 2)
+  --max-hosts N         Maximum CIDR targets to expand (default: 65536)
   --fast                Fast mode: 100 threads, 1s, 1 packet (less accurate)
   --no-history          Don't save this scan to history
   --compare             Compare with previous scan of same target

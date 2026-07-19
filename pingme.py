@@ -8,6 +8,7 @@
 """
 
 import argparse
+import csv
 import ipaddress
 import json
 import os
@@ -23,6 +24,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Union
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -134,7 +136,7 @@ def save_partial(label: str, done_results: list[dict], remaining: list[str]):
     }, indent=2))
 
 
-def load_partial(label: str) -> dict | None:
+def load_partial(label: str) -> Optional[dict]:
     rf = _resume_file(label)
     if not rf.exists():
         return None
@@ -153,7 +155,7 @@ def clear_partial(label: str):
 # ─────────────────────────────────────────────────────────────────
 # TTL FINGERPRINTING
 # ─────────────────────────────────────────────────────────────────
-def ttl_to_os(ttl: int | None) -> str:
+def ttl_to_os(ttl: Optional[int]) -> str:
     """
     Guess OS from TTL value.
     Each OS sets an initial TTL; we bucket by common ranges to absorb hops.
@@ -225,10 +227,16 @@ def ip_classify(ip_str: str) -> dict:
         return {"scope": "Invalid", "color": C.RED, "rfc": "", "description": "Not a valid IP"}
 
     if ip.is_loopback:
-        return {"scope": "Loopback",       "color": C.DIM,    "rfc": "RFC 5735", "description": "Loopback (127.0.0.0/8)"}
+        if ip.version == 6:
+            return {"scope": "Loopback", "color": C.DIM, "rfc": "RFC 4291", "description": "IPv6 loopback (::1/128)"}
+        return {"scope": "Loopback", "color": C.DIM, "rfc": "RFC 5735", "description": "Loopback (127.0.0.0/8)"}
     if ip.is_link_local:
+        if ip.version == 6:
+            return {"scope": "Link-Local", "color": C.YELLOW, "rfc": "RFC 4291", "description": "IPv6 link-local (fe80::/10)"}
         return {"scope": "Link-Local",     "color": C.YELLOW, "rfc": "RFC 3927", "description": "Link-local (169.254.0.0/16) — APIPA"}
     if ip.is_multicast:
+        if ip.version == 6:
+            return {"scope": "Multicast", "color": C.ORANGE, "rfc": "RFC 4291", "description": "IPv6 multicast (ff00::/8)"}
         return {"scope": "Multicast",      "color": C.ORANGE, "rfc": "RFC 5771", "description": "Multicast (224.0.0.0/4)"}
     if ip.is_reserved:
         return {"scope": "Reserved",       "color": C.PURPLE, "rfc": "RFC 1112", "description": "Reserved / future use"}
@@ -245,6 +253,10 @@ def ip_classify(ip_str: str) -> dict:
                 "description": "Shared address space / CGNAT (100.64.0.0/10)"}
 
     if ip.is_private:
+        if ip.version == 6:
+            if ip in ipaddress.ip_network("fc00::/7"):
+                return {"scope": "Private", "color": C.CYAN, "rfc": "RFC 4193", "description": "IPv6 unique local address (fc00::/7)"}
+            return {"scope": "Private", "color": C.CYAN, "rfc": "IANA", "description": "IPv6 special-purpose address"}
         for net, rfc, desc in [
             (ipaddress.ip_network("10.0.0.0/8"),     "RFC 1918", "Class A private (10.0.0.0/8)"),
             (ipaddress.ip_network("172.16.0.0/12"),  "RFC 1918", "Class B private (172.16.0.0/12)"),
@@ -313,22 +325,21 @@ def banner(no_banner: bool = False):
 # ─────────────────────────────────────────────────────────────────
 # SUBNET INFO
 # ─────────────────────────────────────────────────────────────────
-def show_subnet_info(cidr: str) -> ipaddress.IPv4Network:
+def show_subnet_info(cidr: str) -> Union[ipaddress.IPv4Network, ipaddress.IPv6Network]:
     try:
         net = ipaddress.ip_network(cidr, strict=False)
     except ValueError as e:
         print(C.err(f"\n  ✗ Invalid CIDR: {e}"))
         sys.exit(1)
 
-    total  = max(net.num_addresses - 2, 0)
-    hosts_iter = net.hosts()
-    first_host = next(hosts_iter, None)
-    last_host = None
-    if total > 0:
-        try:
-            last_host = ipaddress.ip_address(int(net.broadcast_address) - 1)
-        except Exception:
-            last_host = None
+    is_ipv4 = net.version == 4
+    total = max(net.num_addresses - 2, 0) if is_ipv4 and net.prefixlen <= 30 else net.num_addresses
+    first_host = next(net.hosts(), None) if is_ipv4 else net.network_address
+    last_host = (
+        ipaddress.ip_address(int(net.broadcast_address) - 1)
+        if is_ipv4 and net.prefixlen <= 30 and total > 0
+        else net[-1]
+    )
     prefix = net.prefixlen
     LABEL_W, VALUE_W = 24, 26
     BW = LABEL_W + VALUE_W + 3
@@ -352,7 +363,8 @@ def show_subnet_info(cidr: str) -> ipaddress.IPv4Network:
     print(); print(top); print(hdr("🌐  SUBNET INFORMATION")); print(sep)
     print(row("CIDR",              cidr,                       C.LIME))
     print(row("Network Address",   str(net.network_address),   C.YELLOW))
-    print(row("Broadcast Address", str(net.broadcast_address), C.YELLOW))
+    if is_ipv4:
+        print(row("Broadcast Address", str(net.broadcast_address), C.YELLOW))
     print(row("Subnet Mask",       str(net.netmask),           C.WHITE))
     print(row("Wildcard Mask",     str(net.hostmask),          C.WHITE))
     print(row("Prefix Length",     f"/{prefix}",               C.ORANGE))
@@ -361,31 +373,33 @@ def show_subnet_info(cidr: str) -> ipaddress.IPv4Network:
         print(sep)
         print(row("First Host",       str(first_host),         C.GREEN))
         print(row("Last Host",        str(last_host),          C.GREEN))
-        print(row("Total Usable IPs", f"{total:,}",            C.BOLD + C.LIME))
+        print(row("Total Usable IPs" if is_ipv4 else "Total Addresses", f"{total:,}", C.BOLD + C.LIME))
     print(bot)
 
     bar_w = 32
-    pct   = (total / (2 ** (32 - prefix))) * 100 if prefix < 32 else 100
-    fill  = max(1, int((prefix / 32) * bar_w))
+    address_bits = net.max_prefixlen
+    pct   = (total / (2 ** (address_bits - prefix))) * 100 if prefix < address_bits else 100
+    fill  = max(1, int((prefix / address_bits) * bar_w))
     bar   = f"{C.TEAL}{'█' * fill}{C.DIM}{'░' * (bar_w - fill)}{C.RESET}"
-    print(f"\n  {C.DIM}Prefix /{prefix} usage:{C.RESET}  {bar}  {C.DIM}/{prefix} of /32  ({pct:.1f}% host space){C.RESET}")
+    print(f"\n  {C.DIM}Prefix /{prefix} usage:{C.RESET}  {bar}  {C.DIM}/{prefix} of /{address_bits}  ({pct:.1f}% host space){C.RESET}")
 
     print(f"\n  {C.BOLD}{C.MAGENTA}┌{'─' * BW}┐{C.RESET}")
     print(hdr("📐  SUBNET BREAKDOWN"))
     print(f"  {C.MAGENTA}{C.BOLD}├{'─' * BW}┤{C.RESET}")
-    for sub_prefix in [24, 25, 26, 27, 28, 29, 30]:
+    sub_prefixes = [24, 25, 26, 27, 28, 29, 30] if is_ipv4 else [64, 96, 112, 120, 124, 126]
+    for sub_prefix in sub_prefixes:
         if sub_prefix <= prefix:
             continue
         n_subnets  = 2 ** (sub_prefix - prefix)
-        hosts_each = max(2 ** (32 - sub_prefix) - 2, 0)
+        hosts_each = max(2 ** (address_bits - sub_prefix) - 2, 0) if is_ipv4 else 2 ** (address_bits - sub_prefix)
         print(row(f"/{sub_prefix} subnets", f"{n_subnets:>5,}  ×  {hosts_each} hosts each", C.WHITE))
     print(f"  {C.MAGENTA}{C.BOLD}├{'─' * BW}┤{C.RESET}")
     class_label = ("Class A (/8)" if prefix <= 8 else
                    "Class B (/16)" if prefix <= 16 else
-                   "Class C (/24)" if prefix <= 24 else "Subnetted")
+                   "Class C (/24)" if prefix <= 24 else "Subnetted") if is_ipv4 else "IPv6 subnet"
     scope = f"{'Private' if net.is_private else 'Public'} · {class_label}"
     print(row("Address Scope",           scope,                   C.PINK))
-    print(row("Total IPs (incl. net+bc)", f"{2**(32-prefix):,}", C.DIM + C.WHITE))
+    print(row("Total IPs (incl. net+bc)" if is_ipv4 else "Total Addresses", f"{net.num_addresses:,}", C.DIM + C.WHITE))
     print(f"  {C.MAGENTA}{C.BOLD}└{'─' * BW}┘{C.RESET}\n")
     return net
 
@@ -393,23 +407,34 @@ def show_subnet_info(cidr: str) -> ipaddress.IPv4Network:
 # ─────────────────────────────────────────────────────────────────
 # EXCLUDE FILTER
 # ─────────────────────────────────────────────────────────────────
-def build_exclude_set(exclude_args: list[str]) -> set[str]:
-    """Parse --exclude values (IPs or CIDRs) into a set of IP strings."""
-    excluded: set[str] = set()
+def build_exclude_filter(
+    exclude_args: list[str],
+) -> tuple[set[str], list[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]]:
+    """Parse --exclude values without expanding potentially huge CIDRs in memory."""
+    excluded_ips: set[str] = set()
+    excluded_nets: list[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]] = []
     for item in (exclude_args or []):
         item = item.strip()
         try:
-            # Try as CIDR first
             net = ipaddress.ip_network(item, strict=False)
-            excluded.update(str(h) for h in net.hosts())
-            excluded.add(str(net.network_address))
-            excluded.add(str(net.broadcast_address))
+            excluded_nets.append(net)
         except ValueError:
             try:
-                excluded.add(str(ipaddress.ip_address(item)))
+                excluded_ips.add(str(ipaddress.ip_address(item)))
             except ValueError:
                 print(C.warn(f"  ⚠  Invalid --exclude value ignored: {item}"))
-    return excluded
+    return excluded_ips, excluded_nets
+
+
+def is_excluded(
+    ip: str,
+    excluded_ips: set[str],
+    excluded_nets: list[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]],
+) -> bool:
+    if ip in excluded_ips:
+        return True
+    address = ipaddress.ip_address(ip)
+    return any(address in network for network in excluded_nets)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -442,8 +467,9 @@ class RateLimiter:
 # ─────────────────────────────────────────────────────────────────
 # TOOL SELECTION  (cached at module level — FIX 4)
 # ─────────────────────────────────────────────────────────────────
-_FPING_PATH: str | None = shutil.which("fping")
-_PING_PATH:  str | None = shutil.which("ping")
+_FPING_PATH: Optional[str] = shutil.which("fping")
+_PING_PATH:  Optional[str] = shutil.which("ping")
+_PING6_PATH: Optional[str] = shutil.which("ping6")
 
 # User-selected tool: "auto" | "fping" | "ping"
 _PING_TOOL: str = "auto"
@@ -459,7 +485,11 @@ def _use_fping() -> bool:
     return _FPING_PATH is not None
 
 
-def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, int | None]:
+def _is_ipv6(ip: str) -> bool:
+    return ipaddress.ip_address(ip).version == 6
+
+
+def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, Optional[int]]:
     """
     fping 5.1 on Kali confirmed behaviour (from debug output):
       - Per-packet lines (including TTL) → STDOUT
@@ -481,8 +511,12 @@ def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, int | None
     proc_timeout = (count * timeout) + 10
 
     try:
+        command = [_FPING_PATH]
+        if _is_ipv6(ip):
+            command.append("-6")
+        command.extend(["-c", str(count), "-t", str(timeout * 1000), ip])
         r = subprocess.run(
-            [_FPING_PATH, "-c", str(count), "-t", str(timeout * 1000), ip],
+            command,
             stdout=subprocess.PIPE,   # per-packet lines + TTL
             stderr=subprocess.PIPE,   # xmt/rcv/%loss summary
             timeout=proc_timeout,
@@ -510,6 +544,9 @@ def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, int | None
             alive = False
         break   # only one summary line per IP
 
+    if not alive and re.search(r"\b\d+\s+bytes\b", stdout_text, re.IGNORECASE):
+        alive = True
+
     # ── Step 2: parse TTL from stdout per-packet lines ──────────
     # Line format: "ip : [N], 64 bytes, X ms (Y avg, Z% loss)"
     # TTL not shown in fping stdout by default — check anyway
@@ -523,7 +560,7 @@ def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, int | None
     return alive, ttl
 
 
-def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, int | None]:
+def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, Optional[int]]:
     """
     OS ping confirmed behaviour on Kali (from debug output):
       - Everything goes to STDOUT
@@ -538,16 +575,23 @@ def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, int | Non
       - Never use exit code
     """
     if sys.platform == "win32":
-        cmds         = [["ping", "-n", str(count), "-w", str(timeout * 1000), ip]]
+        cmds         = [[_PING_PATH or "ping", "-n", str(count), "-w", str(timeout * 1000), ip]]
         proc_timeout = (count * timeout) + 5
     else:
-        # -W = per-packet reply wait (seconds), -i = inter-packet interval
-        # Some kernels reject -i for non-root → fall back without it
-        cmds = [
-            ["ping", "-c", str(count), "-W", str(timeout), "-i", "0.5", ip],
-            ["ping", "-c", str(count), "-W", str(timeout), ip],
-        ]
-        proc_timeout = (count * timeout) + 10
+        if _is_ipv6(ip):
+            ping_binary = _PING6_PATH or _PING_PATH or "ping"
+            ipv6_flag = [] if _PING6_PATH else ["-6"]
+            cmds = [
+                [ping_binary, *ipv6_flag, "-c", str(count), "-W", str(timeout), "-i", "0.5", ip],
+                [ping_binary, *ipv6_flag, "-c", str(count), "-W", str(timeout), ip],
+            ]
+            proc_timeout = (count * timeout) + 10
+        else:
+            cmds = [
+                [_PING_PATH or "ping", "-c", str(count), "-W", str(timeout), "-i", "0.5", ip],
+                [_PING_PATH or "ping", "-c", str(count), "-W", str(timeout), ip],
+            ]
+            proc_timeout = (count * timeout) + 10
 
     stdout_text = ""
     for cmd in cmds:
@@ -568,11 +612,15 @@ def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, int | Non
     if not stdout_text:
         return False, None
 
-    # Parse "X received"
-    m = re.search(r'(\d+)\s+(?:packets?\s+)?received', stdout_text, re.IGNORECASE)
+    m = re.search(
+        r'(?:Received\s*=\s*(\d+)|(\d+)\s+(?:packets?\s+)?received)',
+        stdout_text,
+        re.IGNORECASE,
+    )
     if not m:
-        return False, None
-    alive = int(m.group(1)) > 0
+        alive = bool(re.search(r'^\s*\d+\s+bytes\s+from\s+', stdout_text, re.IGNORECASE | re.MULTILINE))
+    else:
+        alive = int(m.group(1) or m.group(2)) > 0
 
     # Parse TTL from per-packet lines
     ttl = None
@@ -584,6 +632,40 @@ def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, int | Non
     return alive, ttl
 
 
+def parse_tcp_ports(value: str) -> list[int]:
+    ports: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        bounds = item.split("-", 1)
+        try:
+            start = int(bounds[0])
+            end = int(bounds[-1])
+        except ValueError as exc:
+            raise ValueError(f"invalid TCP port: {item}") from exc
+        if not 1 <= start <= end <= 65535:
+            raise ValueError(f"TCP port out of range: {item}")
+        if end - start >= 1024:
+            raise ValueError(f"TCP port range is too large: {item}")
+        ports.extend(range(start, end + 1))
+    ports = list(dict.fromkeys(ports))
+    if not ports:
+        raise ValueError("at least one TCP port is required")
+    return ports
+
+
+def tcp_open_ports(ip: str, ports: list[int], timeout: int) -> list[int]:
+    open_ports: list[int] = []
+    for port in ports:
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                open_ports.append(port)
+        except OSError:
+            continue
+    return open_ports
+
+
 # ─────────────────────────────────────────────────────────────────
 # SINGLE-IP PING  — returns rich result dict
 # ─────────────────────────────────────────────────────────────────
@@ -591,8 +673,10 @@ def _ping_one(
     ip:           str,
     timeout:      int              = 2,
     count:        int              = 3,
-    rate_limiter: RateLimiter | None = None,
+    rate_limiter: Optional[RateLimiter] = None,
     do_dns:       bool             = False,
+    tcp_ports:    Optional[list[int]] = None,
+    tcp_timeout:  int              = 2,
 ) -> dict:
     """
     Ping one IP. Cleanly separated fping / OS-ping backends.
@@ -608,35 +692,39 @@ def _ping_one(
     if rate_limiter:
         rate_limiter.acquire(count)
 
-    alive: bool      = False
-    ttl:   int | None = None
+    icmp_alive: bool = False
+    ttl:   Optional[int] = None
 
     if _use_fping():
         try:
-            alive, ttl = _ping_via_fping(ip, timeout, count)
+            icmp_alive, ttl = _ping_via_fping(ip, timeout, count)
         except Exception:
             # FIX 7: fping found but failed to execute → fall through to OS ping
             try:
-                alive, ttl = _ping_via_system(ip, timeout, count)
+                icmp_alive, ttl = _ping_via_system(ip, timeout, count)
             except Exception:
-                alive, ttl = False, None
+                icmp_alive, ttl = False, None
     else:
-        if _PING_PATH is None:
+        if _PING_PATH is None and _PING6_PATH is None:
             # No tool available at all
-            alive, ttl = False, None
+            icmp_alive, ttl = False, None
         else:
             try:
-                alive, ttl = _ping_via_system(ip, timeout, count)
+                icmp_alive, ttl = _ping_via_system(ip, timeout, count)
             except Exception:
-                alive, ttl = False, None
+                icmp_alive, ttl = False, None
 
-    os_guess = ttl_to_os(ttl) if alive else ""
+    open_tcp_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
+    alive = icmp_alive or bool(open_tcp_ports)
+    os_guess = ttl_to_os(ttl) if icmp_alive else ""
     hostname = reverse_dns(ip) if (alive and do_dns) else ""
     classify = ip_classify(ip)
 
     return {
         "ip":       ip,
         "alive":    alive,
+        "icmp_alive": icmp_alive,
+        "tcp_open": open_tcp_ports,
         "ttl":      ttl,
         "os_guess": os_guess,
         "hostname": hostname,
@@ -674,6 +762,8 @@ def run_scan(
     quiet:        bool        = False,
     do_dns:       bool        = False,
     resume:       bool        = False,
+    tcp_ports:    Optional[list[int]] = None,
+    tcp_timeout:  int         = 2,
 ) -> list[dict]:
     """
     Scan all IPs. Returns list of result dicts.
@@ -705,11 +795,12 @@ def run_scan(
     rate_str = f"  rate≤{rate}pkt/s" if rate > 0 else ""
     retry_str = f"  retry={retry}" if retry > 0 else ""
     dns_str  = "  +dns" if do_dns else ""
+    tcp_str  = f"  tcp={','.join(str(port) for port in tcp_ports)}" if tcp_ports else ""
     print(
         f"\n  {C.CYAN}⠿ Scanning {C.BOLD}{total:,}{C.RESET}{C.CYAN} hosts"
         f"  │  threads={C.BOLD}{threads}{C.RESET}{C.CYAN}"
         f"  timeout={timeout}s  pkt/host={count}"
-        f"{retry_str}{rate_str}{dns_str}"
+        f"{retry_str}{rate_str}{dns_str}{tcp_str}"
         f"  est≈{est_sec:.0f}s{C.RESET}\n"
     )
 
@@ -725,7 +816,7 @@ def run_scan(
     try:
         with ThreadPoolExecutor(max_workers=threads) as pool:
             futures = {
-                pool.submit(_ping_one, ip, timeout, count, rl, do_dns): ip
+                pool.submit(_ping_one, ip, timeout, count, rl, do_dns, tcp_ports, tcp_timeout): ip
                 for ip in ip_list
             }
             for fut in as_completed(futures):
@@ -735,7 +826,18 @@ def run_scan(
                         f.cancel()
                     break
 
-                res    = fut.result()
+                try:
+                    res = fut.result()
+                except Exception as exc:
+                    ip = futures[fut]
+                    classify = ip_classify(ip)
+                    res = {
+                        "ip": ip, "alive": False, "ttl": None, "os_guess": "",
+                        "icmp_alive": False, "tcp_open": [], "hostname": "",
+                        "scope": classify["scope"], "rfc": classify["rfc"],
+                    }
+                    if not quiet:
+                        print(C.warn(f"\n  ⚠  Scan failed for {ip}: {exc}"))
                 ip     = res["ip"]
                 alive  = res["alive"]
                 done_n += 1
@@ -743,7 +845,7 @@ def run_scan(
                 # ── retry logic: re-ping dead hosts once ────────
                 if not alive and retry > 0:
                     for _ in range(retry):
-                        res2 = _ping_one(ip, timeout, count, rl, do_dns)
+                        res2 = _ping_one(ip, timeout, count, rl, do_dns, tcp_ports, tcp_timeout)
                         if res2["alive"]:
                             res = res2
                             break
@@ -754,11 +856,12 @@ def run_scan(
                     if not quiet:
                         os_g = res["os_guess"]
                         ttl_s = f"TTL={res['ttl']}" if res["ttl"] else "TTL=?"
+                        reach_s = "ICMP" if res["icmp_alive"] else f"TCP:{','.join(str(port) for port in res['tcp_open'])}"
                         dns_s = f"  {C.DIM}{res['hostname'][:28]}{C.RESET}" if res["hostname"] else ""
                         oscol = ttl_color(os_g)
                         sys.stdout.write(
                             f"\r  {C.GREEN}✔ {ip:<18}{C.RESET}"
-                            f"  {C.DIM}{ttl_s:<8}{C.RESET}"
+                            f"  {C.DIM}{reach_s:<12} {ttl_s:<8}{C.RESET}"
                             f"  {oscol}{os_g:<16}{C.RESET}"
                             f"  {C.CYAN}[{res['scope']}]{C.RESET}"
                             f"{dns_s}\n"
@@ -814,11 +917,19 @@ def write_results(
         Path(alive_file).write_text(json.dumps([r for r in alive], indent=2) + "\n")
         Path(dead_file).write_text(json.dumps([r for r in dead],  indent=2) + "\n")
     elif out_format == "csv":
-        header = "ip,alive,ttl,os_guess,hostname,scope,rfc\n"
-        def to_csv(r):
-            return f"{r['ip']},{r['alive']},{r.get('ttl','')},{r.get('os_guess','')},{r.get('hostname','')},{r.get('scope','')},{r.get('rfc','')}\n"
-        Path(alive_file).write_text(header + "".join(to_csv(r) for r in alive))
-        Path(dead_file).write_text(header  + "".join(to_csv(r) for r in dead))
+        fields = ["ip", "alive", "icmp_alive", "tcp_open", "ttl", "os_guess", "hostname", "scope", "rfc"]
+        for path, rows in ((alive_file, alive), (dead_file, dead)):
+            with Path(path).open("w", newline="") as output:
+                writer = csv.DictWriter(output, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(
+                    {
+                        field: ";".join(str(port) for port in row.get("tcp_open", []))
+                        if field == "tcp_open" else row.get(field, "")
+                        for field in fields
+                    }
+                    for row in rows
+                )
     else:  # txt — plain IPs, one per line
         Path(alive_file).write_text("\n".join(r["ip"] for r in alive) + ("\n" if alive else ""))
         Path(dead_file).write_text("\n".join(r["ip"] for r in dead)  + ("\n" if dead  else ""))
@@ -830,8 +941,8 @@ def write_results(
     print(f"  └{'─' * (box_w + 2)}┘{C.RESET}")
     print(div)
     print(f"  {C.DIM}│{C.RESET}  {'Total scanned':<28}{C.BOLD}{C.WHITE}{total:>6}{C.RESET}")
-    print(f"  {C.DIM}│{C.RESET}  {C.GREEN}{'Alive (reachable)':<28}{C.BOLD}{len(alive):>6}{C.RESET}  {C.DIM}({pct_a:.1f}%){C.RESET}")
-    print(f"  {C.DIM}│{C.RESET}  {C.RED}{'Dead (no response)':<28}{C.BOLD}{len(dead):>6}{C.RESET}  {C.DIM}({pct_d:.1f}%){C.RESET}")
+    print(f"  {C.DIM}│{C.RESET}  {C.GREEN}{'Reachable (ICMP/TCP)':<28}{C.BOLD}{len(alive):>6}{C.RESET}  {C.DIM}({pct_a:.1f}%){C.RESET}")
+    print(f"  {C.DIM}│{C.RESET}  {C.RED}{'No ICMP/TCP response':<28}{C.BOLD}{len(dead):>6}{C.RESET}  {C.DIM}({pct_d:.1f}%){C.RESET}")
     print(div)
 
     # OS breakdown from TTL
@@ -957,27 +1068,70 @@ def diff_files(file_a: str, file_b: str):
 
 
 # ─────────────────────────────────────────────────────────────────
-# READ IP FILE
+# READ TARGETS
 # ─────────────────────────────────────────────────────────────────
-def read_ip_file(path: str) -> list[str]:
+def resolve_hostname(hostname: str) -> list[str]:
+    """Resolve a hostname to unique IP addresses, preserving resolver order."""
+    try:
+        records = socket.getaddrinfo(hostname, None, type=socket.SOCK_DGRAM)
+    except (OSError, UnicodeError):
+        return []
+
+    addresses: list[str] = []
+    for _family, _type, _proto, _canonname, sockaddr in records:
+        address = sockaddr[0]
+        if address not in addresses:
+            addresses.append(address)
+    return addresses
+
+
+def read_target_file(path: str) -> list[str]:
     p = Path(path)
     if not p.exists():
         print(C.err(f"  ✗ File not found: {path}")); sys.exit(1)
-    ips, bad = [], []
-    for line in p.read_text().splitlines():
-        line = line.strip()
+    targets, bad = [], []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
         if not line or line.startswith("#"):
             continue
         try:
-            ipaddress.ip_address(line); ips.append(line)
+            targets.append(str(ipaddress.ip_address(line)))
         except ValueError:
-            bad.append(line)
+            resolved = resolve_hostname(line)
+            if resolved:
+                targets.extend(resolved)
+            else:
+                bad.append(line)
     if bad:
-        print(f"  {C.YELLOW}⚠  Skipped {len(bad)} invalid entries in {path}{C.RESET}")
-    if not ips:
-        print(C.err(f"  ✗ No valid IPs found in {path}")); sys.exit(1)
-    print(f"  {C.CYAN}Loaded {C.BOLD}{len(ips)}{C.RESET}{C.CYAN} IPs from {path}{C.RESET}")
-    return ips
+        print(f"  {C.YELLOW}⚠  Skipped {len(bad)} unresolvable entries in {path}{C.RESET}")
+    targets = list(dict.fromkeys(targets))
+    if not targets:
+        print(C.err(f"  ✗ No valid IPs or resolvable hostnames found in {path}")); sys.exit(1)
+    print(f"  {C.CYAN}Loaded {C.BOLD}{len(targets)}{C.RESET}{C.CYAN} resolved targets from {path}{C.RESET}")
+    return targets
+
+
+def resolve_host_arguments(hostnames: list[str]) -> list[str]:
+    """Resolve --host values and fail clearly if none resolve."""
+    targets: list[str] = []
+    bad: list[str] = []
+    for hostname in hostnames:
+        try:
+            targets.append(str(ipaddress.ip_address(hostname)))
+            continue
+        except ValueError:
+            pass
+        resolved = resolve_hostname(hostname)
+        if resolved:
+            targets.extend(resolved)
+        else:
+            bad.append(hostname)
+    if bad:
+        print(C.warn(f"  ⚠  Could not resolve: {', '.join(bad)}"))
+    targets = list(dict.fromkeys(targets))
+    if not targets:
+        print(C.err("  ✗ No valid IPs or resolvable hostnames supplied.")); sys.exit(1)
+    return targets
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -989,10 +1143,10 @@ def check_deps(ping_tool: str = "auto") -> str:
     offer an interactive prompt if neither fping nor ping is found.
     Returns the resolved tool name: "fping" | "ping".
     """
-    global _PING_TOOL, _FPING_PATH, _PING_PATH
+    global _PING_TOOL, _FPING_PATH, _PING_PATH, _PING6_PATH
 
     has_fping = _FPING_PATH is not None
-    has_ping  = _PING_PATH  is not None
+    has_ping  = _PING_PATH is not None or _PING6_PATH is not None
 
     # ── Print availability ──────────────────────────────────────
     print(f"\n  {C.CYAN}[tools]{C.RESET}")
@@ -1002,7 +1156,8 @@ def check_deps(ping_tool: str = "auto") -> str:
     else:
         print(f"  {C.DIM}│{C.RESET}  {C.RED}fping  ✘  not found{'':<26}{C.RESET}{C.DIM}│{C.RESET}")
     if has_ping:
-        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}ping   ✔  {_PING_PATH:<32}{C.RESET}{C.DIM}│{C.RESET}")
+        ping_path = _PING_PATH or _PING6_PATH
+        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}ping   ✔  {ping_path:<32}{C.RESET}{C.DIM}│{C.RESET}")
     else:
         print(f"  {C.DIM}│{C.RESET}  {C.RED}ping   ✘  not found{'':<26}{C.RESET}{C.DIM}│{C.RESET}")
     print(f"  {C.DIM}└{'─'*44}┘{C.RESET}")
@@ -1107,7 +1262,9 @@ def build_parser() -> argparse.ArgumentParser:
     mg.add_argument("-s", "--sub",    metavar="CIDR",
                     help="Show subnet info (add --scan to ping)")
     mg.add_argument("-f", "--file",   metavar="FILE",
-                    help="Load IPs from a file (one per line)")
+                    help="Scan IPs/hostnames from a file (one per line)")
+    mg.add_argument("--host",          metavar="HOST", nargs="+",
+                    help="Scan one or more IPs or hostnames")
     mg.add_argument("--diff",         metavar=("A", "B"), nargs=2,
                     help="Compare two alive.txt snapshots")
     mg.add_argument("--history",      action="store_true",
@@ -1119,13 +1276,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sg = p.add_argument_group(f"{C.BOLD}Scan Options{C.RESET}")
     sg.add_argument("--scan",         action="store_true",
-                    help="Run ping scan (use with --sub or --file)")
+                    help="Run ping scan (required with --sub; implied by --file/--host)")
     sg.add_argument("-t", "--threads",type=int, default=20, metavar="N",
                     help="Concurrent threads (default: 20)")
     sg.add_argument("--timeout",      type=int, default=6,  metavar="SEC",
                     help="Per-packet wait seconds (default: 6)")
     sg.add_argument("--count",        type=int, default=8,  metavar="N",
                     help="Packets per host — alive if ≥1 reply (default: 8)")
+    sg.add_argument("--tcp-ports",    metavar="PORTS",
+                    help="TCP connect checks, e.g. 22,80,443 or 8000-8010")
+    sg.add_argument("--tcp-timeout",  type=int, default=2, metavar="SEC",
+                    help="TCP connect timeout per port (default: 2)")
+    sg.add_argument("--max-hosts",    type=int, default=65536, metavar="N",
+                    help="Maximum CIDR targets to expand (default: 65536)")
     sg.add_argument("--retry",        type=int, default=0,  metavar="N",
                     help="Extra ping attempts for dead hosts (default: 0)")
     sg.add_argument("--rate",         type=int, default=0,  metavar="PPS",
@@ -1177,6 +1340,16 @@ def main():
     parser = build_parser()
     args   = parser.parse_args()
 
+    if args.max_hosts < 1:
+        parser.error("--max-hosts must be at least 1")
+    if args.tcp_ports:
+        try:
+            args.tcp_ports = parse_tcp_ports(args.tcp_ports)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if (args.file or args.host) and not args.scan:
+        args.scan = True
+
     banner(no_banner=args.no_banner)
 
     # ── clear history ───────────────────────────────────────────
@@ -1195,42 +1368,60 @@ def main():
     if args.diff:
         diff_files(args.diff[0], args.diff[1]); return
 
-    # ── need --sub or --file ────────────────────────────────────
-    if not args.sub and not args.file:
+    # ── need a scan target ──────────────────────────────────────
+    if not args.sub and not args.file and not args.host:
         parser.print_help()
-        print(f"\n  {C.YELLOW}Tip: use --sub 192.168.1.0/24 --scan or --file ips.txt{C.RESET}\n")
+        print(f"\n  {C.YELLOW}Tip: use --sub 192.168.1.0/24 --scan, --file targets.txt, or --host example.com{C.RESET}\n")
         sys.exit(0)
 
     # ── build IP list ───────────────────────────────────────────
     ip_list: list[str] = []
     label = args.label
+    subnet_target_count: Optional[int] = None
 
     if args.sub:
         net     = show_subnet_info(args.sub)
-        ip_list = [str(h) for h in net.hosts()]
+        subnet_target_count = max(net.num_addresses - 2, 0) if net.version == 4 and net.prefixlen <= 30 else net.num_addresses
+        if args.scan:
+            if subnet_target_count > args.max_hosts:
+                print(C.err(
+                    f"  ✗ {args.sub} expands to {subnet_target_count:,} targets, exceeding "
+                    f"--max-hosts {args.max_hosts:,}. Use a smaller CIDR or raise the limit deliberately."
+                ))
+                sys.exit(1)
+            addresses = net.hosts() if net.version == 4 else iter(net)
+            ip_list = [str(host) for host in addresses]
         if not label:
             label = re.sub(r"[/]", "_", args.sub)
 
     if args.file:
-        file_ips = read_ip_file(args.file)
-        if ip_list:
-            print(f"  {C.YELLOW}⚠  Both --sub and --file given — using --file IPs only.{C.RESET}")
-        ip_list = file_ips
+        ip_list.extend(read_target_file(args.file))
         if not label:
             label = Path(args.file).stem
 
+    if args.host:
+        ip_list.extend(resolve_host_arguments(args.host))
+        if not label:
+            label = re.sub(r"[^\w.\-]", "_", "_".join(args.host))
+
+    ip_list = list(dict.fromkeys(ip_list))
+
     # ── apply --exclude ─────────────────────────────────────────
     if args.exclude:
-        excl = build_exclude_set(args.exclude)
+        excluded_ips, excluded_nets = build_exclude_filter(args.exclude)
         before = len(ip_list)
-        ip_list = [ip for ip in ip_list if ip not in excl]
+        ip_list = [ip for ip in ip_list if not is_excluded(ip, excluded_ips, excluded_nets)]
         skipped = before - len(ip_list)
         if skipped:
             print(f"  {C.DIM}[exclude] Skipped {skipped} IPs{C.RESET}")
 
+    if args.scan and not ip_list:
+        print(C.err("  ✗ No scan targets remain after exclusions.")); sys.exit(1)
+
     # ── scan ────────────────────────────────────────────────────
     if args.scan:
-        check_deps(ping_tool=args.ping_tool)
+        if not args.tcp_ports or _FPING_PATH or _PING_PATH or _PING6_PATH:
+            check_deps(ping_tool=args.ping_tool)
 
         if args.fast:
             args.threads = 100; args.timeout = 1; args.count = 1
@@ -1241,6 +1432,7 @@ def main():
         args.count   = max(1,  min(20,   args.count))
         args.retry   = max(0,  min(5,    args.retry))
         args.rate    = max(0,           args.rate)
+        args.tcp_timeout = max(1, min(30, args.tcp_timeout))
 
         results = run_scan(
             ip_list,
@@ -1253,6 +1445,8 @@ def main():
             quiet   = args.quiet,
             do_dns  = args.dns,
             resume  = args.resume,
+            tcp_ports = args.tcp_ports,
+            tcp_timeout = args.tcp_timeout,
         )
 
         alive = [r["ip"] for r in results if r["alive"]]
@@ -1267,7 +1461,7 @@ def main():
             compare_history(label, alive, dead)
 
     elif args.sub and not args.scan:
-        print(f"  {C.DIM}Tip: add {C.BOLD}--scan{C.RESET}{C.DIM} to ping all {len(ip_list):,} hosts.{C.RESET}\n")
+        print(f"  {C.DIM}Tip: add {C.BOLD}--scan{C.RESET}{C.DIM} to ping all {subnet_target_count or 0:,} hosts.{C.RESET}\n")
 
     print()
 
