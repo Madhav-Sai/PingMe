@@ -1248,82 +1248,241 @@ def clear_history(label: str):
 
 
 # ─────────────────────────────────────────────────────────────────
-# ARG PARSER
+# CLI HELP / ARGUMENT PARSER
 # ─────────────────────────────────────────────────────────────────
+HELP_TOPICS = ("targets", "scan", "discovery", "output", "history", "advanced", "examples")
+
+
+class ColorArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser with ANSI-colored headings, flags, metavars, and examples."""
+
+    def format_help(self) -> str:
+        text = super().format_help()
+        if not sys.stdout.isatty():
+            return text
+
+        # Section headings.
+        text = re.sub(
+            r"(?m)^(usage:|Targets:|Discovery:|Scan Control:|Output:|History:|Advanced:|Help:|options:)$",
+            lambda m: f"{C.BOLD}{C.MAGENTA}{m.group(1)}{C.RESET}",
+            text,
+        )
+        # Option flags. Applied after argparse has aligned the plain text.
+        text = re.sub(
+            r"(?<![\w])(--?[a-zA-Z][\w-]*)(?=[,\s=]|$)",
+            lambda m: f"{C.CYAN}{C.BOLD}{m.group(1)}{C.RESET}",
+            text,
+        )
+        # Common metavars and choice groups.
+        text = re.sub(
+            r"\b(CIDR|FILE|HOST|IP|PORTS|SEC|PPS|NAME|N|TOPIC|A|B)\b",
+            lambda m: f"{C.YELLOW}{m.group(1)}{C.RESET}",
+            text,
+        )
+        text = re.sub(
+            r"(\{(?:auto|fping|ping|txt|csv|json)[^}]*\})",
+            lambda m: f"{C.ORANGE}{m.group(1)}{C.RESET}",
+            text,
+        )
+        return text
+
+
+def _topic_header(title: str, description: str) -> None:
+    print(f"\n  {C.BOLD}{C.MAGENTA}{title}{C.RESET}")
+    print(f"  {C.DIM}{description}{C.RESET}\n")
+
+
+def print_topic_help(topic: str) -> None:
+    """Show focused nested help without changing the existing CLI syntax."""
+    topic = topic.lower().strip()
+    if topic not in HELP_TOPICS:
+        print(C.err(f"  ✗ Unknown help topic: {topic}"))
+        print(f"  {C.DIM}Available topics: {', '.join(HELP_TOPICS)}{C.RESET}\n")
+        return
+
+    if topic == "targets":
+        _topic_header("TARGET SELECTION", "Choose one or more sources of IP addresses or hostnames.")
+        rows = [
+            ("-s, --sub CIDR", "Analyze a subnet; add --scan to probe its hosts."),
+            ("-f, --file FILE", "Read IPs/hostnames from a file; scanning is implied."),
+            ("--host HOST ...", "Resolve and scan individual hosts or IP addresses."),
+            ("--exclude IP/CIDR ...", "Skip selected IP addresses or complete networks."),
+            ("--max-hosts N", "Safety limit for CIDR expansion; default 65,536."),
+        ]
+    elif topic == "scan":
+        _topic_header("SCAN CONTROL", "Tune speed, retries, packet count, and backend behavior.")
+        rows = [
+            ("--scan", "Run discovery for --sub targets."),
+            ("-t, --threads N", "Concurrent workers; default 20."),
+            ("--timeout SEC", "Per-packet wait; default 6 seconds."),
+            ("--count N", "Packets sent per host; default 8."),
+            ("--retry N", "Retry hosts that did not respond."),
+            ("--rate PPS", "Global packet-rate limit; 0 means unlimited."),
+            ("--fast", "Use 100 threads, 1-second timeout, and 1 packet."),
+            ("--resume", "Continue an interrupted scan from saved state."),
+            ("--ping-tool auto|fping|ping", "Select the ICMP backend."),
+        ]
+    elif topic == "discovery":
+        _topic_header("DISCOVERY FEATURES", "Add DNS and TCP checks to standard ICMP discovery.")
+        rows = [
+            ("--dns", "Perform reverse DNS lookups for reachable hosts."),
+            ("--tcp-ports PORTS", "Check ports such as 22,80,443 or 8000-8010."),
+            ("--tcp-timeout SEC", "TCP connection timeout per port; default 2 seconds."),
+            ("--ipinfo IP ...", "Classify addresses as public, private, or special-use."),
+        ]
+    elif topic == "output":
+        _topic_header("OUTPUT", "Control result files, formats, and terminal verbosity.")
+        rows = [
+            ("--alive-out FILE", "Destination for reachable hosts."),
+            ("--dead-out FILE", "Destination for non-responsive hosts."),
+            ("--out-format txt|csv|json", "Choose the file format."),
+            ("--quiet", "Hide per-host output while retaining progress."),
+            ("--no-banner", "Suppress the startup banner."),
+            ("--label NAME", "Set a stable label for history and resume data."),
+        ]
+    elif topic == "history":
+        _topic_header("HISTORY AND COMPARISON", "Track changes across scans or compare saved snapshots.")
+        rows = [
+            ("--history", "List stored scan histories."),
+            ("--compare", "Compare this scan with the previous scan using the same label."),
+            ("--diff A B", "Compare two plain-text IP snapshot files."),
+            ("--clear-history NAME", "Delete stored history for a label."),
+            ("--no-history", "Do not save the current scan."),
+        ]
+    elif topic == "advanced":
+        _topic_header("ADVANCED NOTES", "Operational behavior and safety controls.")
+        rows = [
+            ("IPv6", "Supported for individual hosts and practical CIDRs."),
+            ("Reachability", "A host is alive when ICMP responds or a requested TCP port opens."),
+            ("TTL fingerprint", "OS guesses are heuristic and should not be treated as definitive."),
+            ("Authorization", "Only scan systems and networks you are authorized to assess."),
+        ]
+    else:
+        _topic_header("EXAMPLES", "Common PingMe workflows.")
+        examples = [
+            "pingme --sub 192.168.1.0/24",
+            "pingme --sub 192.168.1.0/24 --scan",
+            "pingme --sub 192.168.1.0/24 --scan --fast",
+            "pingme --file targets.txt --dns",
+            "pingme --host server.local 10.0.0.10 --tcp-ports 22,443",
+            "pingme --sub 10.0.0.0/24 --scan --compare --label office",
+            "pingme --ipinfo 8.8.8.8 192.168.1.1",
+            "pingme --diff alive_old.txt alive_new.txt",
+        ]
+        for command in examples:
+            print(f"  {C.CYAN}${C.RESET} {C.BOLD}{command}{C.RESET}")
+        print()
+        return
+
+    width = max(len(flag) for flag, _ in rows)
+    for flag, description in rows:
+        print(f"  {C.CYAN}{C.BOLD}{flag:<{width}}{C.RESET}  {description}")
+    print()
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="pingme",
-        description="PingMe v3.0 — Advanced Ping Scanner",
-        formatter_class=argparse.RawTextHelpFormatter,
-        add_help=False,
+    examples = (
+        f"{C.BOLD}Nested help:{C.RESET}\n"
+        "  pingme help targets       Target selection and exclusions\n"
+        "  pingme help scan          Threads, retries, speed, and backend\n"
+        "  pingme help discovery     ICMP, TCP, DNS, and IP classification\n"
+        "  pingme help output        Files, formats, and terminal controls\n"
+        "  pingme help history       History, comparison, and diff mode\n"
+        "  pingme help examples      Ready-to-run command examples\n\n"
+        f"{C.BOLD}Quick examples:{C.RESET}\n"
+        "  pingme --sub 192.168.1.0/24\n"
+        "  pingme --sub 192.168.1.0/24 --scan --fast\n"
+        "  pingme --file targets.txt --dns --tcp-ports 22,80,443\n"
     )
 
-    mg = p.add_argument_group(f"{C.BOLD}Modes{C.RESET}")
-    mg.add_argument("-s", "--sub",    metavar="CIDR",
-                    help="Show subnet info (add --scan to ping)")
-    mg.add_argument("-f", "--file",   metavar="FILE",
-                    help="Scan IPs/hostnames from a file (one per line)")
-    mg.add_argument("--host",          metavar="HOST", nargs="+",
-                    help="Scan one or more IPs or hostnames")
-    mg.add_argument("--diff",         metavar=("A", "B"), nargs=2,
-                    help="Compare two alive.txt snapshots")
-    mg.add_argument("--history",      action="store_true",
-                    help="List all stored scan history")
-    mg.add_argument("--clear-history",metavar="LABEL",
-                    help="Delete history for a label")
-    mg.add_argument("--ipinfo",       metavar="IP", nargs="+",
-                    help="Classify IPs as Public/Private/Special")
+    p = ColorArgumentParser(
+        prog="pingme",
+        description=(
+            f"{C.BOLD}{C.MAGENTA}PingMe v3.0{C.RESET} — advanced ICMP/TCP host discovery, "
+            "subnet analysis, history, and IP classification."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=False,
+        epilog=examples,
+    )
 
-    sg = p.add_argument_group(f"{C.BOLD}Scan Options{C.RESET}")
-    sg.add_argument("--scan",         action="store_true",
-                    help="Run ping scan (required with --sub; implied by --file/--host)")
-    sg.add_argument("-t", "--threads",type=int, default=20, metavar="N",
-                    help="Concurrent threads (default: 20)")
-    sg.add_argument("--timeout",      type=int, default=6,  metavar="SEC",
-                    help="Per-packet wait seconds (default: 6)")
-    sg.add_argument("--count",        type=int, default=8,  metavar="N",
-                    help="Packets per host — alive if ≥1 reply (default: 8)")
-    sg.add_argument("--tcp-ports",    metavar="PORTS",
-                    help="TCP connect checks, e.g. 22,80,443 or 8000-8010")
-    sg.add_argument("--tcp-timeout",  type=int, default=2, metavar="SEC",
-                    help="TCP connect timeout per port (default: 2)")
-    sg.add_argument("--max-hosts",    type=int, default=65536, metavar="N",
+    tg = p.add_argument_group("Targets")
+    tg.add_argument("-s", "--sub", metavar="CIDR",
+                    help="Analyze a subnet; add --scan to probe its hosts")
+    tg.add_argument("-f", "--file", metavar="FILE",
+                    help="Scan IPs/hostnames from a file (scan implied)")
+    tg.add_argument("--host", metavar="HOST", nargs="+",
+                    help="Scan one or more IP addresses or hostnames")
+    tg.add_argument("--exclude", metavar="IP/CIDR", nargs="+",
+                    help="Skip one or more IP addresses or CIDRs")
+    tg.add_argument("--max-hosts", type=int, default=65536, metavar="N",
                     help="Maximum CIDR targets to expand (default: 65536)")
-    sg.add_argument("--retry",        type=int, default=0,  metavar="N",
-                    help="Extra ping attempts for dead hosts (default: 0)")
-    sg.add_argument("--rate",         type=int, default=0,  metavar="PPS",
-                    help="Max packets/sec total — 0 = unlimited (default: 0)")
-    sg.add_argument("--exclude",      metavar="IP/CIDR", nargs="+",
-                    help="IPs or CIDRs to skip (e.g. --exclude 10.0.0.1 10.0.0.0/28)")
-    sg.add_argument("--dns",          action="store_true",
-                    help="Reverse DNS lookup for alive hosts")
-    sg.add_argument("--resume",       action="store_true",
-                    help="Resume a previously interrupted scan")
-    sg.add_argument("--ping-tool",     default="auto",
-                    choices=["auto", "fping", "ping"],
-                    help="Ping backend: auto (default) | fping | ping")
-    sg.add_argument("--fast",         action="store_true",
-                    help="Fast mode: threads=100 timeout=1s count=1 (less accurate)")
-    sg.add_argument("--no-history",   action="store_true",
-                    help="Don't save this scan to history")
-    sg.add_argument("--compare",      action="store_true",
-                    help="Compare with previous scan of same target")
-    sg.add_argument("--quiet",        action="store_true",
-                    help="Suppress per-IP output during scan")
 
-    og = p.add_argument_group(f"{C.BOLD}Output{C.RESET}")
-    og.add_argument("--alive-out",    default="alive.txt", metavar="FILE",
-                    help="Output file for alive IPs (default: alive.txt)")
-    og.add_argument("--dead-out",     default="dead.txt",  metavar="FILE",
-                    help="Output file for dead IPs (default: dead.txt)")
-    og.add_argument("--out-format",   default="txt", choices=["txt","csv","json"],
-                    help="Output format: txt | csv | json (default: txt)")
-    og.add_argument("--label",        metavar="NAME",
-                    help="Custom history label (default: CIDR or filename)")
-    og.add_argument("--no-banner",    action="store_true",
-                    help="Suppress the ASCII banner (clean output for piping)")
-    og.add_argument("-h", "--help",   action="help",
-                    help="Show this help message")
+    dg = p.add_argument_group("Discovery")
+    dg.add_argument("--scan", action="store_true",
+                    help="Run discovery (required with --sub)")
+    dg.add_argument("--dns", action="store_true",
+                    help="Reverse DNS lookup for reachable hosts")
+    dg.add_argument("--tcp-ports", metavar="PORTS",
+                    help="TCP checks, e.g. 22,80,443 or 8000-8010")
+    dg.add_argument("--tcp-timeout", type=int, default=2, metavar="SEC",
+                    help="TCP connect timeout per port (default: 2)")
+    dg.add_argument("--ipinfo", metavar="IP", nargs="+",
+                    help="Classify IP addresses as public/private/special")
+
+    sg = p.add_argument_group("Scan Control")
+    sg.add_argument("-t", "--threads", type=int, default=20, metavar="N",
+                    help="Concurrent workers (default: 20)")
+    sg.add_argument("--timeout", type=int, default=6, metavar="SEC",
+                    help="Per-packet wait seconds (default: 6)")
+    sg.add_argument("--count", type=int, default=8, metavar="N",
+                    help="Packets per host (default: 8)")
+    sg.add_argument("--retry", type=int, default=0, metavar="N",
+                    help="Retries for non-responsive hosts (default: 0)")
+    sg.add_argument("--rate", type=int, default=0, metavar="PPS",
+                    help="Maximum packets/sec; 0 = unlimited")
+    sg.add_argument("--ping-tool", default="auto", choices=["auto", "fping", "ping"],
+                    help="ICMP backend (default: auto)")
+    sg.add_argument("--fast", action="store_true",
+                    help="100 threads, 1s timeout, 1 packet")
+    sg.add_argument("--resume", action="store_true",
+                    help="Resume an interrupted scan")
+
+    og = p.add_argument_group("Output")
+    og.add_argument("--alive-out", default="alive.txt", metavar="FILE",
+                    help="Reachable-host output file (default: alive.txt)")
+    og.add_argument("--dead-out", default="dead.txt", metavar="FILE",
+                    help="Non-responsive-host output file (default: dead.txt)")
+    og.add_argument("--out-format", default="txt", choices=["txt", "csv", "json"],
+                    help="Output format (default: txt)")
+    og.add_argument("--label", metavar="NAME",
+                    help="History/resume label (default: target-derived)")
+    og.add_argument("--quiet", action="store_true",
+                    help="Suppress per-host output")
+    og.add_argument("--no-banner", action="store_true",
+                    help="Suppress the ASCII banner")
+
+    hg = p.add_argument_group("History")
+    hg.add_argument("--history", action="store_true",
+                    help="List stored scan history")
+    hg.add_argument("--compare", action="store_true",
+                    help="Compare with the previous scan of the same label")
+    hg.add_argument("--diff", metavar=("A", "B"), nargs=2,
+                    help="Compare two alive-host snapshot files")
+    hg.add_argument("--clear-history", metavar="NAME",
+                    help="Delete history for a label")
+    hg.add_argument("--no-history", action="store_true",
+                    help="Do not save this scan to history")
+
+    ag = p.add_argument_group("Advanced")
+    ag.add_argument("--help-topic", choices=HELP_TOPICS, metavar="TOPIC",
+                    help="Show focused help for one topic")
+    ag.add_argument("--help-all", action="store_true",
+                    help="Show complete grouped help")
+
+    help_group = p.add_argument_group("Help")
+    help_group.add_argument("-h", "--help", action="help",
+                            help="Show grouped help and nested-help topics")
 
     return p
 
@@ -1337,8 +1496,21 @@ def main():
             if not attr.startswith("_") and isinstance(getattr(C, attr), str):
                 setattr(C, attr, "")
 
+    # Nested help syntax: pingme help <topic>
+    if len(sys.argv) >= 2 and sys.argv[1] == "help":
+        topic = sys.argv[2] if len(sys.argv) >= 3 else "examples"
+        print_topic_help(topic)
+        return
+
     parser = build_parser()
     args   = parser.parse_args()
+
+    if args.help_topic:
+        print_topic_help(args.help_topic)
+        return
+    if args.help_all:
+        parser.print_help()
+        return
 
     if args.max_hosts < 1:
         parser.error("--max-hosts must be at least 1")
