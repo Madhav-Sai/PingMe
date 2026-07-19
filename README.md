@@ -155,7 +155,7 @@ Prefix /22 usage:  ████████████████████�
 └─────────────────────────────────────────────────────┘
 ```
 
----
+--- 
 
 ### 2️⃣ Ping Scan a Subnet
 
@@ -191,7 +191,7 @@ python3 pingme.py --sub 2001:db8:1234::/120 --scan
 
 IPv6 networks can be enormous. PingMe refuses CIDR scans exceeding `65,536` targets by default; use a smaller prefix or deliberately raise the limit with `--max-hosts N`.
 
-**Live output during scan:**
+**Live output during scan :**
 
 ```
 ⠿ Scanning 254 hosts  │  threads=20  timeout=6s  packets/host=8  est≈242s
