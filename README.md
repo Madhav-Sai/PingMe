@@ -1,103 +1,183 @@
 <div align="center">
 
-# PINGME
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.0.4" alt="PingMe animated title" />
 
-### Advanced ICMP/TCP Host Discovery and Subnet Scanner
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=19&duration=2400&pause=700&color=BB86FC&center=true&vCenter=true&width=920&height=110&lines=Advanced+Network+Discovery+Scanner;Hostname+%E2%86%92+IP+%E2%86%92+Reachability+Status;IPv4+%C2%B7+IPv6+%C2%B7+ICMP+%C2%B7+TCP+%C2%B7+DNS+%C2%B7+History;Linux+%C2%B7+Kali+%C2%B7+macOS+%C2%B7+Windows" alt="PingMe animated subtitle" />
 
-**PingMe v3.0.4** · Linux · Kali · Parrot · Arch · macOS · Windows
+<br/>
+
+[![Version](https://img.shields.io/badge/version-3.0.4-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white&labelColor=0d1117)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-BB86FC?style=for-the-badge&labelColor=0d1117)](#)
+[![License](https://img.shields.io/badge/License-MIT-39FF14?style=for-the-badge&labelColor=0d1117)](LICENSE)
+[![Dependencies](https://img.shields.io/badge/Python%20Dependencies-Zero-FF4ECD?style=for-the-badge&labelColor=0d1117)](#)
+[![fping](https://img.shields.io/badge/fping-Optional-FFD700?style=for-the-badge&labelColor=0d1117)](#)
+
+<br/>
+
+```text
+  ██████╗ ██╗███╗   ██╗ ██████╗ ███╗   ███╗███████╗
+  ██╔══██╗██║████╗  ██║██╔════╝ ████╗ ████║██╔════╝
+  ██████╔╝██║██╔██╗ ██║██║  ███╗██╔████╔██║█████╗
+  ██╔═══╝ ██║██║╚██╗██║██║   ██║██║╚██╔╝██║██╔══╝
+  ██║     ██║██║ ╚████║╚██████╔╝██║ ╚═╝ ██║███████╗
+  ╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
+
+  Advanced Ping Scanner v3.0.4
+  Hostname · IP Address · Reachability · TTL · OS Guess
+```
 
 </div>
 
-PingMe is a zero-Python-dependency network discovery utility for subnet analysis, hostname resolution, ICMP/TCP reachability checks, scan history, comparison, resume support, and IP classification.
+---
 
-> Use PingMe only against networks and systems you own or are explicitly authorized to assess.
+## ⚡ What is PingMe?
 
-## Highlights
+**PingMe** is a fast, cross-platform host discovery and network reachability scanner written in pure Python.
 
-- Cross-platform `install.py` with a global `pingme` command.
-- Automatic tab completion for Zsh, Bash, Fish, and PowerShell.
-- Grouped colorful help and nested help topics.
-- IPv4 and IPv6 target support.
-- Hostname and target-file resolution.
-- File results retain the original hostname beside every resolved IP.
-- Final `FILE SCAN STATUS` table shows reachable, no-response, and unresolved hosts.
-- ICMP discovery using `fping` or the operating-system `ping` command.
-- Optional TCP reachability checks for hosts that block ICMP.
-- TTL-based operating-system estimation.
-- Reverse DNS, retries, rate limiting, exclusions, and resume support.
-- TXT, CSV, and JSON output.
-- Scan history, comparison, and snapshot diffing.
+It accepts:
 
-## Repository contents
+- CIDR networks
+- Individual IP addresses
+- Hostnames
+- Files containing IPs and hostnames
+- IPv4 and IPv6 targets
+
+PingMe resolves hostnames, scans every resolved address, displays live progress, writes alive/dead output files, saves scan history, and presents a final status table showing:
 
 ```text
-PingMe-v3.0.4/
-├── pingme.py
-├── install.py
-├── repair-windows.ps1
-├── README.md
-├── RELEASE_NOTES_v3.0.4.md
-├── LICENSE
-├── .gitignore
-├── docs/
-│   └── PingMe_v3.0_Manual.pdf
-├── examples/
-│   └── targets.txt
-└── tests/
-    └── smoke_test.py
+HOST | IP ADDRESS | STATUS | METHOD | TTL | OS GUESS
 ```
 
-## Installation
+It is designed for network engineers, system administrators, VAPT teams, penetration testers, and anyone who needs a clear answer to:
 
-### Kali, Debian, Ubuntu, Parrot
+> Which hosts resolved, which IP belongs to each hostname, and which systems are reachable?
+
+---
+
+## 🎬 Animated Demo
+
+<div align="center">
+
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=15&duration=65&pause=1200&color=39FF14&center=true&vCenter=false&multiline=true&width=1080&height=235&lines=%24+pingme+-f+endpoints.txt;HOST+RESOLUTION+%C2%B7+endpoints.txt;DSIN10329+%E2%86%92+10.100.6.53;FILE+SCAN+STATUS+%C2%B7+endpoints.txt;DSIN10329+%7C+10.100.6.53+%7C+REACHABLE+%7C+ICMP+%7C+TTL+128+%7C+Windows" alt="PingMe animated terminal demo" />
+
+</div>
+
+Example final output:
+
+```text
+FILE SCAN STATUS · endpoints.txt
+
++--------------+-----------------+--------------+----------+-------+------------+
+| HOST         | IP ADDRESS      | STATUS       | METHOD   | TTL   | OS GUESS   |
++--------------+-----------------+--------------+----------+-------+------------+
+| DSIN10329    | 10.100.6.53     | REACHABLE    | ICMP     | 128   | Windows    |
+| DSIN10343    | 10.100.6.12     | NO RESPONSE  | -        | ?     | Unknown    |
+| web01        | 10.100.6.90     | REACHABLE    | TCP:443  | ?     | Unknown    |
++--------------+-----------------+--------------+----------+-------+------------+
+
+Reachable: 2  No response: 1  Unresolved: 0
+```
+
+---
+
+## ✨ Features
+
+<div align="center">
+
+| 🌐 Target Handling | 🔍 Discovery | 📊 Reporting |
+|:---:|:---:|:---:|
+| CIDR, IP, hostname, file | ICMP with `ping` or `fping` | Hostname → IP resolution table |
+| IPv4 and IPv6 | Optional TCP reachability | Reachable / no-response status |
+| Duplicate removal | Reverse DNS | TTL and OS guess |
+| Inline comments in files | Retry and rate limiting | TXT, CSV, and JSON output |
+
+| 📜 History | ⚙️ CLI Experience | 🛡️ Safety |
+|:---:|:---:|:---:|
+| Automatic scan history | Nested help topics | CIDR expansion limit |
+| Previous-scan comparison | Colored flags and output | Validated ports and ranges |
+| Resume interrupted scans | Bash/Zsh/Fish/PowerShell completion | Thread and timeout limits |
+| Snapshot diff mode | Cross-platform installer | Graceful error handling |
+
+</div>
+
+---
+
+## 🚀 Installation
+
+### Linux / Kali / Parrot / Ubuntu
+
+```bash
+git clone https://github.com/Madhav-Sai/pingme.git
+cd pingme
+
+chmod +x pingme.py install.py
+python3 install.py
+exec zsh
+```
+
+For Bash:
+
+```bash
+python3 install.py --shell bash
+exec bash
+```
+
+Install the recommended discovery tools:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 iputils-ping fping
-
-git clone https://github.com/Madhav-Sai/pingme.git
-cd pingme
-python3 install.py
-exec zsh   # use exec bash when Bash is your shell
-```
-
-User-only installation:
-
-```bash
-python3 install.py --user
-```
-
-### Arch Linux
-
-```bash
-sudo pacman -S --needed python iputils fping
-python3 install.py
+sudo apt install -y fping iputils-ping
 ```
 
 ### macOS
 
 ```bash
-brew install python fping
+git clone https://github.com/Madhav-Sai/pingme.git
+cd pingme
+
 python3 install.py
 exec zsh
+```
+
+Optional faster backend:
+
+```bash
+brew install fping
 ```
 
 ### Windows PowerShell
 
 ```powershell
+git clone https://github.com/Madhav-Sai/pingme.git
+cd pingme
+
 python .\install.py
 ```
 
-Open a new PowerShell window after installation. If Windows is still launching a stale copy, use:
+Open a new PowerShell window, then verify:
+
+```powershell
+pingme --version
+pingme --help
+```
+
+If upgrading an older Windows installation, run:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\repair-windows.ps1
 ```
 
-Verify:
+### User-only installation
 
-```text
+```bash
+python3 install.py --user
+```
+
+### Verify
+
+```bash
 pingme --version
 pingme --help
 ```
@@ -105,65 +185,56 @@ pingme --help
 Expected version:
 
 ```text
-pingme 3.0.4 (cross-platform-file-status-final)
+pingme 3.0.4
 ```
 
-## File-based hostname scanning
+---
 
-Create `hosts.txt`:
+## ⌨️ Automatic Tab Completion
 
-```text
-# Internal endpoints
-DSIN10329
-DSIN10343
-192.168.1.10
-```
+PingMe installs completion for:
 
-Run:
+- Zsh
+- Bash
+- Fish
+- PowerShell
+
+Examples:
 
 ```bash
-pingme -f hosts.txt
+pingme --<TAB>
+pingme help <TAB>
+pingme --ping-tool <TAB>
+pingme --out-format <TAB>
 ```
 
-PingMe first displays hostname resolution:
+Completion suggestions include:
 
 ```text
-HOST RESOLUTION · hosts.txt
-+------------+---------------+-----------+
-| HOST       | IP ADDRESS    | TYPE      |
-+------------+---------------+-----------+
-| DSIN10329  | 10.100.6.53   | DNS       |
-| DSIN10343  | 10.100.6.12   | DNS       |
-| 192.168.1.10 | 192.168.1.10 | DIRECT IP |
-+------------+---------------+-----------+
+auto  fping  ping
+txt   csv    json
+targets  scan  discovery  output  history  advanced  examples
 ```
 
-After discovery it displays the final status table:
+---
 
-```text
-FILE SCAN STATUS · hosts.txt
-+------------+---------------+-------------+---------+-----+-----------+
-| HOST       | IP ADDRESS    | STATUS      | METHOD  | TTL | OS GUESS  |
-+------------+---------------+-------------+---------+-----+-----------+
-| DSIN10329  | 10.100.6.53   | REACHABLE   | ICMP    | 128 | Windows   |
-| DSIN10343  | 10.100.6.12   | NO RESPONSE | -       | ?   | Unknown   |
-| bad-host   | UNRESOLVED    | UNRESOLVED  | -       | -   | -         |
-+------------+---------------+-------------+---------+-----+-----------+
-```
+## 🧭 Help System
 
-A hostname can appear more than once when it resolves to both IPv4 and IPv6. Each address is tested independently.
-
-For systems that block ICMP, add TCP ports:
-
-```bash
-pingme -f hosts.txt --tcp-ports 22,80,135,139,443,445,3389
-```
-
-## Nested help
+### Main help
 
 ```bash
 pingme --help
+```
+
+### Full help
+
+```bash
 pingme --help-all
+```
+
+### Nested help topics
+
+```bash
 pingme help targets
 pingme help scan
 pingme help discovery
@@ -173,138 +244,500 @@ pingme help advanced
 pingme help examples
 ```
 
-The equivalent topic form is:
+Alternative syntax:
 
 ```bash
+pingme --help-topic targets
 pingme --help-topic scan
+pingme --help-topic output
 ```
 
-## Common usage
+---
 
-Subnet information only:
+## 📖 Usage
+
+### 1. Subnet information only
 
 ```bash
 pingme --sub 192.168.1.0/24
+pingme --sub 10.10.0.0/22
 ```
 
-Subnet discovery:
+PingMe displays:
+
+- Network address
+- Broadcast address
+- Subnet mask
+- Wildcard mask
+- Prefix length
+- First and last host
+- Usable host count
+- Subnet breakdown
+
+### 2. Scan a subnet
 
 ```bash
 pingme --sub 192.168.1.0/24 --scan
 ```
 
-Fast LAN discovery:
+Fast mode:
 
 ```bash
 pingme --sub 192.168.1.0/24 --scan --fast
 ```
 
-Direct hosts:
+Custom tuning:
 
 ```bash
-pingme --host server01.example.local 10.0.0.10
+pingme --sub 10.0.0.0/22 --scan --threads 30 --timeout 4 --count 5
 ```
 
-Reverse DNS and TCP discovery:
+### 3. Scan a file containing hostnames or IPs
 
 ```bash
-pingme -f targets.txt --dns --tcp-ports 22,80,443,445,3389
+pingme --file endpoints.txt
 ```
 
-Retries and rate limiting:
+Short form:
 
 ```bash
-pingme --sub 10.10.0.0/24 --scan --retry 2 --rate 100
+pingme -f endpoints.txt
 ```
 
-Exclude addresses or networks:
+Example `endpoints.txt`:
 
-```bash
-pingme --sub 10.10.0.0/24 --scan --exclude 10.10.0.1 10.10.0.128/28
+```text
+# Windows endpoints
+DSIN10329
+DSIN10343
+DSIN10418
+
+# Direct IPs
+10.100.6.90
+10.100.6.21
+
+# Inline comments are supported
+web01.corp.local  # production web server
 ```
 
-Output formats:
+PingMe first displays:
 
-```bash
-pingme -f targets.txt --out-format txt
-pingme -f targets.txt --out-format csv --alive-out alive.csv --dead-out dead.csv
-pingme -f targets.txt --out-format json --alive-out alive.json --dead-out dead.json
+```text
+HOST RESOLUTION · endpoints.txt
 ```
 
-History comparison:
+Then scans all resolved addresses and displays:
+
+```text
+FILE SCAN STATUS · endpoints.txt
+```
+
+### 4. Scan one or more hosts directly
 
 ```bash
-pingme -f targets.txt --label office --compare
+pingme --host server01
+pingme --host server01 server02 10.10.10.10
+```
+
+Use `--host` for a few quick targets. Use `--file` for reusable or larger target lists.
+
+### 5. Detect systems that block ICMP
+
+Some hosts reject ICMP but accept TCP connections.
+
+```bash
+pingme -f endpoints.txt --tcp-ports 22,80,135,139,443,445,3389
+```
+
+A host is marked reachable when:
+
+- ICMP responds, or
+- At least one requested TCP port accepts a connection
+
+### 6. Reverse DNS
+
+```bash
+pingme --host 10.10.10.10 --dns
+pingme -f endpoints.txt --dns
+```
+
+### 7. IPv6
+
+```bash
+pingme --host 2001:db8::10
+pingme --sub 2001:db8:1234::/120 --scan
+```
+
+Large IPv6 networks are protected by `--max-hosts`.
+
+### 8. IP classification
+
+```bash
+pingme --ipinfo 8.8.8.8
+pingme --ipinfo 10.0.0.1 172.16.0.10 192.168.1.1 100.64.0.1
+```
+
+Recognized categories include:
+
+- Public
+- RFC 1918 private
+- CGNAT
+- Loopback
+- Link-local
+- Multicast
+- Documentation
+- Reserved
+- IPv6 unique local
+
+---
+
+## 📊 Output Formats
+
+### Plain text
+
+```bash
+pingme -f endpoints.txt --out-format txt
+```
+
+Produces:
+
+```text
+alive.txt
+dead.txt
+```
+
+### CSV
+
+```bash
+pingme -f endpoints.txt --out-format csv
+```
+
+### JSON
+
+```bash
+pingme -f endpoints.txt --out-format json
+```
+
+### Custom output paths
+
+```bash
+pingme -f endpoints.txt \
+  --alive-out results/alive.csv \
+  --dead-out results/dead.csv \
+  --out-format csv
+```
+
+---
+
+## 📜 History, Comparison, and Resume
+
+### Save and compare scans
+
+```bash
+pingme --sub 192.168.1.0/24 --scan --compare --label office
+```
+
+### List history
+
+```bash
 pingme --history
+```
+
+### Clear history
+
+```bash
 pingme --clear-history office
 ```
 
-Snapshot diff:
+### Skip history
 
 ```bash
-pingme --diff alive-old.txt alive-new.txt
+pingme -f endpoints.txt --no-history
 ```
 
-IP classification:
+### Resume an interrupted scan
 
 ```bash
-pingme --ipinfo 8.8.8.8 192.168.1.1 100.64.0.1 127.0.0.1
+pingme -f endpoints.txt --resume
 ```
 
-## Options overview
+### Compare two snapshot files
 
-### Targets
+```bash
+pingme --diff alive_monday.txt alive_friday.txt
+```
+
+---
+
+## 🎛️ Complete Option Reference
+
+### Targets and modes
 
 ```text
 -s, --sub CIDR
+    Show subnet information. Add --scan to scan it.
+
 -f, --file FILE
+    Resolve and scan IP addresses or hostnames from a file.
+
 --host HOST [HOST ...]
---exclude IP/CIDR [IP/CIDR ...]
---max-hosts N
+    Resolve and scan one or more direct targets.
+
+--ipinfo IP [IP ...]
+    Classify addresses as public, private, loopback, and more.
+
+--diff FILE_A FILE_B
+    Compare two host snapshot files.
+
+--history
+    List stored scan history.
+
+--clear-history LABEL
+    Delete history for one label.
 ```
 
-### Discovery
+### Discovery and scan control
 
 ```text
 --scan
---dns
---tcp-ports PORTS
---tcp-timeout SEC
---ipinfo IP [IP ...]
-```
+    Start scanning a CIDR. Implied by --file and --host.
 
-### Scan control
-
-```text
 -t, --threads N
+    Number of concurrent workers. Default: 20.
+
 --timeout SEC
+    Per-packet wait time. Default: 6.
+
 --count N
+    Packets sent per host. Default: 8.
+
+--tcp-ports PORTS
+    TCP ports or ranges, such as 22,80,443 or 8000-8010.
+
+--tcp-timeout SEC
+    TCP connection timeout. Default: 2.
+
 --retry N
+    Retry hosts that did not respond.
+
 --rate PPS
---ping-tool auto|fping|ping
---fast
+    Maximum packet rate. 0 means unlimited.
+
+--dns
+    Perform reverse DNS for reachable hosts.
+
 --resume
+    Continue an interrupted scan.
+
+--ping-tool auto|fping|ping
+    Select the ICMP backend.
+
+--fast
+    Use 100 threads, one-second timeout, and one packet.
+
+--exclude IP/CIDR [...]
+    Skip selected IP addresses or networks.
+
+--max-hosts N
+    Maximum number of addresses expanded from a CIDR.
 ```
 
-### Output and history
+### Output and display
 
 ```text
 --alive-out FILE
+    Output path for reachable hosts.
+
 --dead-out FILE
+    Output path for hosts that gave no response.
+
 --out-format txt|csv|json
+    Select output format.
+
 --label NAME
+    Custom history label.
+
 --quiet
+    Hide per-host live scan lines.
+
 --no-banner
---history
---compare
---diff A B
---clear-history NAME
+    Hide the ASCII banner.
+
 --no-history
+    Do not store the scan.
+
+--compare
+    Compare the current scan with the previous scan.
 ```
 
-## Output files
+### Help
 
-By default PingMe creates:
+```text
+-h, --help
+--help-all
+--help-topic TOPIC
+help TOPIC
+--version
+```
+
+---
+
+## 🧪 Real-World Workflows
+
+### Corporate Windows endpoint check
+
+```bash
+pingme -f endpoints.txt --ping-tool ping
+```
+
+### Windows endpoints with TCP fallback
+
+```bash
+pingme -f endpoints.txt \
+  --tcp-ports 135,139,445,3389 \
+  --ping-tool ping
+```
+
+### Quick local-network discovery
+
+```bash
+pingme --sub 192.168.1.0/24 --scan --fast
+```
+
+### Accurate infrastructure scan
+
+```bash
+pingme -f production.txt \
+  --threads 20 \
+  --timeout 6 \
+  --count 8 \
+  --retry 1 \
+  --dns
+```
+
+### Rate-limited customer assessment
+
+```bash
+pingme -f scope.txt \
+  --rate 100 \
+  --threads 10 \
+  --label customer-network
+```
+
+### Daily network drift check
+
+```bash
+pingme --sub 192.168.10.0/24 \
+  --scan \
+  --compare \
+  --label office
+```
+
+### Structured report data
+
+```bash
+pingme -f endpoints.txt \
+  --tcp-ports 22,80,443,445,3389 \
+  --out-format csv \
+  --alive-out reachable.csv \
+  --dead-out no-response.csv
+```
+
+---
+
+## 🧾 Cheatsheet
+
+```bash
+# Help
+pingme --help
+pingme --help-all
+pingme help examples
+
+# Version
+pingme --version
+
+# File scan
+pingme -f endpoints.txt
+
+# Host scan
+pingme --host server01 10.10.10.10
+
+# CIDR information
+pingme -s 192.168.1.0/24
+
+# CIDR scan
+pingme -s 192.168.1.0/24 --scan
+
+# Fast scan
+pingme -s 192.168.1.0/24 --scan --fast
+
+# Force system ping
+pingme -f endpoints.txt --ping-tool ping
+
+# Force fping
+pingme -f endpoints.txt --ping-tool fping
+
+# ICMP + TCP discovery
+pingme -f endpoints.txt --tcp-ports 22,80,443,445,3389
+
+# Reverse DNS
+pingme -f endpoints.txt --dns
+
+# CSV output
+pingme -f endpoints.txt --out-format csv
+
+# JSON output
+pingme -f endpoints.txt --out-format json
+
+# Compare with previous scan
+pingme -f endpoints.txt --compare --label endpoints
+
+# Resume
+pingme -f endpoints.txt --resume
+
+# Diff snapshots
+pingme --diff old-alive.txt new-alive.txt
+
+# IP classification
+pingme --ipinfo 8.8.8.8 192.168.1.1
+```
+
+---
+
+## 🧠 Why the Defaults?
+
+| Setting | Default | Purpose |
+|---|---:|---|
+| Threads | `20` | Avoids flooding smaller networks |
+| Timeout | `6s` | Allows slow endpoints to respond |
+| Count | `8` | Reduces false-dead results |
+| TCP timeout | `2s` | Keeps fallback checks practical |
+| Maximum CIDR targets | `65,536` | Prevents accidental huge expansion |
+
+A target is reachable if at least one ICMP request succeeds or one configured TCP port accepts a connection.
+
+---
+
+## 🗂️ Repository Structure
+
+```text
+pingme/
+├── pingme.py
+├── install.py
+├── repair-windows.ps1
+├── README.md
+├── RELEASE_NOTES_v3.0.4.md
+├── PingMe_v3.0_Manual.pdf
+├── LICENSE
+├── examples/
+│   └── targets.txt
+├── tests/
+│   └── smoke_test.py
+└── data/
+    └── scan-history.json
+```
+
+Generated during scans:
 
 ```text
 alive.txt
@@ -312,40 +745,176 @@ dead.txt
 data/<label>.json
 ```
 
-`alive.txt` contains reachable IP addresses. `dead.txt` contains addresses that did not respond to ICMP or requested TCP checks. In file mode, the terminal `FILE SCAN STATUS` table preserves the hostname-to-IP relationship.
+---
 
-## Accuracy notes
-
-- `NO RESPONSE` does not always mean a system is powered off. A firewall may block ICMP and the selected TCP ports.
-- Use `--tcp-ports` when assessing hardened endpoints.
-- TTL fingerprinting is an estimate, not authoritative operating-system detection.
-- `fping` is preferred for large Linux/macOS scans, but the built-in `ping` command is supported.
-- Windows does not normally include `fping`; PingMe automatically uses Windows `ping`.
-
-## Testing
-
-Run the bundled smoke test:
-
-```bash
-python3 tests/smoke_test.py
-```
-
-On Windows:
-
-```powershell
-python .\tests\smoke_test.py
-```
-
-The test checks compilation, version output, nested help, subnet/IP information, target-file mapping, TCP reachability, and the final file status table.
-
-## Documentation
-
-The detailed manual is available at:
+## 🔬 How PingMe Works
 
 ```text
-docs/PingMe_v3.0_Manual.pdf
+Targets
+   │
+   ├── CIDR
+   ├── Direct IP
+   ├── Hostname
+   └── Target file
+          │
+          ▼
+Hostname resolution
+          │
+          ▼
+IPv4 / IPv6 address list
+          │
+          ▼
+ICMP discovery ──────┐
+                     ├── Reachability decision
+TCP fallback ────────┘
+          │
+          ▼
+TTL and OS estimation
+          │
+          ▼
+Live scan output
+          │
+          ▼
+HOST | IP | STATUS | METHOD | TTL | OS
+          │
+          ▼
+TXT / CSV / JSON + history
 ```
 
-## License
+---
 
-MIT License. See `LICENSE`.
+## 🛠️ Troubleshooting
+
+### `pingme` command not found
+
+Linux/macOS:
+
+```bash
+python3 install.py
+exec zsh
+```
+
+Windows:
+
+```powershell
+python .\install.py
+```
+
+Open a new PowerShell window.
+
+### Verify the running version
+
+```bash
+pingme --version
+```
+
+### Test the local script directly
+
+Linux/macOS:
+
+```bash
+python3 ./pingme.py --help
+```
+
+Windows:
+
+```powershell
+python .\pingme.py --help
+```
+
+### Hostname is unresolved
+
+Linux:
+
+```bash
+getent hosts HOSTNAME
+ping HOSTNAME
+```
+
+Windows:
+
+```powershell
+Resolve-DnsName HOSTNAME
+ping HOSTNAME
+nslookup HOSTNAME
+```
+
+Corporate hostnames may require the correct VPN, DNS server, domain suffix, or internal network connection.
+
+### `fping` is missing
+
+```bash
+sudo apt install fping
+```
+
+PingMe automatically falls back to system `ping`.
+
+### Host appears dead but is online
+
+Use TCP fallback:
+
+```bash
+pingme -f endpoints.txt --tcp-ports 22,80,443,445,3389
+```
+
+Firewalls commonly block ICMP.
+
+### Windows still runs an older copy
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\repair-windows.ps1
+pingme --version
+```
+
+---
+
+## 🛡️ Accuracy and Safety
+
+- TTL-based operating-system detection is an estimate, not definitive fingerprinting.
+- A no-response result does not always mean a system is powered off.
+- Firewalls may block ICMP while allowing application traffic.
+- IPv6 link-local addresses may require an interface scope identifier.
+- Use TCP checks for systems expected to block ICMP.
+- Scan only systems and networks you own or are explicitly authorized to assess.
+
+---
+
+## 📘 Detailed Manual
+
+The repository includes:
+
+```text
+PingMe_v3.0_Manual.pdf
+```
+
+It covers installation, commands, options, workflows, cheatsheets, output formats, history, troubleshooting, and production usage.
+
+---
+
+## 🤝 Contributing
+
+1. Fork the repository.
+2. Create a feature branch.
+3. Test on at least one supported platform.
+4. Commit the change.
+5. Push the branch.
+6. Open a pull request.
+
+Keep the core scanner lightweight, dependency-free, and compatible with Python 3.9 or newer.
+
+---
+
+## 📄 License
+
+MIT License — free to use, modify, and distribute.
+
+---
+
+<div align="center">
+
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=15&duration=2500&pause=850&color=00F7FF&center=true&vCenter=true&width=760&height=85&lines=Built+by+Madhav;Fast+%C2%B7+Accurate+%C2%B7+Cross-platform;Star+the+repo+if+PingMe+helped+you" alt="PingMe animated footer" />
+
+**[⬆ Back to top](#)**
+
+</div>
