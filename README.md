@@ -532,7 +532,7 @@ Pull requests welcome. Keep it single-file, zero-dependency, and Python 3.9+.
 
 ## 📄 License
 
-MIT License — free to use, modify, and distribute.
+MIT License — free to use, modify, and distribute,
 
 ---
 
