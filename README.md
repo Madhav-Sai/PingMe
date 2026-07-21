@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.0.4" alt="PingMe animated title" />
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.1.0" alt="PingMe animated title" />
 
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=19&duration=2400&pause=700&color=BB86FC&center=true&vCenter=true&width=920&height=110&lines=Advanced+Network+Discovery+Scanner;Hostname+%E2%86%92+IP+%E2%86%92+Reachability+Status;IPv4+%C2%B7+IPv6+%C2%B7+ICMP+%C2%B7+TCP+%C2%B7+DNS+%C2%B7+History;Linux+%C2%B7+Kali+%C2%B7+macOS+%C2%B7+Windows" alt="PingMe animated subtitle" />
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=19&duration=2400&pause=700&color=BB86FC&center=true&vCenter=true&width=920&height=110&lines=Advanced+Network+Discovery+Scanner;Hostname+%E2%86%92+IP+%E2%86%92+Reachability+Status;hostnames.txt+%C2%B7+changes.txt+%C2%B7+alive.txt+%C2%B7+dead.txt;Linux+%C2%B7+Kali+%C2%B7+macOS+%C2%B7+Windows" alt="PingMe animated subtitle" />
 
 <br/>
 
-[![Version](https://img.shields.io/badge/version-3.0.4-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
+[![Version](https://img.shields.io/badge/version-3.1.0-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white&labelColor=0d1117)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-BB86FC?style=for-the-badge&labelColor=0d1117)](#)
 [![License](https://img.shields.io/badge/License-MIT-39FF14?style=for-the-badge&labelColor=0d1117)](LICENSE)
@@ -23,7 +23,7 @@
   ██║     ██║██║ ╚████║╚██████╔╝██║ ╚═╝ ██║███████╗
   ╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
 
-  Advanced Ping Scanner v3.0.4
+  Advanced Ping Scanner v3.1.0
   Hostname · IP Address · Reachability · TTL · OS Guess
 ```
 
@@ -43,10 +43,19 @@ It accepts:
 - Files containing IPs and hostnames
 - IPv4 and IPv6 targets
 
-PingMe resolves hostnames, scans every resolved address, displays live progress, writes alive/dead output files, saves scan history, and presents a final status table showing:
+PingMe resolves hostnames, scans every resolved address, displays live progress, saves scan history, and presents a final status table showing:
 
 ```text
 HOST | IP ADDRESS | STATUS | METHOD | TTL | OS GUESS
+```
+
+For file-based scans, PingMe can also maintain four clear reports:
+
+```text
+hostnames.txt  → Complete hostname, IP, status, method, TTL, and OS report
+changes.txt    → Newly online and went-offline changes
+alive.txt      → IP addresses that are currently reachable
+dead.txt       → IP addresses that are currently not responding
 ```
 
 It is designed for network engineers, system administrators, VAPT teams, penetration testers, and anyone who needs a clear answer to:
@@ -90,12 +99,12 @@ Reachable: 2  No response: 1  Unresolved: 0
 | CIDR, IP, hostname, file | ICMP with `ping` or `fping` | Hostname → IP resolution table |
 | IPv4 and IPv6 | Optional TCP reachability | Reachable / no-response status |
 | Duplicate removal | Reverse DNS | TTL and OS guess |
-| Inline comments in files | Retry and rate limiting | TXT, CSV, and JSON output |
+| Inline comments in files | Retry and rate limiting | `hostnames.txt`, `changes.txt`, alive/dead reports |
 
 | 📜 History | ⚙️ CLI Experience | 🛡️ Safety |
 |:---:|:---:|:---:|
 | Automatic scan history | Nested help topics | CIDR expansion limit |
-| Previous-scan comparison | Colored flags and output | Validated ports and ranges |
+| Simple `--changes` tracking | Colored flags and output | Validated ports and ranges |
 | Resume interrupted scans | Bash/Zsh/Fish/PowerShell completion | Thread and timeout limits |
 | Snapshot diff mode | Cross-platform installer | Graceful error handling |
 
@@ -185,7 +194,7 @@ pingme --help
 Expected version:
 
 ```text
-pingme 3.0.4
+pingme 3.1.0
 ```
 
 ---
@@ -332,6 +341,110 @@ Then scans all resolved addresses and displays:
 FILE SCAN STATUS · endpoints.txt
 ```
 
+The final table contains:
+
+```text
+HOST | IP ADDRESS | STATUS | METHOD | TTL | OS GUESS
+```
+
+Example:
+
+```text
+FILE SCAN STATUS · endpoints.txt
+
++------------+--------------+-------------+--------+-----+----------+
+| HOST       | IP ADDRESS   | STATUS      | METHOD | TTL | OS GUESS |
++------------+--------------+-------------+--------+-----+----------+
+| DSIN10661  | 10.100.6.161 | NO RESPONSE | -      | ?   | Unknown  |
+| DSIN10657  | 10.100.6.106 | REACHABLE   | ICMP   | 128 | Windows  |
++------------+--------------+-------------+--------+-----+----------+
+```
+
+#### File scan reports and simple change tracking
+
+Run:
+
+```bash
+pingme -f endpoints.txt --changes
+```
+
+PingMe creates or updates:
+
+| File | Purpose |
+|---|---|
+| `hostnames.txt` | Complete `HOST`, `IP ADDRESS`, `STATUS`, `METHOD`, `TTL`, and `OS GUESS` report |
+| `changes.txt` | Newly online and went-offline systems since the previous `--changes` run |
+| `alive.txt` | IP addresses currently reachable |
+| `dead.txt` | IP addresses currently not responding |
+
+`hostnames.txt` always contains the complete current file-scan table, including reachable, non-responsive, and unresolved hosts.
+
+On the first `--changes` run, PingMe saves the current scan as the baseline:
+
+```text
+FIRST SCAN · endpoints.txt
+
+Baseline saved.
+
+Online     : 7
+Offline    : 2
+Unresolved : 1
+```
+
+On later runs, `changes.txt` contains only the important differences:
+
+```text
+CHANGES SINCE LAST SCAN · endpoints.txt
+
+NEWLY ONLINE
++------------+--------------+
+| HOST       | IP ADDRESS   |
++------------+--------------+
+| DSIN10661  | 10.100.6.161 |
++------------+--------------+
+
+WENT OFFLINE
++------------+--------------+
+| HOST       | IP ADDRESS   |
++------------+--------------+
+| DSIN10657  | 10.100.6.106 |
++------------+--------------+
+
+Newly online : 1
+Went offline : 1
+Still online : 6
+Still offline: 1
+```
+
+When nothing changed:
+
+```text
+CHANGES SINCE LAST SCAN · endpoints.txt
+
+No changes detected.
+
+Online     : 7
+Offline    : 2
+Unresolved : 0
+```
+
+Custom report names:
+
+```bash
+pingme -f endpoints.txt \
+  --changes \
+  --hostnames-out reports/hostnames.txt \
+  --changes-out reports/changes.txt
+```
+
+Custom alive/dead report names:
+
+```bash
+pingme -f endpoints.txt \
+  --alive-out reports/alive.txt \
+  --dead-out reports/dead.txt
+```
+
 ### 4. Scan one or more hosts directly
 
 ```bash
@@ -391,19 +504,52 @@ Recognized categories include:
 
 ---
 
-## 📊 Output Formats
+## 📊 Output Files and Formats
+
+### Default file-scan reports
+
+```bash
+pingme -f endpoints.txt --changes
+```
+
+Produces or updates:
+
+```text
+hostnames.txt
+changes.txt
+alive.txt
+dead.txt
+```
+
+### `hostnames.txt`
+
+Stores the complete current file-scan report:
+
+```text
+HOST | IP ADDRESS | STATUS | METHOD | TTL | OS GUESS
+```
+
+### `changes.txt`
+
+Stores only the changes since the previous run using the same target file:
+
+```text
+NEWLY ONLINE
+WENT OFFLINE
+```
+
+### `alive.txt`
+
+Stores one currently reachable IP address per line.
+
+### `dead.txt`
+
+Stores one currently non-responsive IP address per line.
 
 ### Plain text
 
 ```bash
 pingme -f endpoints.txt --out-format txt
-```
-
-Produces:
-
-```text
-alive.txt
-dead.txt
 ```
 
 ### CSV
@@ -418,20 +564,39 @@ pingme -f endpoints.txt --out-format csv
 pingme -f endpoints.txt --out-format json
 ```
 
-### Custom output paths
+### Custom report paths
 
 ```bash
 pingme -f endpoints.txt \
-  --alive-out results/alive.csv \
-  --dead-out results/dead.csv \
-  --out-format csv
+  --changes \
+  --hostnames-out reports/hostnames.txt \
+  --changes-out reports/changes.txt \
+  --alive-out reports/alive.txt \
+  --dead-out reports/dead.txt
+```
+
+When using CSV or JSON for the alive/dead result files:
+
+```bash
+pingme -f endpoints.txt \
+  --out-format csv \
+  --alive-out reports/alive.csv \
+  --dead-out reports/dead.csv
 ```
 
 ---
 
-## 📜 History, Comparison, and Resume
+## 📜 History, Changes, Comparison, and Resume
 
-### Save and compare scans
+### Simple file change tracking
+
+```bash
+pingme -f endpoints.txt --changes
+```
+
+Run the same command again later. PingMe automatically compares the current status with the previous `--changes` run for that file and writes the result to `changes.txt`.
+
+### Advanced history comparison
 
 ```bash
 pingme --sub 192.168.1.0/24 --scan --compare --label office
@@ -546,13 +711,24 @@ pingme --diff alive_monday.txt alive_friday.txt
 
 ```text
 --alive-out FILE
-    Output path for reachable hosts.
+    Output path for currently reachable IP addresses.
 
 --dead-out FILE
-    Output path for hosts that gave no response.
+    Output path for currently non-responsive IP addresses.
+
+--hostnames-out FILE
+    Save the complete file-scan report containing HOST, IP ADDRESS,
+    STATUS, METHOD, TTL, and OS GUESS. Default: hostnames.txt.
+
+--changes-out FILE
+    Save newly-online and went-offline changes. Default: changes.txt.
+
+--changes
+    Compare the current file scan with the previous --changes run and
+    update changes.txt.
 
 --out-format txt|csv|json
-    Select output format.
+    Select the alive/dead output format.
 
 --label NAME
     Custom history label.
@@ -567,7 +743,7 @@ pingme --diff alive_monday.txt alive_friday.txt
     Do not store the scan.
 
 --compare
-    Compare the current scan with the previous scan.
+    Advanced history comparison using the selected history label.
 ```
 
 ### Help
@@ -624,7 +800,22 @@ pingme -f scope.txt \
   --label customer-network
 ```
 
-### Daily network drift check
+### Daily endpoint change check
+
+```bash
+pingme -f endpoints.txt --changes
+```
+
+This updates:
+
+```text
+hostnames.txt
+changes.txt
+alive.txt
+dead.txt
+```
+
+### Advanced subnet history comparison
 
 ```bash
 pingme --sub 192.168.10.0/24 \
@@ -637,10 +828,13 @@ pingme --sub 192.168.10.0/24 \
 
 ```bash
 pingme -f endpoints.txt \
+  --changes \
   --tcp-ports 22,80,443,445,3389 \
+  --hostnames-out reports/hostnames.txt \
+  --changes-out reports/changes.txt \
   --out-format csv \
-  --alive-out reachable.csv \
-  --dead-out no-response.csv
+  --alive-out reports/reachable.csv \
+  --dead-out reports/no-response.csv
 ```
 
 ---
@@ -658,6 +852,14 @@ pingme --version
 
 # File scan
 pingme -f endpoints.txt
+
+# File scan + simple change tracking
+pingme -f endpoints.txt --changes
+
+# Custom full hostname and change reports
+pingme -f endpoints.txt --changes \
+  --hostnames-out reports/hostnames.txt \
+  --changes-out reports/changes.txt
 
 # Host scan
 pingme --host server01 10.10.10.10
@@ -689,7 +891,10 @@ pingme -f endpoints.txt --out-format csv
 # JSON output
 pingme -f endpoints.txt --out-format json
 
-# Compare with previous scan
+# Simple comparison with previous file scan
+pingme -f endpoints.txt --changes
+
+# Advanced labeled history comparison
 pingme -f endpoints.txt --compare --label endpoints
 
 # Resume
@@ -726,7 +931,7 @@ pingme/
 ├── install.py
 ├── repair-windows.ps1
 ├── README.md
-├── RELEASE_NOTES_v3.0.4.md
+├── RELEASE_NOTES_v3.1.0.md
 ├── PingMe_v3.0_Manual.pdf
 ├── LICENSE
 ├── examples/
@@ -737,11 +942,13 @@ pingme/
     └── scan-history.json
 ```
 
-Generated during scans:
+Generated during file scans:
 
 ```text
-alive.txt
-dead.txt
+hostnames.txt   # Complete HOST/IP/STATUS/METHOD/TTL/OS report
+changes.txt     # Newly online and went-offline changes
+alive.txt       # Currently reachable IPs
+dead.txt        # Currently non-responsive IPs
 data/<label>.json
 ```
 
@@ -778,7 +985,7 @@ Live scan output
 HOST | IP | STATUS | METHOD | TTL | OS
           │
           ▼
-TXT / CSV / JSON + history
+hostnames.txt / changes.txt / alive.txt / dead.txt + history
 ```
 
 ---
@@ -859,6 +1066,33 @@ pingme -f endpoints.txt --tcp-ports 22,80,443,445,3389
 
 Firewalls commonly block ICMP.
 
+### `changes.txt` shows a first-scan baseline
+
+This is expected on the first run:
+
+```bash
+pingme -f endpoints.txt --changes
+```
+
+Run the same command again later to see newly online and went-offline systems.
+
+### Save reports in another directory
+
+Create the directory first:
+
+```bash
+mkdir -p reports
+```
+
+Then run:
+
+```bash
+pingme -f endpoints.txt \
+  --changes \
+  --hostnames-out reports/hostnames.txt \
+  --changes-out reports/changes.txt
+```
+
 ### Windows still runs an older copy
 
 ```powershell
@@ -888,7 +1122,7 @@ The repository includes:
 PingMe_v3.0_Manual.pdf
 ```
 
-It covers installation, commands, options, workflows, cheatsheets, output formats, history, troubleshooting, and production usage.
+It covers installation, commands, options, workflows, cheatsheets, output formats, file reports, history, troubleshooting, and production usage.
 
 ---
 
