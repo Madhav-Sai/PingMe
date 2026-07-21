@@ -1,545 +1,351 @@
 <div align="center">
 
-<!-- Animated Title -->
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=2000&pause=800&color=00FFFF&center=true&vCenter=true&width=600&height=90&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME" alt="PingMe" />
+# PINGME
 
-<br/>
+### Advanced ICMP/TCP Host Discovery and Subnet Scanner
 
-<!-- Animated subtitle -->
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=18&duration=3000&pause=500&color=BB86FC&center=true&vCenter=true&width=700&lines=Advanced+Network+Ping+Scanner+v2.0;Subnet+Analysis+%C2%B7+Host+Discovery+%C2%B7+History+Tracking;Public+%2F+Private+IP+Classifier+%C2%B7+Scan+Diffing" alt="subtitle" />
+**PingMe v3.0.4** · Linux · Kali · Parrot · Arch · macOS · Windows
 
-<br/><br/>
+</div>
 
-<!-- Badges -->
-[![Python](https://img.shields.io/badge/Python-3.9%2B-00FFFF?style=for-the-badge&logo=python&logoColor=00FFFF&labelColor=0d1117)](https://python.org)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-BB86FC?style=for-the-badge&logo=linux&logoColor=BB86FC&labelColor=0d1117)](.)
-[![License](https://img.shields.io/badge/License-MIT-03DAC6?style=for-the-badge&logoColor=03DAC6&labelColor=0d1117)](LICENSE)
-[![Zero Deps](https://img.shields.io/badge/Dependencies-Zero-CF6679?style=for-the-badge&logoColor=CF6679&labelColor=0d1117)](.)
-[![fping](https://img.shields.io/badge/fping-Optional%20Speedup-FFD700?style=for-the-badge&logoColor=FFD700&labelColor=0d1117)](.)
+PingMe is a zero-Python-dependency network discovery utility for subnet analysis, hostname resolution, ICMP/TCP reachability checks, scan history, comparison, resume support, and IP classification.
 
-<br/>
+> Use PingMe only against networks and systems you own or are explicitly authorized to assess.
 
+## Highlights
+
+- Cross-platform `install.py` with a global `pingme` command.
+- Automatic tab completion for Zsh, Bash, Fish, and PowerShell.
+- Grouped colorful help and nested help topics.
+- IPv4 and IPv6 target support.
+- Hostname and target-file resolution.
+- File results retain the original hostname beside every resolved IP.
+- Final `FILE SCAN STATUS` table shows reachable, no-response, and unresolved hosts.
+- ICMP discovery using `fping` or the operating-system `ping` command.
+- Optional TCP reachability checks for hosts that block ICMP.
+- TTL-based operating-system estimation.
+- Reverse DNS, retries, rate limiting, exclusions, and resume support.
+- TXT, CSV, and JSON output.
+- Scan history, comparison, and snapshot diffing.
+
+## Repository contents
+
+```text
+PingMe-v3.0.4/
+├── pingme.py
+├── install.py
+├── repair-windows.ps1
+├── README.md
+├── RELEASE_NOTES_v3.0.4.md
+├── LICENSE
+├── .gitignore
+├── docs/
+│   └── PingMe_v3.0_Manual.pdf
+├── examples/
+│   └── targets.txt
+└── tests/
+    └── smoke_test.py
 ```
-  ██████╗ ██╗███╗   ██╗ ██████╗ ███╗   ███╗███████╗
-  ██╔══██╗██║████╗  ██║██╔════╝ ████╗ ████║██╔════╝
-  ██████╔╝██║██╔██╗ ██║██║  ███╗██╔████╔██║█████╗
-  ██╔═══╝ ██║██║╚██╗██║██║   ██║██║╚██╔╝██║██╔══╝
-  ██║     ██║██║ ╚████║╚██████╔╝██║ ╚═╝ ██║███████╗
-  ╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
-  Advanced Ping Scanner v2.0  │  Accurate · Fast · Beautiful
-```
 
-</div>
+## Installation
 
----
-
-## ⚡ What is PingMe?
-
-**PingMe** is a professional-grade network ping scanner written in pure Python 3. No third-party libraries. No bloat. Just drop it in, run it, and get accurate results with a beautiful full-color terminal interface.
-
-It's built for network engineers, sysadmins, pentesters, and anyone who needs to know **what's alive on their network** — right now, and compared to last week.
-
----
-
-## 🎬 Demo
-
-<div align="center">
-
-<!-- Subnet info demo -->
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=13&duration=80&pause=2000&color=00FFFF&center=true&vCenter=false&multiline=true&width=700&height=260&lines=+%24+python3+pingme.py+--sub+10.10.0.0%2F22;+;+%E2%94%8C%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80;+%E2%94%82+%F0%9F%8C%90++SUBNET+INFORMATION+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++%E2%94%82;+%E2%94%9C%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%80%E2%94%A4;+%E2%94%82+CIDR++++++++++++++++++++++10.10.0.0%2F22+++++++++++++++++++++++++++++++++++++++++++++++%E2%94%82;+%E2%94%82+Total+Usable+IPs++++++1%2C022++++++++++++++++++++++++++++++++++++++++++++++++++++++++++%E2%94%82" alt="demo" />
-
-</div>
-
----
-
-## ✨ Features
-
-<div align="center">
-
-| 🌐 Subnet Analysis | 🔍 Host Discovery | 📜 History |
-|:---:|:---:|:---:|
-| Full subnet breakdown | Live progress bar | Auto-saves every scan |
-| /8 through /32 support | Alive IPs stream in real-time | Compare across dates |
-| Network · Broadcast · Mask | 3 packets/host (no false-dead) | Track hosts going up/down |
-| Subnet split calculator | fping or OS ping fallback | Trend bar chart |
-
-| 🔐 IP Classifier | 📂 Diff Mode | ⚡ Flexible Speed |
-|:---:|:---:|:---:|
-| Public / Private detection | Compare two alive.txt files | 20 threads default |
-| RFC 1918 Class A/B/C | Newly online / offline | `--fast` mode available |
-| CGNAT RFC 6598 | No scan needed | Custom threads/timeout/count |
-| Loopback · Link-Local · Multicast | Instant results | Accurate by design |
-
-</div>
-
----
-
-## 🚀 Installation
-
-**No pip. No virtual env. Nothing to install.**
+### Kali, Debian, Ubuntu, Parrot
 
 ```bash
-# Clone the repo
+sudo apt update
+sudo apt install -y python3 iputils-ping fping
+
 git clone https://github.com/Madhav-Sai/pingme.git
 cd pingme
-
-# Make it executable
-chmod +x pingme.py
-
-# Run it
-python3 pingme.py --help
+python3 install.py
+exec zsh   # use exec bash when Bash is your shell
 ```
 
-> **Optional:** Install `fping` for significantly faster scanning
-> ```bash
-> # Ubuntu / Debian
-> sudo apt install fping
->
-> # macOS
-> brew install fping
->
-> # RHEL / CentOS / Fedora
-> sudo dnf install fping
-> ```
-
-**Requirements:** Python 3.9+ · No third-party packages · Works on Linux, macOS, Windows
-
----
-
-## 📖 Usage
-
-### 1️⃣ Subnet Information
-
-Instantly analyze any subnet — no scan, just info.
+User-only installation:
 
 ```bash
-python3 pingme.py --sub 192.168.1.0/24
-python3 pingme.py --sub 10.0.0.0/8
-python3 pingme.py --sub 172.16.0.0/12
+python3 install.py --user
 ```
 
-**What you get:**
-
-```
-┌─────────────────────────────────────────────────────┐
-│  🌐  SUBNET INFORMATION                             │
-├─────────────────────────────────────────────────────┤
-│ CIDR                     10.10.0.0/22               │
-│ Network Address          10.10.0.0                  │
-│ Broadcast Address        10.10.3.255                │
-│ Subnet Mask              255.255.252.0              │
-│ Wildcard Mask            0.0.3.255                  │
-│ Prefix Length            /22                        │
-│ IP Version               IPv4                       │
-├─────────────────────────────────────────────────────┤
-│ First Host               10.10.0.1                  │
-│ Last Host                10.10.3.254                │
-│ Total Usable IPs         1,022                      │
-└─────────────────────────────────────────────────────┘
-
-Prefix /22 usage:  ██████████████████████░░░░░░░░░░  (99.8% host space)
-
-┌─────────────────────────────────────────────────────┐
-│  📐  SUBNET BREAKDOWN                               │
-├─────────────────────────────────────────────────────┤
-│ /24 subnets                  4  ×  254 hosts each   │
-│ /25 subnets                  8  ×  126 hosts each   │
-│ /26 subnets                 16  ×   62 hosts each   │
-│ /27 subnets                 32  ×   30 hosts each   │
-│ /28 subnets                 64  ×   14 hosts each   │
-│ /29 subnets                128  ×    6 hosts each   │
-│ /30 subnets                256  ×    2 hosts each   │
-├─────────────────────────────────────────────────────┤
-│ Address Scope            Private · Class C (/24)    │
-│ Total IPs (incl. net+bc) 1,024                      │
-└─────────────────────────────────────────────────────┘
-```
-
---- 
-
-### 2️⃣ Ping Scan a Subnet
+### Arch Linux
 
 ```bash
-# Default (accurate) — 20 threads, 6s timeout, 8 packets per host
-python3 pingme.py --sub 192.168.1.0/24 --scan
-
-# Fast mode — 100 threads, 1s timeout, 1 packet (less accurate)
-python3 pingme.py --sub 192.168.1.0/24 --scan --fast
-
-# Custom tuning
-python3 pingme.py --sub 10.0.0.0/22 --scan --threads 30 --timeout 4 --count 5
-
-# Custom output files
-python3 pingme.py --sub 192.168.1.0/24 --scan --alive-out hosts_up.txt --dead-out hosts_down.txt
-
-# Silent progress (no per-IP output, just the bar)
-python3 pingme.py --sub 192.168.1.0/24 --scan --quiet
-
-# Find hosts that block ICMP but accept TCP connections
-python3 pingme.py --file servers.txt --tcp-ports 22,80,443
-python3 pingme.py --sub 192.168.1.0/24 --scan --tcp-ports 22,80,443,8000-8010
+sudo pacman -S --needed python iputils fping
+python3 install.py
 ```
 
-With `--tcp-ports`, a target is reachable when it responds to ICMP **or** accepts a TCP connection on any requested port. Results include separate `icmp_alive` and `tcp_open` fields in JSON/CSV output.
-
-**IPv6 is supported for individual addresses and practical CIDRs:**
+### macOS
 
 ```bash
-python3 pingme.py --host 2001:db8::10
-python3 pingme.py --sub 2001:db8:1234::/120 --scan
+brew install python fping
+python3 install.py
+exec zsh
 ```
 
-IPv6 networks can be enormous. PingMe refuses CIDR scans exceeding `65,536` targets by default; use a smaller prefix or deliberately raise the limit with `--max-hosts N`.
+### Windows PowerShell
 
-**Live output during scan :**
-
-```
-⠿ Scanning 254 hosts  │  threads=20  timeout=6s  packets/host=8  est≈242s
-
-  ✔ 192.168.1.1       [Private]
-  ✔ 192.168.1.5       [Private]
-  ✔ 192.168.1.20      [Private]
-
-  [████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  30.0%  76/254  ▲12  ▼64
+```powershell
+python .\install.py
 ```
 
-**Results written to:**
+Open a new PowerShell window after installation. If Windows is still launching a stale copy, use:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\repair-windows.ps1
 ```
-alive.txt   →  all responding hosts, sorted
-dead.txt    →  all non-responding hosts, sorted
-./data/     →  scan history (JSON), auto-saved
+
+Verify:
+
+```text
+pingme --version
+pingme --help
 ```
 
----
+Expected version:
 
-### 3️⃣ Scan from an IP or Hostname File
+```text
+pingme 3.0.4 (cross-platform-file-status-final)
+```
 
-Pass any text file with one IP address or hostname per line. Blank lines, inline `#` comments, and duplicate resolved addresses are ignored. Unresolvable entries are skipped with a warning. File input starts a scan automatically.
+## File-based hostname scanning
+
+Create `hosts.txt`:
+
+```text
+# Internal endpoints
+DSIN10329
+DSIN10343
+192.168.1.10
+```
+
+Run:
 
 ```bash
-python3 pingme.py --file myservers.txt
-python3 pingme.py --file /etc/hosts_to_check.txt --threads 10 --quiet
+pingme -f hosts.txt
 ```
 
-**Example `myservers.txt`:**
-```
-# Web servers
-10.0.1.10
-10.0.1.11
+PingMe first displays hostname resolution:
 
-# Database servers
-10.0.2.50
-10.0.2.51
-
-# Hostnames are resolved before scanning
-api.example.com
-db.example.com  # inline comments work
-
-# Invalid lines are safely skipped
-not-an-ip
+```text
+HOST RESOLUTION · hosts.txt
++------------+---------------+-----------+
+| HOST       | IP ADDRESS    | TYPE      |
++------------+---------------+-----------+
+| DSIN10329  | 10.100.6.53   | DNS       |
+| DSIN10343  | 10.100.6.12   | DNS       |
+| 192.168.1.10 | 192.168.1.10 | DIRECT IP |
++------------+---------------+-----------+
 ```
 
----
+After discovery it displays the final status table:
 
-### 4️⃣ Scan Individual Hostnames
+```text
+FILE SCAN STATUS · hosts.txt
++------------+---------------+-------------+---------+-----+-----------+
+| HOST       | IP ADDRESS    | STATUS      | METHOD  | TTL | OS GUESS  |
++------------+---------------+-------------+---------+-----+-----------+
+| DSIN10329  | 10.100.6.53   | REACHABLE   | ICMP    | 128 | Windows   |
+| DSIN10343  | 10.100.6.12   | NO RESPONSE | -       | ?   | Unknown   |
+| bad-host   | UNRESOLVED    | UNRESOLVED  | -       | -   | -         |
++------------+---------------+-------------+---------+-----+-----------+
+```
 
-Resolve and scan one or more hostnames (or individual IP addresses) directly:
+A hostname can appear more than once when it resolves to both IPv4 and IPv6. Each address is tested independently.
+
+For systems that block ICMP, add TCP ports:
 
 ```bash
-python3 pingme.py --host api.example.com
-python3 pingme.py --host api.example.com db.example.com 10.0.0.10 --dns
+pingme -f hosts.txt --tcp-ports 22,80,135,139,443,445,3389
 ```
 
----
-
-### 5️⃣ IP Classifier
-
-Check whether any IP is Public, Private, CGNAT, Loopback, Link-Local, or Multicast — with the exact RFC.
+## Nested help
 
 ```bash
-# Check one IP
-python3 pingme.py --ipinfo 8.8.8.8
-
-# Check many at once
-python3 pingme.py --ipinfo 10.0.0.1 172.20.5.5 192.168.1.1 8.8.8.8 1.1.1.1 100.64.0.1 127.0.0.1
+pingme --help
+pingme --help-all
+pingme help targets
+pingme help scan
+pingme help discovery
+pingme help output
+pingme help history
+pingme help advanced
+pingme help examples
 ```
 
-**Output:**
-
-```
-┌─────────────────────────────────────────────────────┐
-│                 🔍  IP CLASSIFICATION                │
-├─────────────────────────────────────────────────────┤
-│ IP Address         8.8.8.8                          │
-│ Scope              Public                           │
-│ RFC / Auth         IANA                             │
-│ Description        Publicly routable address        │
-├─────────────────────────────────────────────────────┤
-│ IP Address         192.168.1.1                      │
-│ Scope              Private                          │
-│ RFC / Auth         RFC 1918                         │
-│ Description        Class C private (192.168.0.0/16) │
-├─────────────────────────────────────────────────────┤
-│ IP Address         100.64.0.1                       │
-│ Scope              Private                          │
-│ RFC / Auth         RFC 6598                         │
-│ Description        Shared address space / CGNAT     │
-└─────────────────────────────────────────────────────┘
-```
-
-**All recognized scopes:**
-
-| Scope | Range | RFC |
-|---|---|---|
-| 🟢 **Public** | All other addresses | IANA |
-| 🔵 **Private** Class A | `10.0.0.0/8` | RFC 1918 |
-| 🔵 **Private** Class B | `172.16.0.0/12` | RFC 1918 |
-| 🔵 **Private** Class C | `192.168.0.0/16` | RFC 1918 |
-| 🔵 **Private** CGNAT | `100.64.0.0/10` | RFC 6598 |
-| 🟡 **Link-Local** | `169.254.0.0/16` | RFC 3927 |
-| ⚫ **Loopback** | `127.0.0.0/8` | RFC 5735 |
-| 🟠 **Multicast** | `224.0.0.0/4` | RFC 5771 |
-| 🟣 **Reserved** | Various | RFC 1112 |
-| ⚫ **Documentation** | `192.0.2.0/24` etc. | RFC 5737 |
-
----
-
-### 6️⃣ History & Comparison
-
-Every scan is automatically saved to `./data/` in the current working directory. Run the same target again later and compare — PingMe will tell you exactly which hosts came online and which went dark.
+The equivalent topic form is:
 
 ```bash
-# Run scan and compare with previous run on same target
-python3 pingme.py --sub 192.168.1.0/24 --scan --compare
-
-# Use a custom label (groups scans together in history)
-python3 pingme.py --sub 192.168.1.0/24 --scan --compare --label office-network
-
-# Skip saving this scan to history
-python3 pingme.py --sub 192.168.1.0/24 --scan --no-history
-
-# List all stored history
-python3 pingme.py --history
+pingme --help-topic scan
 ```
 
-**Comparison output:**
+## Common usage
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                     🕐  HISTORY COMPARISON                    │
-├──────────────────────────────────────────────────────────────┤
-  Previous scan : 2026-06-13T10:30:00
-  Current scan  : 2026-06-16 14:29:00
-────────────────────────────────────────────────────────────────
-  ↑ Newly UP      :    3
-  ↓ Newly DOWN    :    7
-  ✔ Stayed ALIVE  :   17
-  ✘ Stayed DEAD   :  227
-
-⬆  Hosts that came ONLINE since last scan:
-   + 192.168.1.30
-   + 192.168.1.31
-   + 192.168.1.45
-
-⬇  Hosts that went OFFLINE since last scan:
-   ✘ 192.168.1.2
-   ✘ 192.168.1.8
-   ...
-
-Full Scan History — Alive Counts:
-  #01  2026-06-13T10:30  ██████████████████████████████    24
-  #02  2026-06-14T09:15  ████████████████████████          20
-  #03  2026-06-16T14:29  ███████████████████████████       21  ◀ current
-```
-
----
-
-### 7️⃣ Diff Two Snapshot Files
-
-Compare any two `alive.txt` snapshots directly — no re-scan needed.
+Subnet information only:
 
 ```bash
-python3 pingme.py --diff alive_monday.txt alive_friday.txt
-python3 pingme.py --diff /backups/scan_jan.txt ./alive.txt
+pingme --sub 192.168.1.0/24
 ```
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    📂  FILE DIFF COMPARISON                   │
-├──────────────────────────────────────────────────────────────┤
-  File A: alive_monday.txt  (20 IPs)
-  File B: alive_friday.txt  (23 IPs)
-────────────────────────────────────────────────────────────────
-  In A only (maybe went offline) :  2
-  In B only (came online)        :  5
-  In both                        : 18
-```
+Subnet discovery:
 
----
-
-## 🎛️ All Options
-
-```
-Modes:
-  -s, --sub CIDR        Show subnet info (and optionally scan)
-  -f, --file FILE       Scan IPs/hostnames from a file (one per line)
-  --host HOST [HOST ...] Scan one or more IPs or hostnames
-  --diff FILE_A FILE_B  Compare two alive.txt snapshots
-  --history             List all stored scan history
-  --ipinfo IP [IP ...]  Classify IPs as Public/Private/Special
-
-Scan Options:
-  --scan                Run ping scan (required with --sub; implied by --file/--host)
-  -t, --threads N       Concurrent threads (default: 20)
-  --timeout SEC         Per-packet wait in seconds (default: 6)
-  --count N             Packets per host — alive if ≥1 reply (default: 8)
-  --tcp-ports PORTS     TCP connect checks, e.g. 22,80,443 or 8000-8010
-  --tcp-timeout SEC     TCP connect timeout per port (default: 2)
-  --max-hosts N         Maximum CIDR targets to expand (default: 65536)
-  --fast                Fast mode: 100 threads, 1s, 1 packet (less accurate)
-  --no-history          Don't save this scan to history
-  --compare             Compare with previous scan of same target
-  --quiet               Suppress per-IP output during scan
-
-Output:
-  --alive-out FILE      Output file for alive IPs (default: alive.txt)
-  --dead-out  FILE      Output file for dead IPs  (default: dead.txt)
-  --label NAME          Custom history label (default: CIDR or filename)
-  -h, --help            Show this help message
-```
-
----
-
-## 🧠 Why the Defaults?
-
-PingMe ships with conservative defaults tuned for **accuracy over raw speed**.
-
-| Setting | Value | Reason |
-|---|---|---|
-| `--threads` | `20` | 150+ threads floods small switches, causing legit hosts to show as dead |
-| `--timeout` | `6s` | Slow devices (cameras, printers, PLCs) need up to 5–6s to respond |
-| `--count` | `8` | A single dropped ICMP packet ≠ dead host. 8 packets = confident result |
-
-A host is marked **alive** if **at least 1 of 8 packets** gets a reply. This prevents false-dead results from transient packet loss on a busy network.
-
-> Use `--fast` when you need quick recon on a local, low-latency LAN and don't mind slightly less accuracy.
-
----
-
-## 📁 File Structure
-
-```
-pingme/
-├── pingme.py          ← The entire tool (single file, no deps)
-├── alive.txt          ← Created after each scan
-├── dead.txt           ← Created after each scan
-├── data/
-│   ├── 192.168.1.0_24.json   ← Scan history per target
-│   └── office-network.json
-└── README.md
-```
-
-> All history is stored in `./data/` relative to wherever you run the script. Each project folder keeps its own independent scan history.
-
----
-
-## 🔬 How It Works
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    PingMe Architecture                       │
-├──────────────┬──────────────────────────────────────────────┤
-│  Input       │  CIDR subnet  │  IP file  │  IP list         │
-├──────────────┼──────────────────────────────────────────────┤
-│  Scan Engine │  ThreadPoolExecutor (N workers)               │
-│              │  Each worker → _ping_one(ip, timeout, count) │
-│              │  fping (if installed) or OS ping fallback     │
-├──────────────┼──────────────────────────────────────────────┤
-│  Logic       │  alive = returncode == 0 (≥1 packet replied) │
-│              │  Live progress bar + streaming alive output   │
-├──────────────┼──────────────────────────────────────────────┤
-│  Output      │  alive.txt  dead.txt  ./data/<label>.json    │
-├──────────────┼──────────────────────────────────────────────┤
-│  History     │  JSON append per label, compare on demand    │
-└──────────────┴──────────────────────────────────────────────┘
-```
-
-**Ping backend selection:**
-
-```
-fping installed?
-    YES → fping -c {count} -t {timeout_ms} -q {ip}   ← faster, batch-capable
-    NO  → ping -c {count} -W {timeout} -i 0.5 {ip}   ← OS fallback, -i avoids flooding
-```
-
----
-
-## 🛡️ Accuracy Notes
-
-- **False-dead prevention:** 8 packets per host means a single dropped ICMP packet won't mark a live host as dead
-- **Inter-packet delay:** `0.5s` between packets (`-i 0.5`) prevents flooding your own switch's ARP/ICMP buffer
-- **Timeout safety:** 6s per packet gives slow embedded devices enough time to respond
-- **Thread cap:** Hard capped at 1000 threads maximum; validated on input
-
-> Some hosts **intentionally block ICMP** (firewalls, hardened servers). A "dead" result means no ICMP response — not necessarily that the host is offline. Combine with port scans (nmap) for full certainty.
-
----
-
-## 💡 Examples: Real-World Workflows
-
-**Morning network check — office subnet:**
 ```bash
-python3 pingme.py --sub 192.168.10.0/24 --scan --compare --label office
-# Shows what changed since yesterday
+pingme --sub 192.168.1.0/24 --scan
 ```
 
-**Scan a list of specific servers:**
+Fast LAN discovery:
+
 ```bash
-python3 pingme.py --file production_servers.txt --quiet --label prod
+pingme --sub 192.168.1.0/24 --scan --fast
 ```
 
-**Quick recon of local LAN:**
+Direct hosts:
+
 ```bash
-python3 pingme.py --sub 192.168.1.0/24 --scan --fast
+pingme --host server01.example.local 10.0.0.10
 ```
 
-**Classify a list of IPs from a log file:**
+Reverse DNS and TCP discovery:
+
 ```bash
-cat access.log | awk '{print $1}' | sort -u > ips.txt
-python3 pingme.py --ipinfo $(cat ips.txt)
+pingme -f targets.txt --dns --tcp-ports 22,80,443,445,3389
 ```
 
-**Weekly drift report — what hosts disappeared?**
+Retries and rate limiting:
+
 ```bash
-cp alive.txt alive_last_week.txt
-python3 pingme.py --sub 192.168.1.0/24 --scan
-python3 pingme.py --diff alive_last_week.txt alive.txt
+pingme --sub 10.10.0.0/24 --scan --retry 2 --rate 100
 ```
 
----
+Exclude addresses or networks:
 
-## 🤝 Contributing
+```bash
+pingme --sub 10.10.0.0/24 --scan --exclude 10.10.0.1 10.10.0.128/28
+```
 
-Pull requests welcome. Keep it single-file, zero-dependency, and Python 3.9+.
+Output formats:
 
-1. Fork the repo
-2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Commit: `git commit -m 'Add my feature'`
-4. Push: `git push origin feature/my-feature`
-5. Open a Pull Request
+```bash
+pingme -f targets.txt --out-format txt
+pingme -f targets.txt --out-format csv --alive-out alive.csv --dead-out dead.csv
+pingme -f targets.txt --out-format json --alive-out alive.json --dead-out dead.json
+```
 
----
+History comparison:
 
-## 📄 License
+```bash
+pingme -f targets.txt --label office --compare
+pingme --history
+pingme --clear-history office
+```
 
-MIT License — free to use, modify, and distribute,
+Snapshot diff:
 
----
+```bash
+pingme --diff alive-old.txt alive-new.txt
+```
 
-<div align="center">
+IP classification:
 
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=14&duration=3000&pause=1000&color=00FFFF&center=true&vCenter=true&width=500&lines=Built+with+%E2%9D%A4%EF%B8%8F+and+pure+Python+3;Zero+dependencies.+One+file.+Full+power.;Star+%E2%AD%90+if+PingMe+helped+you!" alt="footer" />
+```bash
+pingme --ipinfo 8.8.8.8 192.168.1.1 100.64.0.1 127.0.0.1
+```
 
-**[⬆ Back to top](#)**
+## Options overview
 
-</div>
+### Targets
+
+```text
+-s, --sub CIDR
+-f, --file FILE
+--host HOST [HOST ...]
+--exclude IP/CIDR [IP/CIDR ...]
+--max-hosts N
+```
+
+### Discovery
+
+```text
+--scan
+--dns
+--tcp-ports PORTS
+--tcp-timeout SEC
+--ipinfo IP [IP ...]
+```
+
+### Scan control
+
+```text
+-t, --threads N
+--timeout SEC
+--count N
+--retry N
+--rate PPS
+--ping-tool auto|fping|ping
+--fast
+--resume
+```
+
+### Output and history
+
+```text
+--alive-out FILE
+--dead-out FILE
+--out-format txt|csv|json
+--label NAME
+--quiet
+--no-banner
+--history
+--compare
+--diff A B
+--clear-history NAME
+--no-history
+```
+
+## Output files
+
+By default PingMe creates:
+
+```text
+alive.txt
+dead.txt
+data/<label>.json
+```
+
+`alive.txt` contains reachable IP addresses. `dead.txt` contains addresses that did not respond to ICMP or requested TCP checks. In file mode, the terminal `FILE SCAN STATUS` table preserves the hostname-to-IP relationship.
+
+## Accuracy notes
+
+- `NO RESPONSE` does not always mean a system is powered off. A firewall may block ICMP and the selected TCP ports.
+- Use `--tcp-ports` when assessing hardened endpoints.
+- TTL fingerprinting is an estimate, not authoritative operating-system detection.
+- `fping` is preferred for large Linux/macOS scans, but the built-in `ping` command is supported.
+- Windows does not normally include `fping`; PingMe automatically uses Windows `ping`.
+
+## Testing
+
+Run the bundled smoke test:
+
+```bash
+python3 tests/smoke_test.py
+```
+
+On Windows:
+
+```powershell
+python .\tests\smoke_test.py
+```
+
+The test checks compilation, version output, nested help, subnet/IP information, target-file mapping, TCP reachability, and the final file status table.
+
+## Documentation
+
+The detailed manual is available at:
+
+```text
+docs/PingMe_v3.0_Manual.pdf
+```
+
+## License
+
+MIT License. See `LICENSE`.
