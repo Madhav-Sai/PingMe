@@ -27,7 +27,7 @@ OPTIONS = [
     "-s", "--sub", "-f", "--file", "--host", "--exclude", "--max-hosts",
     "--scan", "--dns", "--tcp-ports", "--tcp-timeout", "--ipinfo",
     "-t", "--threads", "--timeout", "--count", "--retry", "--rate",
-    "--ping-tool", "--fast", "--resume", "--alive-out", "--dead-out",
+    "--ping-tool", "--fast", "--resume", "--alive-out", "--dead-out", "--error-out",
     "--hostnames-out", "--changes-out", "--out-format", "--label", "--quiet",
     "--no-banner", "--history", "--changes", "--compare", "--diff",
     "--clear-history", "--no-history",
@@ -180,6 +180,7 @@ def _source_version(source: Path) -> str:
 
 def install_windows_launcher(source: Path) -> Path:
     """Force-install the exact local PingMe script and verify the installed build."""
+    existing_command = shutil.which("pingme.cmd") or shutil.which("pingme")
     destination_dir = windows_scripts_dir()
     destination_dir.mkdir(parents=True, exist_ok=True)
 
@@ -198,6 +199,27 @@ def install_windows_launcher(source: Path) -> Path:
         f'@echo off\r\n"{sys.executable}" "{installed_script}" %*\r\n',
         encoding="utf-8",
     )
+
+    # Existing terminals retain their old PATH. Refresh a previously installed
+    # PingMe wrapper only after verifying its adjacent script is really ours.
+    if existing_command:
+        existing_launcher = Path(existing_command)
+        existing_script = existing_launcher.with_name(SCRIPT)
+        try:
+            is_pingme = (
+                existing_launcher.resolve() != launcher.resolve()
+                and existing_script.is_file()
+                and 'APP_NAME = "PingMe"' in existing_script.read_text(encoding="utf-8", errors="replace")
+            )
+            if is_pingme:
+                shutil.copyfile(source, existing_script)
+                existing_launcher.write_text(
+                    f'@echo off\r\n"{sys.executable}" "{existing_script}" %*\r\n',
+                    encoding="utf-8",
+                )
+                success(f"Refreshed existing launcher: {existing_launcher}")
+        except OSError as error:
+            warn(f"Could not refresh existing PingMe launcher: {error}")
 
     add_windows_user_path(destination_dir)
 
@@ -258,7 +280,8 @@ _pingme() {{
     '--compare[legacy IP-only comparison]' \\
     '--quiet[suppress per-host output]' \\
     '--alive-out[alive hosts output file]:file:_files' \\
-    '--dead-out[dead hosts output file]:file:_files' \\
+    '--dead-out[no-response hosts output file]:file:_files' \\
+    '--error-out[probe errors output file]:file:_files' \\
     '--hostnames-out[complete hostname status report]:file:_files' \\
     '--changes-out[changes report file]:file:_files' \\
     '--out-format[output format]:format:({formats})' \\
@@ -291,7 +314,7 @@ def bash_completion() -> str:
             COMPREPLY=( $(compgen -W "{formats}" -- "$cur") )
             return
             ;;
-        -f|--file|--alive-out|--dead-out|--hostnames-out|--changes-out)
+        -f|--file|--alive-out|--dead-out|--error-out|--hostnames-out|--changes-out)
             COMPREPLY=( $(compgen -f -- "$cur") )
             return
             ;;
@@ -335,7 +358,8 @@ def fish_completion() -> str:
         "compare": "Compare with previous scan",
         "quiet": "Suppress per-host output",
         "alive-out": "Alive output file",
-        "dead-out": "Dead output file",
+        "dead-out": "No-response output file",
+        "error-out": "Probe error output file",
         "out-format": "Output format",
         "label": "Custom history label",
         "no-banner": "Hide ASCII banner",
@@ -354,7 +378,7 @@ def fish_completion() -> str:
         [
             f"complete -c pingme -n '__fish_seen_argument -l ping-tool' -a '{' '.join(PING_TOOLS)}'",
             f"complete -c pingme -n '__fish_seen_argument -l out-format' -a '{' '.join(OUTPUT_FORMATS)}'",
-            "complete -c pingme -n '__fish_seen_argument -s f -l file -l alive-out -l dead-out -l diff' -a '(__fish_complete_path)'",
+            "complete -c pingme -n '__fish_seen_argument -s f -l file -l alive-out -l dead-out -l error-out -l diff' -a '(__fish_complete_path)'",
         ]
     )
 
@@ -488,6 +512,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    if os.name == "nt":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
     args = parse_args()
     source = project_script()
     system = detect_os()

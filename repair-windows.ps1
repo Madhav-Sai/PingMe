@@ -7,20 +7,40 @@ if (-not (Test-Path -LiteralPath $Source)) {
     throw "pingme.py was not found beside repair-windows.ps1"
 }
 
-$Python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $Python) {
-    $Python = Get-Command py -ErrorAction SilentlyContinue
-}
-if (-not $Python) {
-    throw 'Python was not found in PATH.'
+$Candidates = @()
+$PythonOnPath = Get-Command python -ErrorAction SilentlyContinue
+if ($PythonOnPath) { $Candidates += ,@($PythonOnPath.Source) }
+$PyLauncher = Get-Command py -ErrorAction SilentlyContinue
+if ($PyLauncher) { $Candidates += ,@($PyLauncher.Source, '-3') }
+$LocalPythonRoot = Join-Path $env:LOCALAPPDATA 'Programs\Python'
+if (Test-Path -LiteralPath $LocalPythonRoot) {
+    Get-ChildItem -LiteralPath $LocalPythonRoot -Directory -Filter 'Python*' |
+        Sort-Object Name -Descending |
+        ForEach-Object {
+            $Executable = Join-Path $_.FullName 'python.exe'
+            if (Test-Path -LiteralPath $Executable) { $Candidates += ,@($Executable) }
+        }
 }
 
-if ($Python.Name -eq 'py.exe' -or $Python.Name -eq 'py') {
-    $Scripts = & $Python.Source -3 -c "import sysconfig; print(sysconfig.get_path('scripts', scheme='nt_user'))"
-    $PythonCommand = @($Python.Source, '-3')
-} else {
-    $Scripts = & $Python.Source -c "import sysconfig; print(sysconfig.get_path('scripts', scheme='nt_user'))"
-    $PythonCommand = @($Python.Source)
+$PythonCommand = $null
+$Scripts = $null
+foreach ($Candidate in $Candidates) {
+    $Executable = $Candidate[0]
+    $InterpreterArgs = @($Candidate | Select-Object -Skip 1)
+    try {
+        $CandidateScripts = & $Executable @InterpreterArgs -c "import sysconfig; print(sysconfig.get_path('scripts', scheme='nt_user'))" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $CandidateScripts) {
+            $PythonCommand = $Candidate
+            $Scripts = $CandidateScripts
+            break
+        }
+    } catch {
+        continue
+    }
+}
+
+if (-not $PythonCommand) {
+    throw 'No working Python 3 interpreter was found.'
 }
 
 $Scripts = $Scripts.Trim()
@@ -52,8 +72,11 @@ $env:Path = "$Scripts;$env:Path"
 Remove-Item Alias:pingme -ErrorAction SilentlyContinue
 Remove-Item Function:pingme -ErrorAction SilentlyContinue
 
+$ExpectedVersion = Select-String -LiteralPath $Source -Pattern '^VERSION\s*=\s*["'']([^"'']+)' |
+    ForEach-Object { $_.Matches[0].Groups[1].Value } |
+    Select-Object -First 1
 $Version = & $Launcher --version
-if ($LASTEXITCODE -ne 0 -or $Version -notmatch '3\.0\.4') {
+if (-not $ExpectedVersion -or $LASTEXITCODE -ne 0 -or $Version -notmatch [regex]::Escape($ExpectedVersion)) {
     throw "PingMe verification failed: $Version"
 }
 

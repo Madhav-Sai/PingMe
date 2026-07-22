@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-platform smoke tests for PingMe v3.0.4."""
+"""Cross-platform smoke tests for PingMe."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ def run(*args: str, cwd: Path | None = None, timeout: int = 60) -> subprocess.Co
         [sys.executable, str(PINGME), *args],
         cwd=str(cwd or ROOT),
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         timeout=timeout,
@@ -42,11 +44,15 @@ def free_port() -> int:
 
 
 def main() -> int:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
     subprocess.run([sys.executable, "-m", "py_compile", str(PINGME)], check=True)
 
     version = run("--version")
     require(version.returncode == 0, "--version failed", version.stdout)
-    require("3.0.4" in version.stdout, "unexpected version", version.stdout)
+    require("3.1.1" in version.stdout, "unexpected version", version.stdout)
 
     help_result = run("help", "examples")
     require(help_result.returncode == 0, "nested help failed", help_result.stdout)

@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.1.0" alt="PingMe animated title" />
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.1.1" alt="PingMe animated title" />
 
 <img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=19&duration=2400&pause=700&color=BB86FC&center=true&vCenter=true&width=920&height=110&lines=Advanced+Network+Discovery+Scanner;Hostname+%E2%86%92+IP+%E2%86%92+Reachability+Status;hostnames.txt+%C2%B7+changes.txt+%C2%B7+alive.txt+%C2%B7+dead.txt;Linux+%C2%B7+Kali+%C2%B7+macOS+%C2%B7+Windows" alt="PingMe animated subtitle" />
 
 <br/>
 
-[![Version](https://img.shields.io/badge/version-3.1.0-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
+[![Version](https://img.shields.io/badge/version-3.1.1-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white&labelColor=0d1117)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-BB86FC?style=for-the-badge&labelColor=0d1117)](#)
 [![License](https://img.shields.io/badge/License-MIT-39FF14?style=for-the-badge&labelColor=0d1117)](LICENSE)
@@ -23,7 +23,7 @@
   ██║     ██║██║ ╚████║╚██████╔╝██║ ╚═╝ ██║███████╗
   ╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
 
-  Advanced Ping Scanner v3.1.0
+  Advanced Ping Scanner v3.1.1
   Hostname · IP Address · Reachability · TTL · OS Guess
 ```
 
@@ -49,13 +49,14 @@ PingMe resolves hostnames, scans every resolved address, displays live progress,
 HOST | IP ADDRESS | STATUS | METHOD | TTL | OS GUESS
 ```
 
-For file-based scans, PingMe can also maintain four clear reports:
+For file-based scans, PingMe can also maintain five clear reports:
 
 ```text
 hostnames.txt  → Complete hostname, IP, status, method, TTL, and OS report
 changes.txt    → Newly online and went-offline changes
 alive.txt      → IP addresses that are currently reachable
 dead.txt       → IP addresses that are currently not responding
+errors.txt     → IP addresses whose probe command failed (not treated as offline)
 ```
 
 It is designed for network engineers, system administrators, VAPT teams, penetration testers, and anyone who needs a clear answer to:
@@ -194,7 +195,7 @@ pingme --help
 Expected version:
 
 ```text
-pingme 3.1.0
+pingme 3.1.1
 ```
 
 ---
@@ -376,6 +377,7 @@ PingMe creates or updates:
 | `changes.txt` | Newly online and went-offline systems since the previous `--changes` run |
 | `alive.txt` | IP addresses currently reachable |
 | `dead.txt` | IP addresses currently not responding |
+| `errors.txt` | Probe failures, excluded from `dead.txt` and offline alerts |
 
 `hostnames.txt` always contains the complete current file-scan table, including reachable, non-responsive, and unresolved hosts.
 
@@ -464,8 +466,11 @@ pingme -f endpoints.txt --tcp-ports 22,80,135,139,443,445,3389
 
 A host is marked reachable when:
 
-- ICMP responds, or
+- a direct ICMP echo reply comes from the exact requested address, or
 - At least one requested TCP port accepts a connection
+
+Packet-summary counters are not accepted as proof. This prevents Windows
+`Destination host unreachable` packets from being counted as live targets.
 
 ### 6. Reverse DNS
 
@@ -716,6 +721,9 @@ pingme --diff alive_monday.txt alive_friday.txt
 --dead-out FILE
     Output path for currently non-responsive IP addresses.
 
+--error-out FILE
+    Output path for inconclusive probe-execution failures.
+
 --hostnames-out FILE
     Save the complete file-scan report containing HOST, IP ADDRESS,
     STATUS, METHOD, TTL, and OS GUESS. Default: hostnames.txt.
@@ -931,7 +939,7 @@ pingme/
 ├── install.py
 ├── repair-windows.ps1
 ├── README.md
-├── RELEASE_NOTES_v3.1.0.md
+├── RELEASE_NOTES_v3.1.1.md
 ├── PingMe_v3.0_Manual.pdf
 ├── LICENSE
 ├── examples/
@@ -1107,6 +1115,8 @@ pingme --version
 
 - TTL-based operating-system detection is an estimate, not definitive fingerprinting.
 - A no-response result does not always mean a system is powered off.
+- `PROBE ERROR` is inconclusive and is never converted to `NO RESPONSE`.
+- PingMe fails closed: only direct target evidence can produce `REACHABLE`.
 - Firewalls may block ICMP while allowing application traffic.
 - IPv6 link-local addresses may require an interface scope identifier.
 - Use TCP checks for systems expected to block ICMP.
