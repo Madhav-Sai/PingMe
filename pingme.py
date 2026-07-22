@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              PingMe — Advanced Ping Scanner v3.1.1 by Madhav       ║
+║              PingMe — Advanced Ping Scanner v3.1.2 by Madhav       ║
 ║   Subnet Info · Ping Scan · TTL Fingerprint · Reverse DNS        ║
 ║   History · Diff · IP Classify · Retry · Resume · Rate-Limit     ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -28,8 +28,8 @@ from typing import Optional, Union
 
 
 APP_NAME = "PingMe"
-VERSION = "3.1.1"
-BUILD = "fail-closed-reachability"
+VERSION = "3.1.2"
+BUILD = "fail-closed-fping"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -540,9 +540,23 @@ def _line_mentions_target(line: str, target: str) -> bool:
 
 
 def _parse_fping_output(ip: str, stdout_text: str, stderr_text: str) -> tuple[bool, Optional[int]]:
-    """Accept only an fping per-packet response line for the requested target."""
-    del stderr_text  # Summary counters are not proof that the target replied.
+    """Require both fping response statistics and exact-target packet evidence."""
     target_prefix = re.compile(rf"^\s*{re.escape(ip)}\s+:\s*", re.IGNORECASE)
+    received = None
+    for line in (stderr_text + "\n" + stdout_text).splitlines():
+        if not target_prefix.search(line):
+            continue
+        summary = re.search(
+            r"\bxmt/rcv/%loss\s*=\s*\d+\s*/\s*(\d+)\s*/",
+            line,
+            re.IGNORECASE,
+        )
+        if summary:
+            received = int(summary.group(1))
+            break
+    if not received:
+        return False, None
+
     for line in stdout_text.splitlines():
         if not target_prefix.search(line):
             continue
@@ -592,8 +606,9 @@ def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, Optional[i
     Rules:
       - NO -p flag (causes subprocess timeout to fire before fping finishes)
       - Capture BOTH stdout AND stderr
+      - Require rcv>0 in the exact target's count-mode statistics
       - Require a per-packet response line for the exact requested target
-      - Never infer reachability from a packet-summary counter
+      - Require fping's documented success exit status for the single target
     """
     if not _FPING_PATH:
         return False, None
@@ -620,7 +635,7 @@ def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, Optional[i
     stdout_text = _decode_probe_output(r.stdout)
     stderr_text = _decode_probe_output(r.stderr)
     alive, ttl = _parse_fping_output(ip, stdout_text, stderr_text)
-    if alive:
+    if alive and r.returncode == 0:
         return True, ttl
     if r.returncode not in (0, 1):
         detail = (stderr_text or stdout_text).strip().splitlines()
@@ -868,7 +883,16 @@ def run_scan(
     t_start   = time.time()
     interrupted = False
 
-    est_sec = (total / max(threads, 1)) * (timeout + 1)
+    waves = (total + max(threads, 1) - 1) // max(threads, 1)
+    if _use_fping():
+        # fping count mode sends to each target at its default one-second
+        # period, then allows the configured timeout for the final response.
+        icmp_est = max(count - 1, 0) + timeout
+    else:
+        # Conservative cross-platform bound for sequential system-ping waits.
+        icmp_est = count * timeout
+    tcp_est = len(tcp_ports or []) * tcp_timeout
+    est_sec = waves * (icmp_est + tcp_est) * (retry + 1)
     rate_str = f"  rate≤{rate}pkt/s" if rate > 0 else ""
     retry_str = f"  retry={retry}" if retry > 0 else ""
     dns_str  = "  +dns" if do_dns else ""

@@ -77,11 +77,17 @@ class ParserTests(unittest.TestCase):
 
     def test_fping_requires_exact_target_response_line(self) -> None:
         stdout = "10.0.0.8 : [0], 64 bytes, 1.20 ms (1.20 avg, 0% loss)"
-        self.assertEqual(pingme._parse_fping_output("10.0.0.8", stdout, ""), (True, None))
-        self.assertEqual(pingme._parse_fping_output("10.0.0.9", stdout, ""), (False, None))
+        stderr = "10.0.0.8 : xmt/rcv/%loss = 1/1/0%, min/avg/max = 1.20/1.20/1.20"
+        self.assertEqual(pingme._parse_fping_output("10.0.0.8", stdout, stderr), (True, None))
+        self.assertEqual(pingme._parse_fping_output("10.0.0.9", stdout, stderr), (False, None))
 
     def test_fping_timeout_line_is_not_reachable(self) -> None:
         stdout = "10.0.0.8 : [0], timed out (NaN avg, 100% loss)"
+        stderr = "10.0.0.8 : xmt/rcv/%loss = 1/0/100%"
+        self.assertEqual(pingme._parse_fping_output("10.0.0.8", stdout, stderr), (False, None))
+
+    def test_fping_icmp_error_byte_line_with_zero_received_is_not_reachable(self) -> None:
+        stdout = "10.0.0.8 : [0], 84 bytes, 0.42 ms (0.42 avg, 0% loss)"
         stderr = "10.0.0.8 : xmt/rcv/%loss = 1/0/100%"
         self.assertEqual(pingme._parse_fping_output("10.0.0.8", stdout, stderr), (False, None))
 
@@ -93,6 +99,26 @@ class ParserTests(unittest.TestCase):
 
 
 class BackendTests(unittest.TestCase):
+    def test_fping_exit_one_overrides_deceptive_packet_text(self) -> None:
+        stdout = b"10.0.0.8 : [0], 84 bytes, 0.42 ms (0.42 avg, 0% loss)"
+        stderr = b"10.0.0.8 : xmt/rcv/%loss = 1/1/0%, min/avg/max = 0.42/0.42/0.42"
+        completed = subprocess.CompletedProcess(["fping"], 1, stdout, stderr)
+        with (
+            patch.object(pingme, "_FPING_PATH", "fping"),
+            patch.object(pingme.subprocess, "run", return_value=completed),
+        ):
+            self.assertEqual(pingme._ping_via_fping("10.0.0.8", 1, 1), (False, None))
+
+    def test_fping_requires_success_exit_summary_and_packet_evidence(self) -> None:
+        stdout = b"10.0.0.8 : [0], 64 bytes, 0.42 ms (0.42 avg, 0% loss)"
+        stderr = b"10.0.0.8 : xmt/rcv/%loss = 1/1/0%, min/avg/max = 0.42/0.42/0.42"
+        completed = subprocess.CompletedProcess(["fping"], 0, stdout, stderr)
+        with (
+            patch.object(pingme, "_FPING_PATH", "fping"),
+            patch.object(pingme.subprocess, "run", return_value=completed),
+        ):
+            self.assertEqual(pingme._ping_via_fping("10.0.0.8", 1, 1), (True, None))
+
     def test_failed_resolution_command_output_is_discarded(self) -> None:
         failed = subprocess.CompletedProcess(["resolver"], 1, b"Address: 8.8.8.8", b"")
         with patch.object(pingme.subprocess, "run", return_value=failed):
