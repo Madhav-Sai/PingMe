@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              PingMe — Advanced Ping Scanner v3.2.1 by Madhav       ║
+║              PingMe — Advanced Ping Scanner v3.2.2 by Madhav       ║
 ║   Subnet Info · Ping Scan · TTL Fingerprint · Reverse DNS        ║
 ║   History · Diff · IP Classify · Retry · Resume · Rate-Limit     ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -28,8 +28,8 @@ from typing import Callable, Optional, Union
 
 
 APP_NAME = "PingMe"
-VERSION = "3.2.1"
-BUILD = "strict-rich-ui"
+VERSION = "3.2.2"
+BUILD = "portable-host-mapping"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1643,7 +1643,11 @@ def show_host_resolution(rows: list[dict], source: str) -> None:
     print(line)
     for row in display_rows:
         row_type = str(row.get("type", "DNS"))
-        kind_color = C.LIME if row_type == "DNS" else (C.YELLOW if row_type == "DIRECT IP" else C.RED)
+        kind_color = {
+            "DNS": C.LIME,
+            "DIRECT IP": C.YELLOW,
+            "FILE MAP": C.CYAN,
+        }.get(row_type, C.RED)
         print(f"  {C.CYAN}|{C.RESET} {str(row['host'])[:host_w]:<{host_w}} {C.CYAN}|{C.RESET} "
               f"{C.WHITE}{str(row['ip'])[:ip_w]:<{ip_w}}{C.RESET} {C.CYAN}|{C.RESET} "
               f"{kind_color}{row_type[:type_w]:<{type_w}}{C.RESET} {C.CYAN}|{C.RESET}")
@@ -2023,6 +2027,38 @@ def read_target_file(path: str) -> tuple[list[str], list[dict]]:
     for raw_line in lines:
         entry = raw_line.split("#", 1)[0].strip()
         if not entry:
+            continue
+
+        # Portable explicit mappings avoid relying on OS-specific short-name
+        # discovery. Accepted forms are "IP HOST [ALIAS ...]", "HOST,IP",
+        # and "IP,HOST".
+        fields = (
+            [field.strip().strip('"').strip("'") for field in next(csv.reader([entry]))]
+            if "," in entry else entry.split()
+        )
+
+        def _field_ip(value: str) -> Optional[str]:
+            try:
+                return _normalise_probe_address(value)
+            except ValueError:
+                return None
+
+        explicit_rows: list[tuple[str, str]] = []
+        if len(fields) >= 2:
+            first_ip = _field_ip(fields[0])
+            second_ip = _field_ip(fields[1])
+            if first_ip:
+                explicit_rows = [
+                    (alias, first_ip) for alias in fields[1:]
+                    if alias and _field_ip(alias) is None
+                ]
+            elif second_ip and fields[0]:
+                explicit_rows = [(fields[0], second_ip)]
+
+        if explicit_rows:
+            for hostname, address in explicit_rows:
+                targets.append(address)
+                mappings.append({"host": hostname, "ip": address, "type": "FILE MAP"})
             continue
 
         # Accept simple CSV input by using the first column as the hostname/IP.

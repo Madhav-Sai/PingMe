@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.2.1" alt="PingMe animated title" />
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.2.2" alt="PingMe animated title" />
 
 <img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=19&duration=2400&pause=700&color=BB86FC&center=true&vCenter=true&width=920&height=110&lines=Advanced+Network+Discovery+Scanner;Hostname+%E2%86%92+IP+%E2%86%92+Reachability+Status;hostnames.txt+%C2%B7+changes.txt+%C2%B7+alive.txt+%C2%B7+dead.txt;Linux+%C2%B7+Kali+%C2%B7+macOS+%C2%B7+Windows" alt="PingMe animated subtitle" />
 
 <br/>
 
-[![Version](https://img.shields.io/badge/version-3.2.1-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
+[![Version](https://img.shields.io/badge/version-3.2.2-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white&labelColor=0d1117)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-BB86FC?style=for-the-badge&labelColor=0d1117)](#)
 [![License](https://img.shields.io/badge/License-MIT-39FF14?style=for-the-badge&labelColor=0d1117)](LICENSE)
@@ -23,7 +23,7 @@
   ██║     ██║██║ ╚████║╚██████╔╝██║ ╚═╝ ██║███████╗
   ╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
 
-  Advanced Ping Scanner v3.2.1
+  Advanced Ping Scanner v3.2.2
   Hostname · IP Address · Reachability · TTL · OS Guess
 ```
 
@@ -195,7 +195,7 @@ pingme --help
 Expected version:
 
 ```text
-pingme 3.2.1
+pingme 3.2.2
 ```
 
 ---
@@ -328,7 +328,13 @@ DSIN10418
 
 # Inline comments are supported
 web01.corp.local  # production web server
+
+# Portable mappings (work without DNS on Linux and Windows)
+172.31.100.2 VAPT-01
+VAPT-02,172.31.100.3
 ```
+
+Explicit `IP HOST`, `HOST,IP`, and `IP,HOST` mappings are accepted. Use them for short Windows/NetBIOS names that Linux cannot resolve through DNS or `/etc/hosts`.
 
 PingMe first displays:
 
@@ -947,7 +953,7 @@ pingme/
 ├── install.py
 ├── repair-windows.ps1
 ├── README.md
-├── RELEASE_NOTES_v3.2.1.md
+├── RELEASE_NOTES_v3.2.2.md
 ├── PingMe_v3.0_Manual.pdf
 ├── LICENSE
 ├── examples/

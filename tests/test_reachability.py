@@ -286,6 +286,26 @@ class BackendTests(unittest.TestCase):
 
 
 class ReportingTests(unittest.TestCase):
+    def test_target_file_supports_portable_explicit_host_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target_file = Path(directory) / "hosts.txt"
+            target_file.write_text(
+                "10.0.0.8 VAPT-01\nVAPT-02,10.0.0.9\n", encoding="utf-8"
+            )
+            with (
+                patch.object(pingme, "resolve_hostname", side_effect=AssertionError("DNS used")),
+                patch("builtins.print"),
+            ):
+                targets, mappings = pingme.read_target_file(str(target_file))
+        self.assertEqual(targets, ["10.0.0.8", "10.0.0.9"])
+        self.assertEqual(
+            [(row["host"], row["ip"], row["type"]) for row in mappings],
+            [
+                ("VAPT-01", "10.0.0.8", "FILE MAP"),
+                ("VAPT-02", "10.0.0.9", "FILE MAP"),
+            ],
+        )
+
     def test_target_directory_is_rejected_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with (
