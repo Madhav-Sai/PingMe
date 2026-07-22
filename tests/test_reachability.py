@@ -286,6 +286,17 @@ class BackendTests(unittest.TestCase):
 
 
 class ReportingTests(unittest.TestCase):
+    def test_target_directory_is_rejected_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("builtins.print") as print_mock,
+                self.assertRaises(SystemExit) as exit_context,
+            ):
+                pingme.read_target_file(directory)
+        self.assertEqual(exit_context.exception.code, 1)
+        rendered = "\n".join(" ".join(map(str, call.args)) for call in print_mock.call_args_list)
+        self.assertIn("Target path is not a file", rendered)
+
     def test_default_report_is_compact(self) -> None:
         result = pingme._build_probe_result("10.0.0.1", True, 64, [])
         with tempfile.TemporaryDirectory() as directory:

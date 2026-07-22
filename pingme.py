@@ -2008,12 +2008,19 @@ def read_target_file(path: str) -> tuple[list[str], list[dict]]:
     p = Path(path)
     if not p.exists():
         print(C.err(f"  ✗ File not found: {path}")); sys.exit(1)
+    if not p.is_file():
+        print(C.err(f"  ✗ Target path is not a file: {path}")); sys.exit(1)
+
+    try:
+        lines = p.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeError) as exc:
+        print(C.err(f"  ✗ Cannot read target file {path}: {exc}")); sys.exit(1)
 
     targets: list[str] = []
     mappings: list[dict] = []
     bad: list[str] = []
 
-    for raw_line in p.read_text(encoding="utf-8-sig").splitlines():
+    for raw_line in lines:
         entry = raw_line.split("#", 1)[0].strip()
         if not entry:
             continue
