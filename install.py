@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import sysconfig
+import tempfile
 from pathlib import Path
 from typing import NoReturn
 
@@ -101,7 +103,6 @@ def make_executable(path: Path) -> None:
 
 
 def install_unix_launcher(source: Path, user_install: bool) -> Path:
-    make_executable(source)
     destination = (
         Path.home() / ".local/bin/pingme"
         if user_install
@@ -112,23 +113,28 @@ def install_unix_launcher(source: Path, user_install: bool) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
 
     absolute_source = source.resolve()
-
-    if destination.exists() or destination.is_symlink():
-        try:
-            if destination.is_symlink() and destination.resolve() == absolute_source:
-                success(f"Launcher already installed: {destination}")
-                return destination
-        except OSError:
-            pass
+    launcher = (
+        "#!/bin/sh\n"
+        f"exec /usr/bin/env python3 {shlex.quote(str(absolute_source))} \"$@\"\n"
+    ).encode("utf-8")
 
     if os.access(destination.parent, os.W_OK):
         destination.unlink(missing_ok=True)
-        destination.symlink_to(absolute_source)
+        destination.write_bytes(launcher)
+        make_executable(destination)
     else:
         info(f"Administrator permission is required to write {destination}")
-        run(["sudo", "ln", "-sfn", str(absolute_source), str(destination)])
+        temporary_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(prefix="pingme-launcher-", delete=False) as temporary:
+                temporary.write(launcher)
+                temporary_name = temporary.name
+            run(["sudo", "install", "-m", "755", temporary_name, str(destination)])
+        finally:
+            if temporary_name:
+                Path(temporary_name).unlink(missing_ok=True)
 
-    success(f"Installed launcher: {destination} -> {absolute_source}")
+    success(f"Installed launcher: {destination} -> python3 {absolute_source}")
     return destination
 
 

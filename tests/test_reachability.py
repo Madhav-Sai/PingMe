@@ -238,6 +238,19 @@ class BackendTests(unittest.TestCase):
         with patch.object(pingme.subprocess, "run", return_value=failed):
             self.assertEqual(pingme._run_resolution_command(["resolver"]), "")
 
+    def test_linux_hostname_resolution_uses_only_bounded_getent(self) -> None:
+        with (
+            patch.object(pingme.sys, "platform", "linux"),
+            patch.object(pingme.shutil, "which", return_value="/usr/bin/getent"),
+            patch.object(pingme, "_resolve_with_getent", return_value=[]) as getent_mock,
+            patch.object(
+                pingme, "_resolve_with_bounded_python",
+                side_effect=AssertionError("unbounded duplicate resolver path used"),
+            ),
+        ):
+            self.assertEqual(pingme.resolve_hostname("VAPT-01"), [])
+        getent_mock.assert_called_once_with("VAPT-01")
+
     def test_windows_backend_rejects_unreachable_received_packets(self) -> None:
         completed = subprocess.CompletedProcess(["ping"], 0, WINDOWS_UNREACHABLE.encode(), b"")
         with (

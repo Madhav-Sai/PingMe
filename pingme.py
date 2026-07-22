@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              PingMe — Advanced Ping Scanner v3.2.2 by Madhav       ║
+║              PingMe — Advanced Ping Scanner v3.2.3 by Madhav       ║
 ║   Subnet Info · Ping Scan · TTL Fingerprint · Reverse DNS        ║
 ║   History · Diff · IP Classify · Retry · Resume · Rate-Limit     ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -28,8 +28,8 @@ from typing import Callable, Optional, Union
 
 
 APP_NAME = "PingMe"
-VERSION = "3.2.2"
-BUILD = "portable-host-mapping"
+VERSION = "3.2.3"
+BUILD = "bounded-linux-resolution"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1547,75 +1547,63 @@ def _resolve_with_windows_tools(hostname: str) -> list[str]:
 
 
 def _resolve_with_getent(hostname: str) -> list[str]:
-    """Resolve through the system NSS database using getent when available."""
+    """Resolve through Linux NSS with a hard process deadline."""
     getent = shutil.which("getent")
     if not getent:
         return []
 
     addresses: list[str] = []
-    for database in ("hosts", "ahosts"):
-        output = _run_resolution_command([getent, database, hostname], timeout=8)
-        if not output:
+    output = _run_resolution_command([getent, "ahosts", hostname], timeout=4)
+    for line in output.splitlines():
+        fields = line.split()
+        if not fields:
             continue
-        for line in output.splitlines():
-            fields = line.split()
-            if not fields:
-                continue
-            candidate = fields[0].split("%", 1)[0]
-            address = _normalise_probe_address(candidate)
-            if address is None:
-                continue
-            if address not in addresses:
-                addresses.append(address)
-        if addresses:
-            break
-    return addresses
-
-
-def resolve_hostname(hostname: str) -> list[str]:
-    """Resolve names through Python, system NSS, and Windows LAN providers."""
-    hostname = hostname.strip().strip('"').strip("'")
-    if not hostname:
-        return []
-
-    addresses: list[str] = []
-
-    # Use the broadest getaddrinfo form. Supplying SOCK_DGRAM can prevent some
-    # Windows name providers from participating in resolution.
-    try:
-        records = socket.getaddrinfo(hostname, None)
-    except (OSError, UnicodeError, socket.gaierror):
-        records = []
-
-    for _family, _type, _proto, _canonname, sockaddr in records:
-        if not sockaddr:
-            continue
-        candidate = str(sockaddr[0]).split("%", 1)[0]
+        candidate = fields[0].split("%", 1)[0]
         address = _normalise_probe_address(candidate)
         if address is None:
             continue
         if address not in addresses:
             addresses.append(address)
+    return addresses
 
-    # Additional legacy API. On some corporate Windows endpoints this succeeds
-    # for short hostnames even when getaddrinfo does not.
-    if not addresses:
+
+def _resolve_with_bounded_python(hostname: str) -> list[str]:
+    """Run Python's socket resolver out-of-process so it can be timed out."""
+    resolver_code = (
+        "import socket,sys\n"
+        "seen=set()\n"
+        "for row in socket.getaddrinfo(sys.argv[1],None):\n"
+        " address=str(row[4][0]).split('%',1)[0]\n"
+        " if address not in seen:\n"
+        "  print(address)\n"
+        "  seen.add(address)\n"
+    )
+    output = _run_resolution_command(
+        [sys.executable, "-c", resolver_code, hostname], timeout=4
+    )
+    addresses: list[str] = []
+    for line in output.splitlines():
         try:
-            _canonical, _aliases, legacy = socket.gethostbyname_ex(hostname)
-        except (OSError, UnicodeError, socket.gaierror):
-            legacy = []
-        for candidate in legacy:
-            address = _normalise_probe_address(candidate)
-            if address is None:
-                continue
-            if address not in addresses:
-                addresses.append(address)
+            address = _normalise_probe_address(line.strip())
+        except ValueError:
+            address = None
+        if address is not None and address not in addresses:
+            addresses.append(address)
+    return addresses
 
-    # getent follows the system NSS configuration (DNS, /etc/hosts, mDNS,
-    # winbind and other configured providers). This mirrors the known-good
-    # shell workflow used by PingMe users.
-    if not addresses:
-        addresses.extend(_resolve_with_getent(hostname))
+
+def resolve_hostname(hostname: str) -> list[str]:
+    """Resolve names through bounded OS-specific resolver processes."""
+    hostname = hostname.strip().strip('"').strip("'")
+    if not hostname:
+        return []
+
+    if sys.platform.startswith("linux") and shutil.which("getent"):
+        # getent follows NSS (DNS, /etc/hosts, mDNS, winbind, and configured
+        # providers). Running it out-of-process lets PingMe enforce a deadline.
+        addresses = _resolve_with_getent(hostname)
+    else:
+        addresses = _resolve_with_bounded_python(hostname)
 
     if not addresses:
         addresses.extend(_resolve_with_windows_tools(hostname))
@@ -2023,6 +2011,7 @@ def read_target_file(path: str) -> tuple[list[str], list[dict]]:
     targets: list[str] = []
     mappings: list[dict] = []
     bad: list[str] = []
+    print(f"  {C.DIM}Resolving targets from {path} (deadline: 4s per hostname)...{C.RESET}", flush=True)
 
     for raw_line in lines:
         entry = raw_line.split("#", 1)[0].strip()
