@@ -112,6 +112,18 @@ class BackendTests(unittest.TestCase):
         ):
             self.assertEqual(pingme.check_deps("auto"), "fping")
 
+    def test_interactive_auto_backend_asks_for_selection(self) -> None:
+        with (
+            patch.object(pingme, "_FPING_PATH", "fping"),
+            patch.object(pingme, "_PING_PATH", "ping"),
+            patch.object(pingme, "_PING6_PATH", None),
+            patch.object(pingme.sys.stdin, "isatty", return_value=True),
+            patch("builtins.input", return_value="2") as input_mock,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(pingme.check_deps("auto", interactive=True), "ping")
+        input_mock.assert_called_once()
+
     def test_fping_batch_uses_one_process_and_accepts_only_requested_stdout_ips(self) -> None:
         completed = subprocess.CompletedProcess(
             ["fping"], 1, b"10.0.0.2\n203.0.113.9\n", b""
@@ -136,15 +148,26 @@ class BackendTests(unittest.TestCase):
             patch.object(
                 pingme,
                 "_ping_via_system",
-                side_effect=[(True, 64), pingme.ProbeExecutionError("invalid ICMP reply payload")],
+                side_effect=[
+                    (True, 64),
+                    (True, 64),
+                    pingme.ProbeExecutionError("invalid ICMP reply payload"),
+                ],
             ) as confirm_mock,
         ):
             results = pingme._scan_fping_batch(addresses, 1, 2, 0, 0, False, None, 1)
-        self.assertEqual(confirm_mock.call_count, 2)
+        self.assertEqual(confirm_mock.call_count, 3)
         self.assertEqual([row["status"] for row in results], [
             "REACHABLE", "PROBE ERROR", "NO RESPONSE"
         ])
         self.assertEqual([row["ip"] for row in results if row["alive"]], ["10.0.0.1"])
+
+    def test_one_valid_echo_is_not_enough_for_positive_status(self) -> None:
+        with patch.object(
+            pingme, "_ping_via_system", side_effect=[(True, 64), (False, None)]
+        ) as ping_mock:
+            self.assertEqual(pingme._confirm_direct_echo("10.0.0.8", 1, 2), (False, None))
+        self.assertEqual(ping_mock.call_count, 2)
 
     def test_run_scan_fping_path_never_starts_per_host_workers(self) -> None:
         expected = [pingme._build_probe_result("10.0.0.1", False, None, [])]

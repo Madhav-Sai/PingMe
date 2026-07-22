@@ -52,7 +52,7 @@ def main() -> int:
 
     version = run("--version")
     require(version.returncode == 0, "--version failed", version.stdout)
-    require("3.2.0" in version.stdout, "unexpected version", version.stdout)
+    require("3.2.1" in version.stdout, "unexpected version", version.stdout)
 
     help_result = run("help", "examples")
     require(help_result.returncode == 0, "nested help failed", help_result.stdout)

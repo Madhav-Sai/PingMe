@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              PingMe — Advanced Ping Scanner v3.2.0 by Madhav       ║
+║              PingMe — Advanced Ping Scanner v3.2.1 by Madhav       ║
 ║   Subnet Info · Ping Scan · TTL Fingerprint · Reverse DNS        ║
 ║   History · Diff · IP Classify · Retry · Resume · Rate-Limit     ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -24,12 +24,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 
 APP_NAME = "PingMe"
-VERSION = "3.2.0"
-BUILD = "batch-automation"
+VERSION = "3.2.1"
+BUILD = "strict-rich-ui"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -696,7 +696,7 @@ def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, Optional[
         if integrity_error:
             raise ProbeExecutionError(f"invalid ICMP reply for {ip}: {integrity_error}")
         alive, ttl = _parse_system_ping_output(ip, stdout_text, sys.platform == "win32")
-        if alive:
+        if alive and r.returncode == 0:
             return True, ttl
         if r.returncode in (0, 1):
             return False, None
@@ -707,6 +707,24 @@ def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, Optional[
     if command_errors:
         raise ProbeExecutionError(f"system ping failed for {ip}: {command_errors[-1]}")
     raise ProbeExecutionError(f"system ping produced no usable result for {ip}")
+
+
+def _confirm_direct_echo(
+    ip: str, timeout: int, confirmations: int = 2
+) -> tuple[bool, Optional[int]]:
+    """Require independent successful ping processes for a positive result.
+
+    Separate processes use separate ICMP request state and prevent one stray,
+    duplicated, or stale reply from satisfying the positive decision.
+    """
+    ttl: Optional[int] = None
+    for _ in range(max(2, confirmations)):
+        alive, observed_ttl = _ping_via_system(ip, timeout, 1)
+        if not alive:
+            return False, None
+        if observed_ttl is not None:
+            ttl = observed_ttl
+    return True, ttl
 
 
 def parse_tcp_ports(value: str) -> list[int]:
@@ -839,6 +857,7 @@ def _scan_fping_batch(
     do_dns: bool,
     tcp_ports: Optional[list[int]],
     tcp_timeout: int,
+    progress_callback: Optional[Callable[[dict, int, int], None]] = None,
 ) -> list[dict]:
     """Batch discovery followed by serialized validation of positives."""
     attempts = count * (retry + 1)
@@ -860,13 +879,16 @@ def _scan_fping_batch(
                 probe_error = "fping positive could not be integrity-confirmed: system ping unavailable"
             else:
                 try:
-                    icmp_alive, ttl = _ping_via_system(ip, timeout, min(count, 2))
+                    icmp_alive, ttl = _confirm_direct_echo(ip, timeout, count)
                 except Exception as exc:
                     probe_error = f"invalid ICMP confirmation: {exc}"
                 if not icmp_alive and not probe_error:
                     probe_error = "fping positive was not confirmed by a valid echo reply"
         open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
-        results.append(_build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns))
+        result = _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns)
+        results.append(result)
+        if progress_callback:
+            progress_callback(result, len(results), len(ip_list))
     return results
 
 
@@ -903,7 +925,7 @@ def _ping_one(
                     probe_error = "fping reply could not be integrity-confirmed because system ping is unavailable"
                 else:
                     try:
-                        confirmed, confirmed_ttl = _ping_via_system(ip, timeout, min(count, 2))
+                        confirmed, confirmed_ttl = _confirm_direct_echo(ip, timeout, count)
                     except Exception as confirmation_error:
                         icmp_alive = False
                         probe_error = f"fping reply failed integrity confirmation: {confirmation_error}"
@@ -917,7 +939,7 @@ def _ping_one(
             # A broken fping invocation falls back to system ping. It becomes a
             # probe error only when that independent backend also fails.
             try:
-                icmp_alive, ttl = _ping_via_system(ip, timeout, count)
+                icmp_alive, ttl = _confirm_direct_echo(ip, timeout, count)
             except Exception as system_error:
                 icmp_alive, ttl = False, None
                 probe_error = f"fping: {fping_error}; ping: {system_error}"
@@ -928,7 +950,7 @@ def _ping_one(
                 probe_error = "no ICMP probe tool is available"
         else:
             try:
-                icmp_alive, ttl = _ping_via_system(ip, timeout, count)
+                icmp_alive, ttl = _confirm_direct_echo(ip, timeout, count)
             except Exception as exc:
                 icmp_alive, ttl = False, None
                 probe_error = str(exc)
@@ -1004,7 +1026,7 @@ def run_scan(
     if _use_fping():
         # Alive mode makes at most ``count`` attempts; positives then receive a
         # short independent integrity confirmation through system ping.
-        icmp_est = (count + min(count, 2)) * timeout
+        icmp_est = (count + max(count, 2)) * timeout
     else:
         # Conservative cross-platform bound for sequential system-ping waits.
         icmp_est = count * timeout
@@ -1024,8 +1046,33 @@ def run_scan(
         )
 
     if _use_fping():
+        live_counts = {"alive": 0, "no_response": 0, "errors": 0}
+
+        def _batch_progress(result: dict, completed: int, target_total: int) -> None:
+            if result["alive"]:
+                live_counts["alive"] += 1
+                ttl_s = f"TTL={result['ttl']}" if result["ttl"] else "TTL=?"
+                sys.stdout.write(
+                    f"\r  {C.GREEN}✔ {result['ip']:<18}{C.RESET}"
+                    f"  {C.DIM}{'ICMP':<12} {ttl_s:<8}{C.RESET}"
+                    f"  {ttl_color(result['os_guess'])}{result['os_guess']:<16}{C.RESET}\n"
+                )
+            elif result.get("status") == "PROBE ERROR":
+                live_counts["errors"] += 1
+                sys.stdout.write(
+                    f"\r  {C.YELLOW}! {result['ip']:<18} {'PROBE ERROR':<12}{C.RESET}"
+                    f"  {C.DIM}{result.get('probe_error', '')[:44]}{C.RESET}\n"
+                )
+            else:
+                live_counts["no_response"] += 1
+            _progress_bar(
+                completed, target_total, live_counts["alive"],
+                live_counts["no_response"], live_counts["errors"],
+            )
+
         results = _scan_fping_batch(
-            ip_list, timeout, count, retry, rate, do_dns, tcp_ports, tcp_timeout
+            ip_list, timeout, count, retry, rate, do_dns, tcp_ports, tcp_timeout,
+            None if quiet else _batch_progress,
         )
         elapsed = time.time() - t_start
         if not quiet:
@@ -2054,10 +2101,12 @@ def resolve_host_arguments(hostnames: list[str]) -> list[str]:
 # ─────────────────────────────────────────────────────────────────
 # CHECK DEPENDENCIES + TOOL SELECTION  (FIX 5)
 # ─────────────────────────────────────────────────────────────────
-def check_deps(ping_tool: str = "auto", verbose: bool = False) -> str:
+def check_deps(
+    ping_tool: str = "auto", verbose: bool = False, interactive: bool = False
+) -> str:
     """
     Detect available ping tools, honour --ping-tool flag, and
-    select a backend without prompting.
+    optionally ask an interactive user to choose the backend.
     Returns the resolved tool name: "fping" | "ping".
     """
     global _PING_TOOL, _FPING_PATH, _PING_PATH, _PING6_PATH
@@ -2092,7 +2141,16 @@ def check_deps(ping_tool: str = "auto", verbose: bool = False) -> str:
             sys.exit(3)
         _PING_TOOL = "ping"
     else:
-        if has_fping:
+        if has_fping and has_ping and interactive and sys.stdin.isatty():
+            print(f"\n  {C.BOLD}{C.CYAN}Select ping backend:{C.RESET}")
+            print(f"  {C.GREEN}[1]{C.RESET} fping  {C.DIM}(batch discovery + strict ping confirmation){C.RESET}")
+            print(f"  {C.YELLOW}[2]{C.RESET} ping   {C.DIM}(system ping only){C.RESET}")
+            try:
+                choice = input(f"  {C.BOLD}Choice [1/2, default=1]:{C.RESET} ").strip()
+            except (EOFError, KeyboardInterrupt):
+                choice = ""
+            _PING_TOOL = "ping" if choice == "2" else "fping"
+        elif has_fping:
             _PING_TOOL = "fping"
         else:
             _PING_TOOL = "ping"
@@ -2237,6 +2295,7 @@ def print_topic_help(topic: str) -> None:
             ("--changes-out FILE", "Saved change summary when --changes is used (default: changes.txt)."),
             ("--out-format txt|csv|json", "Choose the file format."),
             ("--quiet", "Write files only; suppress normal terminal output."),
+            ("--compact", "Show only the summary and saved file paths."),
             ("--verbose", "Show diagnostic tables, progress, and backend details."),
             ("--no-banner", "Suppress the startup banner."),
             ("--label NAME", "Set a stable label for history and resume data."),
@@ -2369,8 +2428,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="History/resume label (default: target-derived)")
     og.add_argument("--quiet", action="store_true",
                     help="Write files only; suppress normal terminal output")
+    og.add_argument("--compact", action="store_true",
+                    help="Show only the summary and saved file paths")
     og.add_argument("--verbose", action="store_true",
-                    help="Show diagnostic tables, progress, and backend details")
+                    help="Force graphical diagnostic output even when redirected")
     og.add_argument("--no-banner", action="store_true",
                     help="Suppress the ASCII banner")
 
@@ -2451,6 +2512,10 @@ def main():
             parser.error(str(exc))
     if (args.file or args.host) and not args.scan:
         args.scan = True
+    if args.quiet and (args.compact or args.verbose):
+        parser.error("--quiet cannot be combined with --compact or --verbose")
+    if args.compact and args.verbose:
+        parser.error("--compact and --verbose cannot be combined")
     if args.changes and not args.file:
         parser.error("--changes currently requires --file")
     output_options = {
@@ -2470,9 +2535,12 @@ def main():
             parser.error(f"{option} and {previous_option} must use different files")
         seen_output_paths[normalized] = option
 
-    # Scans are compact by default so their output is safe for automation.
-    # Analysis/history commands retain the visual interface.
-    banner(no_banner=args.no_banner or (args.scan and not args.verbose) or args.quiet)
+    # Interactive terminals get the graphical UI. Redirected output is compact
+    # unless --verbose explicitly requests the full diagnostic interface.
+    rich_output = args.verbose or (
+        sys.stdout.isatty() and not args.compact and not args.quiet
+    )
+    banner(no_banner=args.no_banner or (args.scan and not rich_output) or args.quiet)
 
     # ── clear history ───────────────────────────────────────────
     if args.clear_history:
@@ -2503,7 +2571,7 @@ def main():
     subnet_target_count: Optional[int] = None
 
     if args.sub:
-        net = show_subnet_info(args.sub, display=not args.scan or args.verbose)
+        net = show_subnet_info(args.sub, display=not args.scan or rich_output)
         subnet_target_count = max(net.num_addresses - 2, 0) if net.version == 4 and net.prefixlen <= 30 else net.num_addresses
         if args.scan:
             if subnet_target_count > args.max_hosts:
@@ -2522,7 +2590,7 @@ def main():
         # Always show the original hostname-to-IP mapping before scanning.
         # This makes file mode auditable and prevents users from seeing only
         # anonymous IP addresses during the scan.
-        if args.verbose:
+        if rich_output:
             show_host_resolution(file_mappings, args.file)
         ip_list.extend(file_targets)
         if not label:
@@ -2555,7 +2623,7 @@ def main():
                 if row_ip not in {"", "UNRESOLVED"} and row_ip not in remaining_ips:
                     row["excluded"] = True
         skipped = before - len(ip_list)
-        if skipped and args.verbose:
+        if skipped and rich_output:
             print(f"  {C.DIM}[exclude] Skipped {skipped} IPs{C.RESET}")
 
     if args.scan and not ip_list:
@@ -2564,11 +2632,15 @@ def main():
     # ── scan ────────────────────────────────────────────────────
     if args.scan:
         if not args.tcp_ports or _FPING_PATH or _PING_PATH or _PING6_PATH:
-            check_deps(ping_tool=args.ping_tool, verbose=args.verbose)
+            check_deps(
+                ping_tool=args.ping_tool,
+                verbose=rich_output,
+                interactive=rich_output,
+            )
 
         if args.fast:
             args.threads = 100; args.timeout = 1; args.count = 1
-            if args.verbose:
+            if rich_output:
                 print(f"  {C.YELLOW}⚡ Fast mode — less accurate on slow/busy hosts.{C.RESET}")
 
         args.threads = max(1,  min(1000, args.threads))
@@ -2586,7 +2658,7 @@ def main():
             retry   = args.retry,
             rate    = args.rate,
             label   = label,
-            quiet   = args.quiet or not args.verbose,
+            quiet   = not rich_output,
             do_dns  = args.dns,
             resume  = args.resume,
             tcp_ports = args.tcp_ports,
@@ -2597,12 +2669,12 @@ def main():
         dead  = [r["ip"] for r in results if r.get("status") == "NO RESPONSE"]
 
         if args.file and file_mappings:
-            if args.verbose:
+            if rich_output:
                 status_records = show_file_scan_status(file_mappings, results, args.file)
             else:
                 status_records = build_file_status_records(file_mappings, results)
             write_hostnames_report(
-                status_records, args.file, args.hostnames_out, announce=args.verbose
+                status_records, args.file, args.hostnames_out, announce=rich_output
             )
 
             if args.changes:
@@ -2617,11 +2689,11 @@ def main():
             error_file=args.error_out,
             out_format=args.out_format,
             quiet=args.quiet,
-            verbose=args.verbose,
+            verbose=rich_output,
         )
 
         if not args.no_history:
-            save_scan(label, results, announce=args.verbose)
+            save_scan(label, results, announce=rich_output)
 
         if args.compare:
             compare_history(label, alive, dead)
@@ -2629,7 +2701,7 @@ def main():
     elif args.sub and not args.scan:
         print(f"  {C.DIM}Tip: add {C.BOLD}--scan{C.RESET}{C.DIM} to ping all {subnet_target_count or 0:,} hosts.{C.RESET}\n")
 
-    if args.verbose or not args.scan:
+    if rich_output or not args.scan:
         print()
 
 

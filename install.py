@@ -28,7 +28,7 @@ OPTIONS = [
     "--scan", "--dns", "--tcp-ports", "--tcp-timeout", "--ipinfo",
     "-t", "--threads", "--timeout", "--count", "--retry", "--rate",
     "--ping-tool", "--fast", "--resume", "--alive-out", "--dead-out", "--error-out",
-    "--hostnames-out", "--changes-out", "--out-format", "--label", "--quiet", "--verbose",
+    "--hostnames-out", "--changes-out", "--out-format", "--label", "--quiet", "--compact", "--verbose",
     "--no-banner", "--history", "--changes", "--compare", "--diff",
     "--clear-history", "--no-history",
 ]
