@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              PingMe — Advanced Ping Scanner v3.1.3 by Madhav       ║
+║              PingMe — Advanced Ping Scanner v3.2.0 by Madhav       ║
 ║   Subnet Info · Ping Scan · TTL Fingerprint · Reverse DNS        ║
 ║   History · Diff · IP Classify · Retry · Resume · Rate-Limit     ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -28,8 +28,8 @@ from typing import Optional, Union
 
 
 APP_NAME = "PingMe"
-VERSION = "3.1.3"
-BUILD = "strict-icmp-integrity"
+VERSION = "3.2.0"
+BUILD = "batch-automation"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ def history_file(label: str) -> Path:
     return d / f"{safe}.json"
 
 
-def save_scan(label: str, results: list[dict]):
+def save_scan(label: str, results: list[dict], announce: bool = True):
     """Save a scan. results = list of {ip, alive, ttl, os_guess, hostname, scope}"""
     alive = sorted(r["ip"] for r in results if r["alive"])
     dead  = sorted(r["ip"] for r in results if r.get("status") == "NO RESPONSE")
@@ -109,7 +109,8 @@ def save_scan(label: str, results: list[dict]):
         existing = []
     existing.append(data)
     hf.write_text(json.dumps(existing, indent=2))
-    print(f"  {C.DIM}[data] saved → {hf}{C.RESET}")
+    if announce:
+        print(f"  {C.DIM}[data] saved → {hf}{C.RESET}")
 
 
 def load_history(label: str) -> list[dict]:
@@ -329,12 +330,17 @@ def banner(no_banner: bool = False):
 # ─────────────────────────────────────────────────────────────────
 # SUBNET INFO
 # ─────────────────────────────────────────────────────────────────
-def show_subnet_info(cidr: str) -> Union[ipaddress.IPv4Network, ipaddress.IPv6Network]:
+def show_subnet_info(
+    cidr: str, display: bool = True
+) -> Union[ipaddress.IPv4Network, ipaddress.IPv6Network]:
     try:
         net = ipaddress.ip_network(cidr, strict=False)
     except ValueError as e:
         print(C.err(f"\n  ✗ Invalid CIDR: {e}"))
         sys.exit(1)
+
+    if not display:
+        return net
 
     is_ipv4 = net.version == 4
     total = max(net.num_addresses - 2, 0) if is_ipv4 and net.prefixlen <= 30 else net.num_addresses
@@ -737,6 +743,133 @@ def tcp_open_ports(ip: str, ports: list[int], timeout: int) -> list[int]:
     return open_ports
 
 
+def _build_probe_result(
+    ip: str,
+    icmp_alive: bool,
+    ttl: Optional[int],
+    open_tcp_ports: list[int],
+    probe_error: str = "",
+    do_dns: bool = False,
+) -> dict:
+    """Build one normalized tri-state result from validated evidence."""
+    alive = icmp_alive or bool(open_tcp_ports)
+    if alive:
+        status = "REACHABLE"
+        evidence = "ICMP echo reply" if icmp_alive else "TCP connection accepted"
+    elif probe_error:
+        status = "PROBE ERROR"
+        evidence = ""
+    else:
+        status = "NO RESPONSE"
+        evidence = ""
+    classify = ip_classify(ip)
+    return {
+        "ip": ip,
+        "alive": alive,
+        "status": status,
+        "evidence": evidence,
+        "probe_error": probe_error,
+        "icmp_alive": icmp_alive,
+        "tcp_open": open_tcp_ports,
+        "ttl": ttl,
+        "os_guess": ttl_to_os(ttl) if icmp_alive else "",
+        "hostname": reverse_dns(ip) if (alive and do_dns) else "",
+        "scope": classify["scope"],
+        "rfc": classify["rfc"],
+    }
+
+
+def _fping_batch_alive(
+    ip_list: list[str],
+    timeout: int,
+    attempts: int,
+    rate: int = 0,
+) -> set[str]:
+    """Discover all fping-positive targets in one process using stdin."""
+    if not _FPING_PATH:
+        raise ProbeExecutionError("fping is unavailable")
+    command = [
+        _FPING_PATH,
+        "-a",
+        "-r", str(max(attempts - 1, 0)),
+        "-B", "1.0",
+        "-t", str(timeout * 1000),
+    ]
+    if rate > 0:
+        interval_ms = max(1, (1000 + rate - 1) // rate)
+        command.extend(["-i", str(interval_ms)])
+    payload = ("\n".join(ip_list) + "\n").encode()
+    interval_budget = (len(ip_list) * max(attempts, 1) / max(rate, 100)) + 2
+    proc_timeout = (max(attempts, 1) * timeout) + interval_budget + 10
+    try:
+        result = subprocess.run(
+            command,
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=proc_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeExecutionError("batch fping exceeded its process deadline") from exc
+    except OSError as exc:
+        raise ProbeExecutionError(f"batch fping could not execute: {exc}") from exc
+
+    stdout_text = _decode_probe_output(result.stdout)
+    stderr_text = _decode_probe_output(result.stderr)
+    if result.returncode not in (0, 1):
+        detail = (stderr_text or stdout_text).strip().splitlines()
+        message = detail[-1] if detail else f"exit code {result.returncode}"
+        raise ProbeExecutionError(f"batch fping failed: {message}")
+
+    requested = {_normalise_probe_address(ip) for ip in ip_list}
+    alive: set[str] = set()
+    for line in stdout_text.splitlines():
+        candidate = _normalise_probe_address(line.strip())
+        if candidate is not None and candidate in requested:
+            alive.add(candidate)
+    return alive
+
+
+def _scan_fping_batch(
+    ip_list: list[str],
+    timeout: int,
+    count: int,
+    retry: int,
+    rate: int,
+    do_dns: bool,
+    tcp_ports: Optional[list[int]],
+    tcp_timeout: int,
+) -> list[dict]:
+    """Batch discovery followed by serialized validation of positives."""
+    attempts = count * (retry + 1)
+    try:
+        candidates = _fping_batch_alive(ip_list, timeout, attempts, rate)
+    except Exception as exc:
+        return [
+            _build_probe_result(ip, False, None, [], f"fping batch failed: {exc}", do_dns)
+            for ip in ip_list
+        ]
+
+    results: list[dict] = []
+    for ip in ip_list:
+        icmp_alive = False
+        ttl = None
+        probe_error = ""
+        if _normalise_probe_address(ip) in candidates:
+            if _PING_PATH is None and _PING6_PATH is None:
+                probe_error = "fping positive could not be integrity-confirmed: system ping unavailable"
+            else:
+                try:
+                    icmp_alive, ttl = _ping_via_system(ip, timeout, min(count, 2))
+                except Exception as exc:
+                    probe_error = f"invalid ICMP confirmation: {exc}"
+                if not icmp_alive and not probe_error:
+                    probe_error = "fping positive was not confirmed by a valid echo reply"
+        open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
+        results.append(_build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns))
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────
 # SINGLE-IP PING  — returns rich result dict
 # ─────────────────────────────────────────────────────────────────
@@ -800,35 +933,8 @@ def _ping_one(
                 icmp_alive, ttl = False, None
                 probe_error = str(exc)
 
-    open_tcp_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
-    alive = icmp_alive or bool(open_tcp_ports)
-    if alive:
-        status = "REACHABLE"
-        evidence = "ICMP echo reply" if icmp_alive else "TCP connection accepted"
-    elif probe_error:
-        status = "PROBE ERROR"
-        evidence = ""
-    else:
-        status = "NO RESPONSE"
-        evidence = ""
-    os_guess = ttl_to_os(ttl) if icmp_alive else ""
-    hostname = reverse_dns(ip) if (alive and do_dns) else ""
-    classify = ip_classify(ip)
-
-    return {
-        "ip":       ip,
-        "alive":    alive,
-        "status":   status,
-        "evidence": evidence,
-        "probe_error": probe_error,
-        "icmp_alive": icmp_alive,
-        "tcp_open": open_tcp_ports,
-        "ttl":      ttl,
-        "os_guess": os_guess,
-        "hostname": hostname,
-        "scope":    classify["scope"],
-        "rfc":      classify["rfc"],
-    }
+    open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
+    return _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -852,8 +958,8 @@ def _progress_bar(done: int, total: int, alive: int, no_response: int, errors: i
 def run_scan(
     ip_list:      list[str],
     threads:      int         = 20,
-    timeout:      int         = 6,
-    count:        int         = 8,
+    timeout:      int         = 2,
+    count:        int         = 2,
     retry:        int         = 0,
     rate:         int         = 0,
     label:        str         = "scan",
@@ -908,13 +1014,29 @@ def run_scan(
     retry_str = f"  retry={retry}" if retry > 0 else ""
     dns_str  = "  +dns" if do_dns else ""
     tcp_str  = f"  tcp={','.join(str(port) for port in tcp_ports)}" if tcp_ports else ""
-    print(
-        f"\n  {C.CYAN}⠿ Scanning {C.BOLD}{total:,}{C.RESET}{C.CYAN} hosts"
-        f"  │  threads={C.BOLD}{threads}{C.RESET}{C.CYAN}"
-        f"  timeout={timeout}s  pkt/host={count}"
-        f"{retry_str}{rate_str}{dns_str}{tcp_str}"
-        f"  est≈{est_sec:.0f}s{C.RESET}\n"
-    )
+    if not quiet:
+        print(
+            f"\n  {C.CYAN}⠿ Scanning {C.BOLD}{total:,}{C.RESET}{C.CYAN} hosts"
+            f"  │  threads={C.BOLD}{threads}{C.RESET}{C.CYAN}"
+            f"  timeout={timeout}s  pkt/host={count}"
+            f"{retry_str}{rate_str}{dns_str}{tcp_str}"
+            f"  est≤{est_sec:.0f}s{C.RESET}\n"
+        )
+
+    if _use_fping():
+        results = _scan_fping_batch(
+            ip_list, timeout, count, retry, rate, do_dns, tcp_ports, tcp_timeout
+        )
+        elapsed = time.time() - t_start
+        if not quiet:
+            print(f"\n  {C.DIM}Scan finished in {elapsed:.1f}s{C.RESET}\n")
+        clear_partial(label)
+        all_results = done_results + results
+        try:
+            all_results.sort(key=lambda result: ipaddress.ip_address(result["ip"]))
+        except Exception:
+            all_results.sort(key=lambda result: result["ip"])
+        return all_results
 
     # ── Ctrl+C handler: save partial and exit gracefully ────────
     def _sigint(sig, frame):
@@ -998,13 +1120,14 @@ def run_scan(
                             f"  {C.CYAN}[{res['scope']}]{C.RESET}\n"
                         )
                     sys.stdout.flush()
-                _progress_bar(
-                    done_n,
-                    total,
-                    sum(1 for r in results if r["alive"]),
-                    sum(1 for r in results if r.get("status") == "NO RESPONSE"),
-                    sum(1 for r in results if r.get("status") == "PROBE ERROR"),
-                )
+                if not quiet:
+                    _progress_bar(
+                        done_n,
+                        total,
+                        sum(1 for r in results if r["alive"]),
+                        sum(1 for r in results if r.get("status") == "NO RESPONSE"),
+                        sum(1 for r in results if r.get("status") == "PROBE ERROR"),
+                    )
 
     finally:
         signal.signal(signal.SIGINT, old_handler)
@@ -1020,7 +1143,8 @@ def run_scan(
         # Return what we have so alive/dead files are still written
         return all_done
 
-    print(f"\n\n  {C.DIM}Scan finished in {elapsed:.1f}s{C.RESET}\n")
+    if not quiet:
+        print(f"\n\n  {C.DIM}Scan finished in {elapsed:.1f}s{C.RESET}\n")
     clear_partial(label)
 
     # Merge with any previously-resumed results
@@ -1044,6 +1168,8 @@ def write_results(
     dead_file:  str  = "dead.txt",
     out_format: str  = "txt",
     error_file: str  = "errors.txt",
+    quiet:      bool = False,
+    verbose:    bool = False,
 ):
     alive = [r for r in results if r["alive"]]
     dead  = [r for r in results if r.get("status") == "NO RESPONSE"]
@@ -1079,6 +1205,17 @@ def write_results(
         alive_path.write_text("\n".join(r["ip"] for r in alive) + ("\n" if alive else ""), encoding="utf-8")
         dead_path.write_text("\n".join(r["ip"] for r in dead) + ("\n" if dead else ""), encoding="utf-8")
         error_path.write_text("\n".join(r["ip"] for r in errors) + ("\n" if errors else ""), encoding="utf-8")
+
+    if quiet:
+        return
+
+    if not verbose:
+        print(
+            f"Scan complete: total={total} reachable={len(alive)} "
+            f"no_response={len(dead)} errors={len(errors)}"
+        )
+        print(f"Saved: {alive_file}, {dead_file}, {error_file}")
+        return
 
     box_w = 58
     div   = f"  {C.CYAN}{'─' * box_w}{C.RESET}"
@@ -1568,13 +1705,15 @@ def write_hostnames_report(
     records: list[dict],
     source: str,
     output_file: str = "hostnames.txt",
+    announce: bool = True,
 ) -> Path:
     """Save HOST, IP, STATUS, METHOD, TTL, and OS details after every file scan."""
     destination = Path(output_file).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
     report = _plain_table(records, f"FILE SCAN STATUS · {source}")
     destination.write_text(report, encoding="utf-8")
-    print(f"  {C.CYAN}[report] host details → {destination}{C.RESET}")
+    if announce:
+        print(f"  {C.CYAN}[report] host details → {destination}{C.RESET}")
     return destination
 
 
@@ -1915,10 +2054,10 @@ def resolve_host_arguments(hostnames: list[str]) -> list[str]:
 # ─────────────────────────────────────────────────────────────────
 # CHECK DEPENDENCIES + TOOL SELECTION  (FIX 5)
 # ─────────────────────────────────────────────────────────────────
-def check_deps(ping_tool: str = "auto") -> str:
+def check_deps(ping_tool: str = "auto", verbose: bool = False) -> str:
     """
     Detect available ping tools, honour --ping-tool flag, and
-    offer an interactive prompt if neither fping nor ping is found.
+    select a backend without prompting.
     Returns the resolved tool name: "fping" | "ping".
     """
     global _PING_TOOL, _FPING_PATH, _PING_PATH, _PING6_PATH
@@ -1927,20 +2066,12 @@ def check_deps(ping_tool: str = "auto") -> str:
     has_ping  = _PING_PATH is not None or _PING6_PATH is not None
 
     # ── Print availability ──────────────────────────────────────
-    print(f"\n  {C.CYAN}[tools]{C.RESET}")
-    print(f"  {C.DIM}┌{'─'*44}┐{C.RESET}")
-    if has_fping:
-        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}fping  ✔  {_FPING_PATH:<32}{C.RESET}{C.DIM}│{C.RESET}")
-    else:
-        print(f"  {C.DIM}│{C.RESET}  {C.RED}fping  ✘  not found{'':<26}{C.RESET}{C.DIM}│{C.RESET}")
-    if has_ping:
-        ping_path = _PING_PATH or _PING6_PATH
-        print(f"  {C.DIM}│{C.RESET}  {C.GREEN}ping   ✔  {ping_path:<32}{C.RESET}{C.DIM}│{C.RESET}")
-    else:
-        print(f"  {C.DIM}│{C.RESET}  {C.RED}ping   ✘  not found{'':<26}{C.RESET}{C.DIM}│{C.RESET}")
-    print(f"  {C.DIM}└{'─'*44}┘{C.RESET}")
+    if verbose:
+        print(f"\n  {C.CYAN}[tools]{C.RESET}")
+        print(f"  fping: {_FPING_PATH or 'not found'}")
+        print(f"  ping:  {_PING_PATH or _PING6_PATH or 'not found'}")
 
-    # ── Neither available → interactive fallback ────────────────
+    # No ICMP backend is a hard failure unless TCP-only scanning is used.
     if not has_fping and not has_ping:
         print(f"\n  {C.RED}✗ No ping tool found on PATH.{C.RESET}")
         print(f"  {C.YELLOW}Install one of:{C.RESET}")
@@ -1961,30 +2092,15 @@ def check_deps(ping_tool: str = "auto") -> str:
             sys.exit(3)
         _PING_TOOL = "ping"
     else:
-        # auto mode: prompt user if both are available
-        if has_fping and has_ping and sys.stdin.isatty():
-            print(f"\n  {C.BOLD}{C.CYAN}Select ping backend:{C.RESET}")
-            print(f"  {C.GREEN}  [1]{C.RESET}  fping  {C.DIM}(faster, better for large subnets){C.RESET}")
-            print(f"  {C.YELLOW}  [2]{C.RESET}  ping   {C.DIM}(OS built-in, more compatible){C.RESET}")
-            print(f"  {C.DIM}  [↵]  auto-select (fping){C.RESET}\n")
-            try:
-                choice = input(f"  {C.BOLD}Choice [1/2, default=1]:{C.RESET} ").strip()
-            except (EOFError, KeyboardInterrupt):
-                choice = ""
-            if choice == "2":
-                _PING_TOOL = "ping"
-                print(f"  {C.YELLOW}→ Using: ping{C.RESET}\n")
-            else:
-                _PING_TOOL = "fping"
-                print(f"  {C.GREEN}→ Using: fping{C.RESET}\n")
-        elif has_fping:
+        if has_fping:
             _PING_TOOL = "fping"
         else:
             _PING_TOOL = "ping"
 
     # Print resolved selection
-    tool_label = f"{C.GREEN}fping{C.RESET}" if _PING_TOOL == "fping" else f"{C.YELLOW}ping{C.RESET}"
-    print(f"  {C.DIM}Backend:{C.RESET}  {tool_label}")
+    if verbose:
+        tool_label = f"{C.GREEN}fping{C.RESET}" if _PING_TOOL == "fping" else f"{C.YELLOW}ping{C.RESET}"
+        print(f"  {C.DIM}Backend:{C.RESET}  {tool_label}")
 
     return _PING_TOOL
 
@@ -2095,8 +2211,8 @@ def print_topic_help(topic: str) -> None:
         rows = [
             ("--scan", "Run discovery for --sub targets."),
             ("-t, --threads N", "Concurrent workers; default 20."),
-            ("--timeout SEC", "Per-packet wait; default 6 seconds."),
-            ("--count N", "Packets sent per host; default 8."),
+            ("--timeout SEC", "Per-packet wait; default 2 seconds."),
+            ("--count N", "Packets sent per host; default 2."),
             ("--retry N", "Retry hosts that did not respond."),
             ("--rate PPS", "Global packet-rate limit; 0 means unlimited."),
             ("--fast", "Use 100 threads, 1-second timeout, and 1 packet."),
@@ -2120,7 +2236,8 @@ def print_topic_help(topic: str) -> None:
             ("--hostnames-out FILE", "Complete HOST/IP/STATUS/METHOD/TTL/OS report (default: hostnames.txt)."),
             ("--changes-out FILE", "Saved change summary when --changes is used (default: changes.txt)."),
             ("--out-format txt|csv|json", "Choose the file format."),
-            ("--quiet", "Hide per-host output while retaining progress."),
+            ("--quiet", "Write files only; suppress normal terminal output."),
+            ("--verbose", "Show diagnostic tables, progress, and backend details."),
             ("--no-banner", "Suppress the startup banner."),
             ("--label NAME", "Set a stable label for history and resume data."),
         ]
@@ -2220,10 +2337,10 @@ def build_parser() -> argparse.ArgumentParser:
     sg = p.add_argument_group("Scan Control")
     sg.add_argument("-t", "--threads", type=int, default=20, metavar="N",
                     help="Concurrent workers (default: 20)")
-    sg.add_argument("--timeout", type=int, default=6, metavar="SEC",
-                    help="Per-packet wait seconds (default: 6)")
-    sg.add_argument("--count", type=int, default=8, metavar="N",
-                    help="Packets per host (default: 8)")
+    sg.add_argument("--timeout", type=int, default=2, metavar="SEC",
+                    help="Per-packet wait seconds (default: 2)")
+    sg.add_argument("--count", type=int, default=2, metavar="N",
+                    help="Packets per host (default: 2)")
     sg.add_argument("--retry", type=int, default=0, metavar="N",
                     help="Retries for non-responsive hosts (default: 0)")
     sg.add_argument("--rate", type=int, default=0, metavar="PPS",
@@ -2251,7 +2368,9 @@ def build_parser() -> argparse.ArgumentParser:
     og.add_argument("--label", metavar="NAME",
                     help="History/resume label (default: target-derived)")
     og.add_argument("--quiet", action="store_true",
-                    help="Suppress per-host output")
+                    help="Write files only; suppress normal terminal output")
+    og.add_argument("--verbose", action="store_true",
+                    help="Show diagnostic tables, progress, and backend details")
     og.add_argument("--no-banner", action="store_true",
                     help="Suppress the ASCII banner")
 
@@ -2351,7 +2470,9 @@ def main():
             parser.error(f"{option} and {previous_option} must use different files")
         seen_output_paths[normalized] = option
 
-    banner(no_banner=args.no_banner)
+    # Scans are compact by default so their output is safe for automation.
+    # Analysis/history commands retain the visual interface.
+    banner(no_banner=args.no_banner or (args.scan and not args.verbose) or args.quiet)
 
     # ── clear history ───────────────────────────────────────────
     if args.clear_history:
@@ -2382,7 +2503,7 @@ def main():
     subnet_target_count: Optional[int] = None
 
     if args.sub:
-        net     = show_subnet_info(args.sub)
+        net = show_subnet_info(args.sub, display=not args.scan or args.verbose)
         subnet_target_count = max(net.num_addresses - 2, 0) if net.version == 4 and net.prefixlen <= 30 else net.num_addresses
         if args.scan:
             if subnet_target_count > args.max_hosts:
@@ -2401,7 +2522,8 @@ def main():
         # Always show the original hostname-to-IP mapping before scanning.
         # This makes file mode auditable and prevents users from seeing only
         # anonymous IP addresses during the scan.
-        show_host_resolution(file_mappings, args.file)
+        if args.verbose:
+            show_host_resolution(file_mappings, args.file)
         ip_list.extend(file_targets)
         if not label:
             label = Path(args.file).stem
@@ -2433,7 +2555,7 @@ def main():
                 if row_ip not in {"", "UNRESOLVED"} and row_ip not in remaining_ips:
                     row["excluded"] = True
         skipped = before - len(ip_list)
-        if skipped:
+        if skipped and args.verbose:
             print(f"  {C.DIM}[exclude] Skipped {skipped} IPs{C.RESET}")
 
     if args.scan and not ip_list:
@@ -2442,11 +2564,12 @@ def main():
     # ── scan ────────────────────────────────────────────────────
     if args.scan:
         if not args.tcp_ports or _FPING_PATH or _PING_PATH or _PING6_PATH:
-            check_deps(ping_tool=args.ping_tool)
+            check_deps(ping_tool=args.ping_tool, verbose=args.verbose)
 
         if args.fast:
             args.threads = 100; args.timeout = 1; args.count = 1
-            print(f"  {C.YELLOW}⚡ Fast mode — less accurate on slow/busy hosts.{C.RESET}")
+            if args.verbose:
+                print(f"  {C.YELLOW}⚡ Fast mode — less accurate on slow/busy hosts.{C.RESET}")
 
         args.threads = max(1,  min(1000, args.threads))
         args.timeout = max(1,  min(30,   args.timeout))
@@ -2463,7 +2586,7 @@ def main():
             retry   = args.retry,
             rate    = args.rate,
             label   = label,
-            quiet   = args.quiet,
+            quiet   = args.quiet or not args.verbose,
             do_dns  = args.dns,
             resume  = args.resume,
             tcp_ports = args.tcp_ports,
@@ -2474,8 +2597,13 @@ def main():
         dead  = [r["ip"] for r in results if r.get("status") == "NO RESPONSE"]
 
         if args.file and file_mappings:
-            status_records = show_file_scan_status(file_mappings, results, args.file)
-            write_hostnames_report(status_records, args.file, args.hostnames_out)
+            if args.verbose:
+                status_records = show_file_scan_status(file_mappings, results, args.file)
+            else:
+                status_records = build_file_status_records(file_mappings, results)
+            write_hostnames_report(
+                status_records, args.file, args.hostnames_out, announce=args.verbose
+            )
 
             if args.changes:
                 previous_changes = load_changes_state(label)
@@ -2488,10 +2616,12 @@ def main():
             dead_file=args.dead_out,
             error_file=args.error_out,
             out_format=args.out_format,
+            quiet=args.quiet,
+            verbose=args.verbose,
         )
 
         if not args.no_history:
-            save_scan(label, results)
+            save_scan(label, results, announce=args.verbose)
 
         if args.compare:
             compare_history(label, alive, dead)
@@ -2499,7 +2629,8 @@ def main():
     elif args.sub and not args.scan:
         print(f"  {C.DIM}Tip: add {C.BOLD}--scan{C.RESET}{C.DIM} to ping all {subnet_target_count or 0:,} hosts.{C.RESET}\n")
 
-    print()
+    if args.verbose or not args.scan:
+        print()
 
 
 if __name__ == "__main__":

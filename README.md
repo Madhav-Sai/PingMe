@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.1.3" alt="PingMe animated title" />
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.2.0" alt="PingMe animated title" />
 
 <img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=19&duration=2400&pause=700&color=BB86FC&center=true&vCenter=true&width=920&height=110&lines=Advanced+Network+Discovery+Scanner;Hostname+%E2%86%92+IP+%E2%86%92+Reachability+Status;hostnames.txt+%C2%B7+changes.txt+%C2%B7+alive.txt+%C2%B7+dead.txt;Linux+%C2%B7+Kali+%C2%B7+macOS+%C2%B7+Windows" alt="PingMe animated subtitle" />
 
 <br/>
 
-[![Version](https://img.shields.io/badge/version-3.1.3-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
+[![Version](https://img.shields.io/badge/version-3.2.0-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white&labelColor=0d1117)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-BB86FC?style=for-the-badge&labelColor=0d1117)](#)
 [![License](https://img.shields.io/badge/License-MIT-39FF14?style=for-the-badge&labelColor=0d1117)](LICENSE)
@@ -23,7 +23,7 @@
   ██║     ██║██║ ╚████║╚██████╔╝██║ ╚═╝ ██║███████╗
   ╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
 
-  Advanced Ping Scanner v3.1.3
+  Advanced Ping Scanner v3.2.0
   Hostname · IP Address · Reachability · TTL · OS Guess
 ```
 
@@ -195,7 +195,7 @@ pingme --help
 Expected version:
 
 ```text
-pingme 3.1.3
+pingme 3.2.0
 ```
 
 ---
@@ -676,10 +676,10 @@ pingme --diff alive_monday.txt alive_friday.txt
     Number of concurrent workers. Default: 20.
 
 --timeout SEC
-    Per-packet wait time. Default: 6.
+    Per-packet wait time. Default: 2.
 
 --count N
-    Packets sent per host. Default: 8.
+    Packets sent per host. Default: 2.
 
 --tcp-ports PORTS
     TCP ports or ranges, such as 22,80,443 or 8000-8010.
@@ -742,7 +742,10 @@ pingme --diff alive_monday.txt alive_friday.txt
     Custom history label.
 
 --quiet
-    Hide per-host live scan lines.
+    Write result files without normal terminal output.
+
+--verbose
+    Show diagnostic tables, progress, and backend details.
 
 --no-banner
     Hide the ASCII banner.
@@ -922,12 +925,14 @@ pingme --ipinfo 8.8.8.8 192.168.1.1
 | Setting | Default | Purpose |
 |---|---:|---|
 | Threads | `20` | Avoids flooding smaller networks |
-| Timeout | `6s` | Allows slow endpoints to respond |
-| Count | `8` | Reduces false-dead results |
+| Timeout | `2s` | Practical default for automated discovery |
+| Count | `2` | Confirms responses without excessive delay |
 | TCP timeout | `2s` | Keeps fallback checks practical |
 | Maximum CIDR targets | `65,536` | Prevents accidental huge expansion |
 
-A target is reachable if at least one ICMP request succeeds or one configured TCP port accepts a connection.
+A target is reachable only after a validated direct ICMP echo reply or a configured TCP port accepts a connection. With `fping`, PingMe performs one batch discovery process and then validates positive candidates serially with system `ping`; malformed or inconsistent replies go to `errors.txt`, never `alive.txt`.
+
+Normal scans are non-interactive and compact. Add `--verbose` only when troubleshooting.
 
 ---
 
@@ -939,7 +944,7 @@ pingme/
 ├── install.py
 ├── repair-windows.ps1
 ├── README.md
-├── RELEASE_NOTES_v3.1.3.md
+├── RELEASE_NOTES_v3.2.0.md
 ├── PingMe_v3.0_Manual.pdf
 ├── LICENSE
 ├── examples/

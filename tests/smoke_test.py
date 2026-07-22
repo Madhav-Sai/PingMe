@@ -52,7 +52,7 @@ def main() -> int:
 
     version = run("--version")
     require(version.returncode == 0, "--version failed", version.stdout)
-    require("3.1.3" in version.stdout, "unexpected version", version.stdout)
+    require("3.2.0" in version.stdout, "unexpected version", version.stdout)
 
     help_result = run("help", "examples")
     require(help_result.returncode == 0, "nested help failed", help_result.stdout)
@@ -84,7 +84,7 @@ def main() -> int:
                 "--count", "1",
                 "--timeout", "1",
                 "--threads", "4",
-                "--quiet",
+                "--verbose",
                 "--no-banner",
                 "--no-history",
                 cwd=work,

@@ -103,6 +103,60 @@ class ParserTests(unittest.TestCase):
 
 
 class BackendTests(unittest.TestCase):
+    def test_auto_backend_is_deterministic_and_never_prompts(self) -> None:
+        with (
+            patch.object(pingme, "_FPING_PATH", "fping"),
+            patch.object(pingme, "_PING_PATH", "ping"),
+            patch.object(pingme, "_PING6_PATH", None),
+            patch("builtins.input", side_effect=AssertionError("interactive prompt used")),
+        ):
+            self.assertEqual(pingme.check_deps("auto"), "fping")
+
+    def test_fping_batch_uses_one_process_and_accepts_only_requested_stdout_ips(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["fping"], 1, b"10.0.0.2\n203.0.113.9\n", b""
+        )
+        with (
+            patch.object(pingme, "_FPING_PATH", "fping"),
+            patch.object(pingme.subprocess, "run", return_value=completed) as run_mock,
+        ):
+            alive = pingme._fping_batch_alive(["10.0.0.1", "10.0.0.2"], 1, 2)
+        self.assertEqual(alive, {"10.0.0.2"})
+        self.assertEqual(run_mock.call_count, 1)
+        command = run_mock.call_args.args[0]
+        self.assertIn("-a", command)
+        self.assertNotIn("-c", command)
+        self.assertEqual(run_mock.call_args.kwargs["input"], b"10.0.0.1\n10.0.0.2\n")
+
+    def test_batch_candidates_are_confirmed_serially_and_fail_closed(self) -> None:
+        addresses = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+        with (
+            patch.object(pingme, "_fping_batch_alive", return_value=set(addresses[:2])),
+            patch.object(pingme, "_PING_PATH", "ping"),
+            patch.object(
+                pingme,
+                "_ping_via_system",
+                side_effect=[(True, 64), pingme.ProbeExecutionError("invalid ICMP reply payload")],
+            ) as confirm_mock,
+        ):
+            results = pingme._scan_fping_batch(addresses, 1, 2, 0, 0, False, None, 1)
+        self.assertEqual(confirm_mock.call_count, 2)
+        self.assertEqual([row["status"] for row in results], [
+            "REACHABLE", "PROBE ERROR", "NO RESPONSE"
+        ])
+        self.assertEqual([row["ip"] for row in results if row["alive"]], ["10.0.0.1"])
+
+    def test_run_scan_fping_path_never_starts_per_host_workers(self) -> None:
+        expected = [pingme._build_probe_result("10.0.0.1", False, None, [])]
+        with (
+            patch.object(pingme, "_use_fping", return_value=True),
+            patch.object(pingme, "_scan_fping_batch", return_value=expected) as batch_mock,
+            patch.object(pingme, "_ping_one", side_effect=AssertionError("per-host worker used")),
+        ):
+            actual = pingme.run_scan(["10.0.0.1"], timeout=1, count=1, quiet=True)
+        self.assertEqual(actual, expected)
+        batch_mock.assert_called_once()
+
     def test_fping_exit_one_overrides_deceptive_packet_text(self) -> None:
         stdout = b"10.0.0.8\n"
         stderr = b""
@@ -209,6 +263,21 @@ class BackendTests(unittest.TestCase):
 
 
 class ReportingTests(unittest.TestCase):
+    def test_default_report_is_compact(self) -> None:
+        result = pingme._build_probe_result("10.0.0.1", True, 64, [])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("builtins.print") as print_mock:
+                pingme.write_results(
+                    [result],
+                    alive_file=str(root / "alive.txt"),
+                    dead_file=str(root / "dead.txt"),
+                    error_file=str(root / "errors.txt"),
+                )
+        rendered = "\n".join(" ".join(map(str, call.args)) for call in print_mock.call_args_list)
+        self.assertIn("Scan complete: total=1 reachable=1 no_response=0 errors=0", rendered)
+        self.assertNotIn("SCAN RESULTS", rendered)
+
     def test_probe_errors_are_not_written_as_no_response(self) -> None:
         base = {
             "ttl": None,
