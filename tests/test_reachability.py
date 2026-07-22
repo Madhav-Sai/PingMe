@@ -76,10 +76,9 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(pingme._parse_system_ping_output("10.0.0.8", output, False), (False, None))
 
     def test_fping_requires_exact_target_response_line(self) -> None:
-        stdout = "10.0.0.8 : [0], 64 bytes, 1.20 ms (1.20 avg, 0% loss)"
-        stderr = "10.0.0.8 : xmt/rcv/%loss = 1/1/0%, min/avg/max = 1.20/1.20/1.20"
-        self.assertEqual(pingme._parse_fping_output("10.0.0.8", stdout, stderr), (True, None))
-        self.assertEqual(pingme._parse_fping_output("10.0.0.9", stdout, stderr), (False, None))
+        stdout = "10.0.0.8\n"
+        self.assertEqual(pingme._parse_fping_output("10.0.0.8", stdout, ""), (True, None))
+        self.assertEqual(pingme._parse_fping_output("10.0.0.9", stdout, ""), (False, None))
 
     def test_fping_timeout_line_is_not_reachable(self) -> None:
         stdout = "10.0.0.8 : [0], timed out (NaN avg, 100% loss)"
@@ -91,6 +90,11 @@ class ParserTests(unittest.TestCase):
         stderr = "10.0.0.8 : xmt/rcv/%loss = 1/0/100%"
         self.assertEqual(pingme._parse_fping_output("10.0.0.8", stdout, stderr), (False, None))
 
+    def test_iputils_payload_corruption_is_an_integrity_error(self) -> None:
+        stderr = "ping: Warning: invalid tv_usec -172297512116558010 us"
+        stdout = "64 bytes from 192.168.24.101: icmp_seq=0 ttl=64 time=0.000 ms\nwrong data byte #16"
+        self.assertIsNotNone(pingme._ping_integrity_error(stdout, stderr))
+
     def test_ttl_hint_uses_next_common_initial_ttl(self) -> None:
         self.assertEqual(pingme.ttl_to_os(64), "Likely Unix (≤64)")
         self.assertEqual(pingme.ttl_to_os(122), "Likely Windows (≤128)")
@@ -100,8 +104,8 @@ class ParserTests(unittest.TestCase):
 
 class BackendTests(unittest.TestCase):
     def test_fping_exit_one_overrides_deceptive_packet_text(self) -> None:
-        stdout = b"10.0.0.8 : [0], 84 bytes, 0.42 ms (0.42 avg, 0% loss)"
-        stderr = b"10.0.0.8 : xmt/rcv/%loss = 1/1/0%, min/avg/max = 0.42/0.42/0.42"
+        stdout = b"10.0.0.8\n"
+        stderr = b""
         completed = subprocess.CompletedProcess(["fping"], 1, stdout, stderr)
         with (
             patch.object(pingme, "_FPING_PATH", "fping"),
@@ -109,15 +113,48 @@ class BackendTests(unittest.TestCase):
         ):
             self.assertEqual(pingme._ping_via_fping("10.0.0.8", 1, 1), (False, None))
 
-    def test_fping_requires_success_exit_summary_and_packet_evidence(self) -> None:
-        stdout = b"10.0.0.8 : [0], 64 bytes, 0.42 ms (0.42 avg, 0% loss)"
-        stderr = b"10.0.0.8 : xmt/rcv/%loss = 1/1/0%, min/avg/max = 0.42/0.42/0.42"
+    def test_fping_requires_success_exit_and_exact_alive_output(self) -> None:
+        stdout = b"10.0.0.8\n"
+        stderr = b""
         completed = subprocess.CompletedProcess(["fping"], 0, stdout, stderr)
         with (
             patch.object(pingme, "_FPING_PATH", "fping"),
-            patch.object(pingme.subprocess, "run", return_value=completed),
+            patch.object(pingme.subprocess, "run", return_value=completed) as run_mock,
         ):
             self.assertEqual(pingme._ping_via_fping("10.0.0.8", 1, 1), (True, None))
+        command = run_mock.call_args.args[0]
+        self.assertIn("-a", command)
+        self.assertNotIn("-c", command)
+
+    def test_system_ping_rejects_corrupt_echo_payload(self) -> None:
+        stdout = (
+            b"64 bytes from 192.168.24.101: icmp_seq=0 ttl=64 time=0.000 ms\n"
+            b"wrong data byte #16 should be 0x10 but was 0xc0\n"
+        )
+        completed = subprocess.CompletedProcess(["ping"], 0, stdout, b"")
+        with (
+            patch.object(pingme.sys, "platform", "linux"),
+            patch.object(pingme, "_PING_PATH", "ping"),
+            patch.object(pingme.subprocess, "run", return_value=completed),
+        ):
+            with self.assertRaises(pingme.ProbeExecutionError):
+                pingme._ping_via_system("192.168.24.101", 1, 1)
+
+    def test_fping_positive_with_corrupt_system_confirmation_is_probe_error(self) -> None:
+        with (
+            patch.object(pingme, "_use_fping", return_value=True),
+            patch.object(pingme, "_PING_PATH", "ping"),
+            patch.object(pingme, "_ping_via_fping", return_value=(True, None)),
+            patch.object(
+                pingme,
+                "_ping_via_system",
+                side_effect=pingme.ProbeExecutionError("invalid ICMP reply payload"),
+            ),
+        ):
+            result = pingme._ping_one("10.0.0.8", count=1)
+        self.assertFalse(result["alive"])
+        self.assertEqual(result["status"], "PROBE ERROR")
+        self.assertIn("integrity confirmation", result["probe_error"])
 
     def test_failed_resolution_command_output_is_discarded(self) -> None:
         failed = subprocess.CompletedProcess(["resolver"], 1, b"Address: 8.8.8.8", b"")

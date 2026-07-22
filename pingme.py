@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              PingMe — Advanced Ping Scanner v3.1.2 by Madhav       ║
+║              PingMe — Advanced Ping Scanner v3.1.3 by Madhav       ║
 ║   Subnet Info · Ping Scan · TTL Fingerprint · Reverse DNS        ║
 ║   History · Diff · IP Classify · Retry · Resume · Rate-Limit     ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -28,8 +28,8 @@ from typing import Optional, Union
 
 
 APP_NAME = "PingMe"
-VERSION = "3.1.2"
-BUILD = "fail-closed-fping"
+VERSION = "3.1.3"
+BUILD = "strict-icmp-integrity"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -540,31 +540,24 @@ def _line_mentions_target(line: str, target: str) -> bool:
 
 
 def _parse_fping_output(ip: str, stdout_text: str, stderr_text: str) -> tuple[bool, Optional[int]]:
-    """Require both fping response statistics and exact-target packet evidence."""
-    target_prefix = re.compile(rf"^\s*{re.escape(ip)}\s+:\s*", re.IGNORECASE)
-    received = None
-    for line in (stderr_text + "\n" + stdout_text).splitlines():
-        if not target_prefix.search(line):
-            continue
-        summary = re.search(
-            r"\bxmt/rcv/%loss\s*=\s*\d+\s*/\s*(\d+)\s*/",
-            line,
-            re.IGNORECASE,
-        )
-        if summary:
-            received = int(summary.group(1))
-            break
-    if not received:
-        return False, None
-
+    """Parse only fping alive-mode output, which is one exact address per line."""
+    del stderr_text
+    expected = _normalise_probe_address(ip)
     for line in stdout_text.splitlines():
-        if not target_prefix.search(line):
-            continue
-        if not re.search(r"(?:\[\d+\],\s*)?\d+\s+bytes\b", line, re.IGNORECASE):
-            continue
-        ttl_match = re.search(r"\bttl\s*[=:]\s*(\d+)\b", line, re.IGNORECASE)
-        return True, int(ttl_match.group(1)) if ttl_match else None
+        candidate = _normalise_probe_address(line.strip())
+        if expected is not None and candidate == expected:
+            return True, None
     return False, None
+
+
+def _ping_integrity_error(stdout_text: str, stderr_text: str) -> Optional[str]:
+    """Detect iputils evidence that an echo payload does not match our request."""
+    combined = stdout_text + "\n" + stderr_text
+    if re.search(r"\bwrong data byte\b", combined, re.IGNORECASE):
+        return "echo reply payload does not match the transmitted request"
+    if re.search(r"\binvalid tv_usec\b", combined, re.IGNORECASE):
+        return "echo reply contains an invalid timestamp payload"
+    return None
 
 
 def _parse_system_ping_output(ip: str, stdout_text: str, windows: bool) -> tuple[bool, Optional[int]]:
@@ -597,30 +590,29 @@ def _parse_system_ping_output(ip: str, stdout_text: str, windows: bool) -> tuple
 
 def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, Optional[int]]:
     """
-    fping 5.1 on Kali confirmed behaviour (from debug output):
-      - Per-packet lines (including TTL) → STDOUT
-      - Summary "xmt/rcv/%loss = N/M/P%" → STDERR
-      - Dead host: exit=1, stdout has timed-out lines, stderr has rcv=0
-      - Alive host: exit=0, stdout has reply lines with TTL, stderr has rcv>0
+    Use fping's script-oriented alive mode, matching ``fping -a`` control runs.
 
     Rules:
-      - NO -p flag (causes subprocess timeout to fire before fping finishes)
-      - Capture BOTH stdout AND stderr
-      - Require rcv>0 in the exact target's count-mode statistics
-      - Require a per-packet response line for the exact requested target
+      - Send at most ``count`` attempts using retry mode rather than count mode
+      - Require stdout to contain only the exact requested address as alive
       - Require fping's documented success exit status for the single target
     """
     if not _FPING_PATH:
         return False, None
 
-    # Generous timeout — no -p flag so fping finishes in count*timeout seconds
-    proc_timeout = (count * timeout) + 10
+    proc_timeout = (count * timeout) + 5
 
     try:
         command = [_FPING_PATH]
         if _is_ipv6(ip):
             command.append("-6")
-        command.extend(["-c", str(count), "-t", str(timeout * 1000), ip])
+        command.extend([
+            "-a",
+            "-r", str(max(count - 1, 0)),
+            "-B", "1.0",
+            "-t", str(timeout * 1000),
+            ip,
+        ])
         r = subprocess.run(
             command,
             stdout=subprocess.PIPE,   # per-packet lines + TTL
@@ -694,6 +686,9 @@ def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, Optional[
 
         stdout_text = _decode_probe_output(r.stdout)
         stderr_text = _decode_probe_output(r.stderr)
+        integrity_error = _ping_integrity_error(stdout_text, stderr_text)
+        if integrity_error:
+            raise ProbeExecutionError(f"invalid ICMP reply for {ip}: {integrity_error}")
         alive, ttl = _parse_system_ping_output(ip, stdout_text, sys.platform == "win32")
         if alive:
             return True, ttl
@@ -769,6 +764,22 @@ def _ping_one(
     if _use_fping():
         try:
             icmp_alive, ttl = _ping_via_fping(ip, timeout, count)
+            if icmp_alive:
+                if _PING_PATH is None and _PING6_PATH is None:
+                    icmp_alive = False
+                    probe_error = "fping reply could not be integrity-confirmed because system ping is unavailable"
+                else:
+                    try:
+                        confirmed, confirmed_ttl = _ping_via_system(ip, timeout, min(count, 2))
+                    except Exception as confirmation_error:
+                        icmp_alive = False
+                        probe_error = f"fping reply failed integrity confirmation: {confirmation_error}"
+                    else:
+                        if confirmed:
+                            ttl = confirmed_ttl
+                        else:
+                            icmp_alive = False
+                            probe_error = "fping reported alive but system ping did not confirm a valid echo reply"
         except Exception as fping_error:
             # A broken fping invocation falls back to system ping. It becomes a
             # probe error only when that independent backend also fails.
@@ -885,9 +896,9 @@ def run_scan(
 
     waves = (total + max(threads, 1) - 1) // max(threads, 1)
     if _use_fping():
-        # fping count mode sends to each target at its default one-second
-        # period, then allows the configured timeout for the final response.
-        icmp_est = max(count - 1, 0) + timeout
+        # Alive mode makes at most ``count`` attempts; positives then receive a
+        # short independent integrity confirmation through system ping.
+        icmp_est = (count + min(count, 2)) * timeout
     else:
         # Conservative cross-platform bound for sequential system-ping waits.
         icmp_est = count * timeout
