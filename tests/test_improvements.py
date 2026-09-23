@@ -97,10 +97,15 @@ class ConfirmationTests(unittest.TestCase):
         self.assertEqual(ping_mock.call_count, 4)  # stops once two replies are in
         self.assertEqual((outcome.sent, outcome.received), (4, 2))
 
-    def test_stops_early_when_the_threshold_is_out_of_reach(self) -> None:
+    def test_silent_host_gets_exactly_count_attempts(self) -> None:
         with patch.object(pingme, "_ping_via_system", return_value=(False, None)) as ping_mock:
-            self.assertEqual(pingme._confirm_direct_echo("10.0.0.8", 1, attempts=5, min_replies=2), (False, None))
-        self.assertEqual(ping_mock.call_count, 4)
+            self.assertEqual(pingme._confirm_direct_echo("10.0.0.8", 1, attempts=3, min_replies=2), (False, None))
+        self.assertEqual(ping_mock.call_count, 3)
+
+    def test_one_lost_packet_does_not_hide_a_live_host(self) -> None:
+        replies = [(True, 64), (False, None), (True, 64)]
+        with patch.object(pingme, "_ping_via_system", side_effect=replies):
+            self.assertEqual(pingme._confirm_direct_echo("10.0.0.8", 1, attempts=2, min_replies=2), (True, 64))
 
     def test_count_one_still_requires_two_independent_replies(self) -> None:
         with patch.object(pingme, "_ping_via_system", return_value=(True, 64)) as ping_mock:

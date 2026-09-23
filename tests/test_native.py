@@ -90,8 +90,8 @@ class SweepTests(unittest.TestCase):
             results = pingme.native_icmp_sweep(["10.0.0.1", "10.0.0.2"], 0.05, attempts=3, min_replies=2)
         self.assertEqual(results["10.0.0.1"][0], (True, 64))
         self.assertEqual(results["10.0.0.2"][0], (False, None))
-        # The silent host is dropped once two replies are out of reach (after round 2).
-        self.assertEqual(sent_to.count("10.0.0.2"), 2)
+        # A silent host gets exactly `attempts` rounds.
+        self.assertEqual(sent_to.count("10.0.0.2"), 3)
 
 
 class EngineSelectionTests(unittest.TestCase):

@@ -1068,28 +1068,46 @@ def _ping_via_system(ip: str, timeout: float, count: int) -> EchoResult:
     raise ProbeExecutionError(f"system ping produced no usable result for {ip}")
 
 
+# A host that has answered at least once gets this many extra attempts to reach
+# --min-replies, so one lost packet on a lossy link cannot hide a live host.
+CONFIRM_EXTRA_ATTEMPTS = 2
+
+
+def echo_attempt_allowed(replies: int, attempt: int, attempts: int, required: int) -> bool:
+    """Decide whether attempt number ``attempt`` (0-based) should be sent.
+
+    Silent targets get ``attempts`` tries. Once a target has replied, it may
+    use up to ``max(attempts, required) + CONFIRM_EXTRA_ATTEMPTS`` tries, as
+    long as ``required`` replies are still reachable. Shared by every engine
+    so they reach identical verdicts.
+    """
+    if replies >= required:
+        return False
+    if replies == 0:
+        return attempt < attempts
+    budget = max(attempts, required) + CONFIRM_EXTRA_ATTEMPTS
+    return attempt < budget and replies + (budget - attempt) >= required
+
+
 def _confirm_direct_echo(
     ip: str,
     timeout: float,
-    attempts: int = 2,
+    attempts: int = 3,
     min_replies: int = 2,
     rate_limiter: Optional[RateLimiter] = None,
 ) -> EchoResult:
     """Require ``min_replies`` independent ping processes to see a direct reply.
 
-    Up to ``attempts`` single-packet processes are run, so a lossy host can
-    still qualify (for example 2 replies out of 5 attempts). Separate processes
-    use separate ICMP request state and prevent one stray, duplicated, or stale
-    reply from satisfying the positive decision. Integrity errors abort at once.
+    Attempts follow ``echo_attempt_allowed``: silent hosts get ``attempts``
+    tries, responders a few more to confirm. Separate processes use separate
+    ICMP request state, so one stray, duplicated, or stale reply cannot
+    satisfy the decision. Integrity errors abort at once.
     """
     required = max(1, min_replies)
-    attempts = max(attempts, required)
     ttl: Optional[int] = None
     rtts: list[float] = []
     sent = replies = 0
-    for attempt in range(attempts):
-        if replies + (attempts - attempt) < required or _STOP_EVENT.is_set():
-            break
+    while echo_attempt_allowed(replies, sent, attempts, required) and not _STOP_EVENT.is_set():
         if rate_limiter:
             rate_limiter.acquire(1)
         outcome = _ping_via_system(ip, timeout, 1)
@@ -1099,8 +1117,6 @@ def _confirm_direct_echo(
             if outcome[1] is not None:
                 ttl = outcome[1]
             rtts.extend(getattr(outcome, "rtts", []))
-            if replies >= required:
-                break
     if replies >= required:
         return EchoResult(True, ttl, rtts, sent, replies)
     return EchoResult(False, None, [], sent, replies)
@@ -1156,6 +1172,31 @@ def tcp_open_ports(ip: str, ports: list[int], timeout: float) -> list[int]:
     return asyncio.run(_check_all())
 
 
+TCP_CANARY_COUNT = 2
+
+
+def tcp_evidence(ip: str, ports: list[int], timeout: float) -> tuple[list[int], bool]:
+    """Open ports plus whether the address accepts connections on *any* port.
+
+    Two random high "canary" ports are tried together with the requested
+    ones. Real hosts almost never listen on both, but SYN proxies, tarpits,
+    and some firewalls accept every connection for every address. When both
+    canaries connect, the open ports are not evidence that a host exists.
+    """
+    import random
+    canaries: list[int] = []
+    while len(canaries) < TCP_CANARY_COUNT:
+        port = random.randint(40000, 65000)
+        if port not in ports and port not in canaries:
+            canaries.append(port)
+    accepted = tcp_open_ports(ip, list(ports) + canaries, timeout)
+    suspicious = all(port in accepted for port in canaries)
+    return [port for port in accepted if port not in canaries], suspicious
+
+
+TCP_PROXY_NOTE = "accepts TCP on every port (SYN proxy, tarpit, or firewall); TCP is not evidence here"
+
+
 def _build_probe_result(
     ip: str,
     icmp_alive: bool,
@@ -1164,8 +1205,13 @@ def _build_probe_result(
     probe_error: str = "",
     do_dns: bool = False,
     echo: Optional[EchoResult] = None,
+    tcp_suspect: bool = False,
 ) -> dict:
     """Build one normalized tri-state result from validated evidence."""
+    if tcp_suspect and not icmp_alive:
+        # Connections that anything would accept prove nothing about this address.
+        probe_error = probe_error or TCP_PROXY_NOTE
+        open_tcp_ports = []
     alive = icmp_alive or bool(open_tcp_ports)
     if alive:
         status = "REACHABLE"
@@ -1188,6 +1234,7 @@ def _build_probe_result(
         "probe_error": probe_error,
         "icmp_alive": icmp_alive,
         "tcp_open": open_tcp_ports,
+        "tcp_suspect": tcp_suspect,
         "ttl": ttl,
         "rtt_min": round(min(rtts), 2) if rtts else None,
         "rtt_avg": round(sum(rtts) / len(rtts), 2) if rtts else None,
@@ -1343,8 +1390,8 @@ def _scan_fping_batch(
                     probe_error = f"invalid ICMP confirmation: {exc}"
                 if not icmp_alive and not probe_error:
                     probe_error = "fping positive was not confirmed by a valid echo reply"
-        open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
-        return _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns, echo)
+        open_ports, tcp_suspect = tcp_evidence(ip, tcp_ports, tcp_timeout) if tcp_ports else ([], False)
+        return _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns, echo, tcp_suspect)
 
     candidates: set[str] = set()
     pool = ThreadPoolExecutor(max_workers=max(1, threads))
@@ -1454,8 +1501,8 @@ def _ping_one(
                 icmp_alive, ttl = False, None
                 probe_error = str(exc)
 
-    open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
-    return _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns, echo)
+    open_ports, tcp_suspect = tcp_evidence(ip, tcp_ports, tcp_timeout) if tcp_ports else ([], False)
+    return _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns, echo, tcp_suspect)
 
 
 def _probe_with_retry(
@@ -1493,6 +1540,7 @@ NATIVE_DEFAULT_INTERVAL = 0.002  # seconds between requests unless --rate is set
 # sending socket's buffer; ~200 unresolved neighbours can block sendto() for seconds.
 # Spreading requests over several sockets keeps every buffer well below that.
 NATIVE_REQUESTS_PER_SOCKET = 100
+NATIVE_MAX_SOCKETS = 64  # per family; stays far below default open-file limits (macOS: 256)
 ADAPTIVE_TIMEOUT_CAP = 3.0
 
 
@@ -1595,7 +1643,8 @@ class NativePinger:
         """Return the family's current socket, opening another every N requests."""
         with self.lock:
             pool = self.sockets.setdefault(family, [])
-            wanted = self.sends.get(family, 0) // NATIVE_REQUESTS_PER_SOCKET + 1
+            sends = self.sends.get(family, 0)
+            wanted = min(sends // NATIVE_REQUESTS_PER_SOCKET + 1, NATIVE_MAX_SOCKETS)
             if len(pool) < wanted:
                 try:
                     pool.append(_open_icmp_socket(family))
@@ -1605,7 +1654,10 @@ class NativePinger:
                 except OSError:
                     if not pool:
                         raise  # e.g. out of file descriptors; reuse what exists
-            self.sends[family] = self.sends.get(family, 0) + 1
+            self.sends[family] = sends + 1
+            if len(pool) >= NATIVE_MAX_SOCKETS:
+                # Pool is full: rotate so no single socket's buffer fills up.
+                return pool[(sends // NATIVE_REQUESTS_PER_SOCKET) % len(pool)]
             return pool[-1]
 
     def close(self) -> None:
@@ -1710,12 +1762,13 @@ def native_icmp_sweep(
 ) -> dict[str, tuple[EchoResult, str]]:
     """Probe every target in rounds from one socket; returns {ip: (echo, probe error)}.
 
-    Round 1 goes to every target; later rounds only to targets that can still
-    reach ``min_replies``, so silent hosts cost one timeout. ``timeout=None``
+    Rounds follow ``echo_attempt_allowed``: silent targets get ``attempts``
+    rounds, responders extra rounds to reach ``min_replies``. ``timeout=None``
     adapts the wait to observed round-trip times (capped at 3 s).
     """
     required = max(1, min_replies)
-    attempts = max(attempts, required)
+    attempts = max(1, attempts)
+    total_rounds = max(attempts, required) + CONFIRM_EXTRA_ATTEMPTS
     interval = 1.0 / rate if rate > 0 else NATIVE_DEFAULT_INTERVAL
     pinger = NativePinger()
     targets = [_TargetState(ip) for ip in ip_list]
@@ -1743,14 +1796,14 @@ def native_icmp_sweep(
                                           target.sent, len(target.received)), target.error)
 
     try:
-        for round_index in range(attempts):
+        for round_index in range(total_rounds):
             if _STOP_EVENT.is_set():
                 break
             with pinger.lock:
                 active = [
                     target for target in targets
-                    if not target.error and len(target.received) < required
-                    and len(target.received) + (attempts - round_index) >= required
+                    if not target.error
+                    and echo_attempt_allowed(len(target.received), target.sent, attempts, required)
                 ]
                 for target in targets:
                     if target not in active:
@@ -1809,15 +1862,15 @@ def _scan_native_batch(
     min_replies: int = 2,
 ) -> list[dict]:
     """Native ICMP sweep, with TCP checks and name lookups finished in a worker pool."""
-    attempts = max(count, min_replies) * (retry + 1)
+    attempts = count * (retry + 1)
     by_ip: dict[str, dict] = {}
     lock = threading.Lock()
     pool = ThreadPoolExecutor(max_workers=max(1, threads))
     futures = []
 
     def _complete(ip: str, echo: EchoResult, error: str) -> dict:
-        open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
-        return _build_probe_result(ip, bool(echo[0]), echo[1], open_ports, error, do_dns, echo)
+        open_ports, tcp_suspect = tcp_evidence(ip, tcp_ports, tcp_timeout) if tcp_ports else ([], False)
+        return _build_probe_result(ip, bool(echo[0]), echo[1], open_ports, error, do_dns, echo, tcp_suspect)
 
     def _on_done(ip: str, echo: EchoResult, error: str) -> None:
         # TCP checks and DNS start as soon as a target's ICMP verdict is known.
@@ -4516,7 +4569,7 @@ CONFIG_TEMPLATE = """\
 
 # threads = 20          # concurrent workers
 # timeout = 2           # seconds to wait per ping (fractions like 0.5 work)
-# count = 2             # ping attempts per host
+# count = 3             # ping attempts for a silent host
 # min_replies = 2       # replies needed before a host counts as reachable
 # retry = 0             # extra rounds for hosts that did not answer
 # rate = 0              # packets per second, 0 = unlimited
@@ -4799,7 +4852,7 @@ def print_topic_help(topic: str) -> int:
             ("--scan", "Probe the hosts of --sub (targets given directly are always scanned)."),
             ("-t, --threads N", "Concurrent workers (default 20, max 1000)."),
             ("--timeout SEC", "Wait per ping, fractions allowed (default 2)."),
-            ("--count N", "Ping attempts per host (default 2)."),
+            ("--count N", "Attempts for a silent host (default 3); responders get 2 extra to confirm."),
             ("--min-replies N", "Replies needed to count as reachable (default 2)."),
             ("--retry N", "Extra rounds for hosts that did not answer (max 5)."),
             ("--rate PPS", "Global packets-per-second cap; 0 = unlimited."),
@@ -5007,8 +5060,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Concurrent workers (default: 20)")
     sg.add_argument("--timeout", type=_timeout_argument, default=2, metavar="SEC",
                     help="Wait per ping in seconds, fractions allowed, or 'auto' (default: 2)")
-    sg.add_argument("--count", type=int, default=2, metavar="N",
-                    help="Ping attempts per host (default: 2)")
+    sg.add_argument("--count", type=int, default=3, metavar="N",
+                    help="Ping attempts for a silent host (default: 3)")
     sg.add_argument("--min-replies", type=int, default=2, metavar="N",
                     help="Replies required for REACHABLE (default: 2)")
     sg.add_argument("--retry", type=int, default=0, metavar="N",
@@ -5209,7 +5262,7 @@ def show_reverse_lookups(values: list[str], threads: int, max_hosts: int) -> int
 
     named = [(ip, *rows[ip]) for ip in addresses if rows[ip][0]]
     ip_w = max([15] + [len(ip) for ip in addresses])
-    name_w = max([8] + [len(name) for _ip, name, _source in named])
+    name_w = max([len("(no name)")] + [len(name) for _ip, name, _source in named])
     line = f"  {C.CYAN}+{'-' * (ip_w + 2)}+{'-' * (name_w + 2)}+{'-' * 9}+{C.RESET}"
     print(f"\n  {C.BOLD}{C.MAGENTA}REVERSE LOOKUP · IP → HOSTNAME{C.RESET}")
     print(line)
@@ -5324,6 +5377,29 @@ def _configure_streams() -> None:
         sys.stderr.reconfigure(**stream_options)
     except (AttributeError, ValueError):
         pass
+
+
+BLANKET_TCP_MIN_TARGETS = 16
+BLANKET_TCP_SHARE = 0.9
+
+
+def downgrade_blanket_tcp(results: list[dict]) -> int:
+    """Refuse TCP-only evidence when nearly every address "accepts" connections.
+
+    A transparent proxy or captive portal can answer port 80/443 for every IP,
+    including unused ones, on ports the canary check does not cover. If at
+    least 90% of 16+ scanned addresses are reachable only through TCP, those
+    results become PROBE ERROR instead of REACHABLE. Returns how many changed.
+    """
+    if len(results) < BLANKET_TCP_MIN_TARGETS:
+        return 0
+    tcp_only = [r for r in results if r["alive"] and not r.get("icmp_alive") and not r.get("arp") and r.get("tcp_open")]
+    if len(tcp_only) < BLANKET_TCP_SHARE * len(results):
+        return 0
+    for result in tcp_only:
+        result.update(alive=False, status="PROBE ERROR", evidence="",
+                      probe_error="TCP accepted for nearly every scanned address (proxy?); not counted as reachable")
+    return len(tcp_only)
 
 
 def scan_events(
@@ -5708,6 +5784,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     previous_scan = (load_history(label) or [None])[-1]
     results = run_scan(ip_list, label=label, quiet=not rich_output, resume=args.resume, **scan_kwargs)
     interrupted = _STOP_EVENT.is_set()
+    blanket = downgrade_blanket_tcp(results) if args.tcp_ports else 0
+    if blanket and not args.quiet:
+        print(C.warn(f"  ⚠  {blanket} addresses accepted TCP but never answered ping or ARP — nearly every "
+                     "address did, which points to a proxy or firewall answering for all of them. "
+                     "They are reported as PROBE ERROR, not REACHABLE."))
 
     alive = [r["ip"] for r in results if r["alive"]]
     dead  = [r["ip"] for r in results if r.get("status") == "NO RESPONSE"]

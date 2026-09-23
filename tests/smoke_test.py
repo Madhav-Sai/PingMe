@@ -72,7 +72,8 @@ def main() -> int:
     require(typo.returncode == 2 and "--tcp-ports" in typo.stdout, "option suggestion missing", typo.stdout)
 
     reverse = run("--reverse", "127.0.0.1", "--no-banner")
-    require(reverse.returncode == 0 and "REVERSE LOOKUP" in reverse.stdout, "reverse lookup failed", reverse.stdout)
+    # Exit 1 only means no name was found; some CI resolvers have no PTR for 127.0.0.1.
+    require(reverse.returncode in (0, 1) and "REVERSE LOOKUP" in reverse.stdout, "reverse lookup failed", reverse.stdout)
 
     subnet = run("--sub", "192.168.1.0/30", "--no-banner")
     require(subnet.returncode == 0, "subnet mode failed", subnet.stdout)

@@ -49,9 +49,14 @@ jobs:
           python pingme.py ::1 --ping-tool ping --compact --no-history || [ "$RUNNER_OS" = "Windows" ]
           python pingme.py --help-all > /dev/null
       - name: Native ICMP engine (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: always() && runner.os != 'Windows'
         shell: bash
         run: |
+          if ! python -c "import pingme, sys; sys.exit(0 if pingme.native_engine_available() else 1)"; then
+            echo "Unprivileged ICMP sockets are disabled here (net.ipv4.ping_group_range); checking the fallback."
+            python pingme.py 127.0.0.1 --compact --no-history
+            exit 0
+          fi
           python pingme.py 127.0.0.1 --ping-tool native --compact --no-history
           set +e
           python pingme.py 192.0.2.1 --ping-tool native --compact --no-history --timeout 1

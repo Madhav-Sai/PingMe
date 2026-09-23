@@ -165,10 +165,11 @@ class BackendTests(unittest.TestCase):
 
     def test_one_valid_echo_is_not_enough_for_positive_status(self) -> None:
         with patch.object(
-            pingme, "_ping_via_system", side_effect=[(True, 64), (False, None)]
+            pingme, "_ping_via_system", side_effect=[(True, 64), (False, None), (False, None), (False, None)]
         ) as ping_mock:
             self.assertEqual(pingme._confirm_direct_echo("10.0.0.8", 1, 2), (False, None))
-        self.assertEqual(ping_mock.call_count, 2)
+        # A responder gets CONFIRM_EXTRA_ATTEMPTS more tries, but one reply is never enough.
+        self.assertEqual(ping_mock.call_count, 4)
 
     def test_run_scan_fping_path_never_starts_per_host_workers(self) -> None:
         expected = [pingme._build_probe_result("10.0.0.1", False, None, [])]
