@@ -4717,7 +4717,7 @@ def print_quick_help() -> None:
     def section(title: str) -> None:
         print(f"\n  {C.BOLD}{C.MAGENTA}{title}{C.RESET}")
 
-    def line(left: str, right: str, width: int = 38) -> None:
+    def line(left: str, right: str, width: int = 42) -> None:
         print(f"    {C.CYAN}{left:<{width}}{C.RESET} {right}")
 
     print(f"\n  {C.BOLD}{C.MAGENTA}PingMe {VERSION}{C.RESET} — find which hosts are up, what they are called, and what changed.")
