@@ -5622,6 +5622,254 @@ class ColorArgumentParser(argparse.ArgumentParser):
         sys.exit(EXIT_USAGE)
 
 
+# What each option's value can be, for `pingme FLAG -h` and the generated shell
+# completion (install.py). Kinds: file, dir, iface, subnet, text (free text).
+OPTION_VALUE_HINTS: dict[str, tuple[str, list[tuple[str, str]]]] = {
+    "sub": ("subnet", []),
+    "file": ("file", []),
+    "host": ("text", [("<IP or hostname>", "")]),
+    "exclude": ("text", [("<IP or CIDR>", "")]),
+    "max_hosts": ("text", [("256", ""), ("1024", ""), ("65536", "default")]),
+    "tag": ("text", [("<tag>", "lines marked @tag in the target file")]),
+    "column": ("text", [("<column>", "CSV header name holding the targets")]),
+    "discover6": ("iface", []),
+    "reverse": ("text", [("<IP or CIDR>", "")]),
+    "tcp_ports": ("text", []),  # filled from pingme.TCP_PORT_PRESETS
+    "tcp_timeout": ("text", [("0.5", "seconds"), ("1", "seconds"), ("2", "default")]),
+    "ipinfo": ("text", [("<IP>", "")]),
+    "threads": ("text", [("10", ""), ("20", "default"), ("50", ""), ("100", "")]),
+    "timeout": ("text", [("0.5", "seconds"), ("1", "seconds"), ("2", "default"), ("auto", "adapt to measured RTT")]),
+    "count": ("text", [("1", ""), ("2", ""), ("3", "default"), ("5", "")]),
+    "min_replies": ("text", [("1", ""), ("2", "default"), ("3", "")]),
+    "retry": ("text", [("0", "default"), ("1", ""), ("2", "")]),
+    "rate": ("text", [("0", "unlimited (default)"), ("50", "packets/s"), ("200", "packets/s")]),
+    "interface": ("iface", []),
+    "watch": ("text", [("30", "seconds"), ("60", "seconds"), ("300", "seconds")]),
+    "alive_out": ("file", [("alive.txt", "default")]),
+    "dead_out": ("file", [("dead.txt", "default")]),
+    "error_out": ("file", [("errors.txt", "default")]),
+    "hostnames_out": ("file", [("hostnames.txt", "live-host report"), ("hostnames.csv", "CSV rows"),
+                               ("hostnames.json", "JSON rows")]),
+    "changes_out": ("file", [("changes.txt", "default")]),
+    "html": ("file", [("report.html", "HTML report")]),
+    "nmap_xml": ("file", [("scan.xml", "nmap XML")]),
+    "label": ("text", [("<name>", "history label")]),
+    "diff": ("file", []),
+    "clear_history": ("file", []),
+    "uptime": ("file", []),
+    "keep": ("text", [("10", ""), ("50", "default"), ("0", "keep everything")]),
+    "data_dir": ("dir", []),
+    "notify": ("text", [("https://", "Slack/Teams/Discord/any webhook"), ("mailto:", "e-mail"),
+                        ("telegram://", "TOKEN@CHAT")]),
+    "serve": ("text", [("9109", "port"), ("127.0.0.1:9109", "local only"), ("0.0.0.0:9109", "all adapters")]),
+    "wol": ("text", [("<MAC>", "aa:bb:cc:dd:ee:ff")]),
+    "wol_broadcast": ("text", [("255.255.255.255", "default")]),
+    "config": ("file", []),
+}
+OPTION_CHOICE_HELP: dict[str, dict[str, str]] = {
+    "ping_tool": {"auto": "pick the best available", "native": "built-in ICMP engine", "fping": "fping sweep",
+                  "ping": "system ping", "ask": "choose interactively"},
+    "out_format": {"txt": "one IP per line", "csv": "spreadsheet rows", "json": "full detail"},
+    "color": {"auto": "only on a terminal", "always": "force colors", "never": "plain text"},
+    "notify_on": {"changes": "when something changes", "down": "whenever a host is down",
+                  "always": "after every scan"},
+}
+
+
+
+
+def option_spec(parser: Optional[argparse.ArgumentParser] = None) -> list[dict]:
+    """Every option with its help, value kind, and suggested values."""
+    parser = parser or build_parser()
+    presets = list(TCP_PORT_PRESETS.items())
+    options = []
+    for action in parser._actions:
+        if not action.option_strings:
+            continue
+        takes_value = action.nargs != 0
+        kind, values = OPTION_VALUE_HINTS.get(action.dest, ("text", []))
+        if action.choices:
+            kind, values = "choice", [(str(c), OPTION_CHOICE_HELP.get(action.dest, {}).get(str(c), ""))
+                                      for c in action.choices]
+        if action.dest == "tcp_ports":
+            values = presets + [("22,80,443", "explicit list"), ("8000-8010", "range")]
+        options.append({
+            "names": list(action.option_strings),
+            "dest": action.dest,
+            "help": " ".join((action.help or "").split()).replace("%%", "%"),
+            "takes_value": takes_value,
+            "nargs": action.nargs,
+            "kind": kind if takes_value else None,
+            "values": values if takes_value else [],
+            "metavar": action.metavar if isinstance(action.metavar, str) else action.dest.upper(),
+            "default": action.default,
+        })
+    return options
+
+
+# Flags that are usually combined; shown by `pingme FLAG -h`.
+OPTION_RELATED: dict[str, list[str]] = {
+    "hostnames_out": ["--names-only", "--out-format"],
+    "names_only": ["--hostnames-out"],
+    "sub": ["--scan", "--exclude", "-I"],
+    "scan": ["--sub"],
+    "interface": ["--discover6", "--hostnames-out"],
+    "tcp_ports": ["--tcp-timeout"],
+    "tcp_timeout": ["--tcp-ports"],
+    "count": ["--min-replies", "--timeout"],
+    "min_replies": ["--count"],
+    "changes": ["--changes-out", "--notify"],
+    "compare": ["--history", "--diff"],
+    "notify": ["--notify-on", "--watch"],
+    "notify_on": ["--notify"],
+    "serve": ["--watch"],
+    "watch": ["--notify", "--serve"],
+    "wol": ["--wol-broadcast"],
+    "wake": ["--wol-broadcast"],
+    "out_format": ["--alive-out", "--dead-out", "--error-out"],
+    "file": ["--tag", "--column", "--changes"],
+    "keep": ["--history", "--data-dir"],
+}
+
+
+# Hand-picked examples for `pingme FLAG -h`; other flags get one built from their suggested value.
+OPTION_EXAMPLES: dict[str, list[tuple[str, str]]] = {
+    "hostnames_out": [
+        ("pingme 10.10.11.0/24 --hostnames-out hostnames.txt", "live-host report"),
+        ("pingme 10.10.11.0/24 --hostnames-out hostnames.txt --names-only", "only IP ADDRESS | HOSTNAME"),
+        ("pingme -f scope.txt --hostnames-out live.csv", "rows for a spreadsheet"),
+    ],
+    "names_only": [("pingme 10.10.11.0/24 --hostnames-out hostnames.txt --names-only", "only IP and hostname")],
+    "interface": [
+        ("pingme 10.10.11.0/24 -I wlan0", "every probe and DNS lookup from wlan0"),
+        ("pingme -f scope.txt --interface 10.10.11.30", "choose the adapter by its IP"),
+    ],
+    "sub": [("pingme --sub 10.10.11.0/24", "subnet calculator only"),
+            ("pingme --sub 10.10.11.0/24 --scan", "calculate and scan")],
+}
+# Options that run on their own instead of modifying a scan.
+_STANDALONE_OPTIONS = {"history", "diff", "clear_history", "uptime", "ipinfo", "reverse", "wol", "init_config",
+                       "update_oui", "help_topic", "help_all", "version", "discover6"}
+
+
+def _flag_examples(option: dict) -> list[tuple[str, str]]:
+    names = option["names"]
+    found = []
+    for line in _help_example_lines():
+        command, description = (re.split(r"\s{2,}", line, maxsplit=1) + [""])[:2]
+        if any(re.search(rf"(?<!\S){re.escape(name)}(?![\w-])", command) for name in names):
+            found.append((command, description))
+    found = OPTION_EXAMPLES.get(option["dest"], []) + found
+    if not found:
+        flag = max(names, key=len)
+        value = next((v for v, _d in option["values"] if not v.startswith("<")), None)
+        if option["takes_value"]:
+            value = value or {"file": "hosts.txt", "dir": "./data", "iface": "wlan0",
+                              "subnet": "192.168.1.0/24"}.get(option["kind"] or "", option["metavar"])
+        if option["dest"] in _STANDALONE_OPTIONS:
+            command = f"pingme {flag}" + (f" {value}" if option["takes_value"] else "")
+        else:
+            target = "hosts.txt" if option["dest"] in {"tag", "column", "changes", "changes_out"} else "192.168.1.0/24"
+            command = f"pingme {target} {flag}" + (f" {value}" if option["takes_value"] else "")
+        found = [(command, "")]
+    return list(dict.fromkeys(found))[:5]
+
+
+def _help_example_lines() -> list[str]:
+    """Every `$ pingme ...` example printed by the help topics, as plain text."""
+    import contextlib
+    import io
+    saved = {name: getattr(C, name) for name in dir(C) if not name.startswith("_") and isinstance(getattr(C, name), str)}
+    buffer = io.StringIO()
+    try:
+        for name in saved:
+            setattr(C, name, "")
+        with contextlib.redirect_stdout(buffer):
+            for topic in HELP_TOPICS:
+                print_topic_help(topic)
+    finally:
+        for name, value in saved.items():
+            setattr(C, name, value)
+    return [line.strip()[2:].rstrip() for line in buffer.getvalue().splitlines() if line.strip().startswith("$ pingme")]
+
+
+def _local_networks() -> list[str]:
+    if not shutil.which("ip"):
+        return []
+    output = _run_resolution_command(["ip", "-o", "-4", "route", "show", "scope", "link"], timeout=3)
+    return list(dict.fromkeys(line.split()[0] for line in output.splitlines() if line.split()))
+
+
+def flag_help_target(argv: list[str], parser: argparse.ArgumentParser) -> Optional[str]:
+    """The option a trailing -h/--help asks about: the nearest flag before it."""
+    if not any(token in {"-h", "--help"} for token in argv):
+        return None
+    position = max(index for index, token in enumerate(argv) if token in {"-h", "--help"})
+    known = parser._option_string_actions
+    for token in reversed(argv[:position]):
+        if not token.startswith("-") or token in {"-h", "--help"}:
+            continue
+        name = token.split("=", 1)[0]
+        if name in known:
+            return name
+        matches = [option for option in known if option.startswith(name) and option.startswith("--")]
+        if len(matches) == 1 or len({known[m].dest for m in matches}) == 1:
+            return matches[0] if matches else None
+        return None
+    return None
+
+
+def print_flag_help(flag: str, parser: argparse.ArgumentParser) -> int:
+    """Explain one option: what it does, what it accepts, its default, and examples."""
+    dest = parser._option_string_actions[flag].dest
+    option = next(entry for entry in option_spec(parser) if entry["dest"] == dest)
+    names = option["names"]
+    title = ", ".join(names) + (f" {option['metavar']}" if option["takes_value"] else "")
+    print(f"\n  {C.BOLD}{C.CYAN}{title}{C.RESET}")
+    print(f"  {C.DIM}{'─' * max(len(title), 40)}{C.RESET}")
+    print(f"  {option['help']}\n")
+
+    def row(label: str, text: str) -> None:
+        print(f"  {C.BOLD}{label:<12}{C.RESET}{text}")
+
+    kind = option["kind"]
+    if not option["takes_value"]:
+        row("Value", "none (on/off switch)")
+    else:
+        accepts = {
+            "file": "a file path", "dir": "a folder path", "iface": "an adapter name or one of its IP addresses",
+            "subnet": "a network in CIDR form, e.g. 192.168.1.0/24", "choice": "one of the values below",
+        }.get(kind, "text")
+        count = {"+": " (one or more)", "*": " (zero or more)", 2: " (exactly two)"}.get(option["nargs"], "")
+        row("Value", f"{option['metavar']}: {accepts}{count}")
+        values = [(v, d) for v, d in option["values"]]
+        if kind == "iface":
+            values = [(name, ", ".join(info[4][:1] + info[6][:1]) or "no address")
+                      for name, info in sorted(local_interfaces().items()) if info["up"]]
+        elif kind == "subnet":
+            values = [(network, "network on this machine") for network in _local_networks()]
+        if values:
+            width = max(len(v) for v, _d in values)
+            label = "Choices" if kind == "choice" else "Suggested"
+            for index, (value, description) in enumerate(values):
+                row(label if index == 0 else "", f"{C.GREEN}{value:<{width}}{C.RESET}  {C.DIM}{description}{C.RESET}")
+    default = option["default"]
+    if option["takes_value"] and default not in (None, False, [], ""):
+        row("Default", str(default))
+    related = OPTION_RELATED.get(dest, [])
+    if related:
+        row("Works with", "  ".join(related))
+    examples = _flag_examples(option)
+    print()
+    row("Examples", "")
+    width = max(len(command) for command, _d in examples)
+    for command, description in examples:
+        note = f"  {C.DIM}# {description}{C.RESET}" if description else ""
+        print(f"    {C.DIM}${C.RESET} {command:<{width}}{note}")
+    print(f"\n  {C.DIM}All options: pingme --help-all   Topics: pingme help{C.RESET}\n")
+    return EXIT_OK
+
+
 class _QuickHelpAction(argparse.Action):
     def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):
         super().__init__(option_strings, dest=dest, default=default, nargs=0, help=help)
@@ -5955,7 +6203,7 @@ def build_parser() -> argparse.ArgumentParser:
     og.add_argument("--error-out", default="errors.txt", metavar="FILE",
                     help="Probe-execution-error output file (default: errors.txt)")
     og.add_argument("--hostnames-out", "--hostfile-out", default=None, metavar="FILE",
-                    help="Host status table (file scans default to hostnames.txt)")
+                    help="Live-host report: IP, hostname, MAC, vendor, notes (file scans: hostnames.txt)")
     og.add_argument("--names-only", action="store_true",
                     help="Hostnames file lists only IP ADDRESS | HOSTNAME")
     og.add_argument("--changes-out", default="changes.txt", metavar="FILE",
@@ -6360,10 +6608,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     if _COLOR_ENABLED and not colors_wanted(pre.color or config.get("color") or "auto"):
         disable_colors()
 
-    # Nested help syntax: pingme help <topic>
+    # Nested help syntax: pingme help <topic>  |  pingme help --flag
     if argv and argv[0] == "help":
+        flags = [value for value in argv[1:] if value.startswith("-")]
+        if flags:
+            help_parser = build_parser()
+            target = flag_help_target([flags[0], "-h"], help_parser)
+            if target:
+                return print_flag_help(target, help_parser)
+            print(C.err(f"  ✗ Unknown option: {flags[0]}"), file=sys.stderr)
+            return EXIT_USAGE
         topics = [value for value in argv[1:] if not value.startswith("-")]
         return print_topic_help(topics[0] if topics else "")
+
+    # Per-flag help: pingme ... --hostnames-out -h
+    help_parser = build_parser()
+    target = flag_help_target(argv, help_parser)
+    if target and target not in {"-h", "--help"}:
+        return print_flag_help(target, help_parser)
 
     parser = build_parser()
     parser.set_defaults(**config)

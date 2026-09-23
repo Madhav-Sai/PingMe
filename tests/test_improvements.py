@@ -457,3 +457,37 @@ class InterfaceTests(unittest.TestCase):
         pingme._BOUND.dns_servers = []
         report = pingme.render_hosts_report([], {"scope": "x", "name_lookups": pingme.name_lookup_description()})
         self.assertIn("system resolver", report.split("LIMITATIONS", 1)[1])
+
+
+class FlagHelpTests(unittest.TestCase):
+    """`pingme ... FLAG -h` explains that flag."""
+
+    def test_nearest_flag_before_help_is_explained(self) -> None:
+        parser = pingme.build_parser()
+        target = pingme.flag_help_target(["--sub", "10.0.0.0/24", "--scan", "--hostnames-out", "-h"], parser)
+        self.assertEqual(target, "--hostnames-out")
+        self.assertEqual(pingme.flag_help_target(["--timeout", "2", "--help"], parser), "--timeout")
+        self.assertEqual(pingme.flag_help_target(["--hostn", "-h"], parser), "--hostnames-out")
+        self.assertIsNone(pingme.flag_help_target(["10.0.0.0/24", "-h"], parser))
+        self.assertIsNone(pingme.flag_help_target(["--scan"], parser))
+
+    def test_every_option_has_working_help_with_an_example(self) -> None:
+        import contextlib
+        import io
+        parser = pingme.build_parser()
+        for entry in pingme.option_spec(parser):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                self.assertEqual(pingme.print_flag_help(entry["names"][0], parser), pingme.EXIT_OK)
+            text = pingme.ANSI_RE.sub("", buffer.getvalue()) if hasattr(pingme, "ANSI_RE") else buffer.getvalue()
+            self.assertIn("$ pingme", text, entry["names"])
+
+    def test_hostnames_help_points_to_names_only(self) -> None:
+        import contextlib
+        import io
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = pingme.main(["--sub", "10.0.0.0/24", "--scan", "--hostnames-out", "-h", "--color", "never"])
+        self.assertEqual(code, pingme.EXIT_OK)
+        self.assertIn("--names-only", buffer.getvalue())
+        self.assertIn("hostnames.csv", buffer.getvalue())

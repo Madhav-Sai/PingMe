@@ -291,6 +291,31 @@ pingme --help-topic scan
 pingme --help-topic output
 ```
 
+### Help for one flag
+
+Put `-h` after any flag, even in the middle of a command, to see what that flag does, the values it accepts, its default, the flags that go with it, and examples:
+
+```bash
+pingme --sub 10.10.11.0/24 --scan --hostnames-out -h
+pingme -I -h
+pingme help --names-only
+```
+
+```text
+  --hostnames-out, --hostfile-out FILE
+  Live-host report: IP, hostname, MAC, vendor, notes (file scans: hostnames.txt)
+
+  Value       FILE: a file path
+  Suggested   hostnames.txt   live-host report
+              hostnames.csv   CSV rows
+              hostnames.json  JSON rows
+  Works with  --names-only  --out-format
+
+  Examples
+    $ pingme 10.10.11.0/24 --hostnames-out hostnames.txt               # live-host report
+    $ pingme 10.10.11.0/24 --hostnames-out hostnames.txt --names-only  # only IP ADDRESS | HOSTNAME
+```
+
 ---
 
 ## 📖 Usage

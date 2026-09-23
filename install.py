@@ -21,61 +21,6 @@ SCRIPT = "pingme.py"
 MARKER_START = "# >>> pingme completion >>>"
 MARKER_END = "# <<< pingme completion <<<"
 
-# Completion is generated from pingme.py's own argument parser, so every option
-# is always covered. VALUE_HINTS adds what argparse cannot know: what to suggest
-# for a value. Kinds: file, dir, iface, subnet, text (free text; the hint is shown).
-VALUE_HINTS: dict[str, tuple[str, list[tuple[str, str]]]] = {
-    "sub": ("subnet", []),
-    "file": ("file", []),
-    "host": ("text", [("<IP or hostname>", "")]),
-    "exclude": ("text", [("<IP or CIDR>", "")]),
-    "max_hosts": ("text", [("256", ""), ("1024", ""), ("65536", "default")]),
-    "tag": ("text", [("<tag>", "lines marked @tag in the target file")]),
-    "column": ("text", [("<column>", "CSV header name holding the targets")]),
-    "discover6": ("iface", []),
-    "reverse": ("text", [("<IP or CIDR>", "")]),
-    "tcp_ports": ("text", []),  # filled from pingme.TCP_PORT_PRESETS
-    "tcp_timeout": ("text", [("0.5", "seconds"), ("1", "seconds"), ("2", "default")]),
-    "ipinfo": ("text", [("<IP>", "")]),
-    "threads": ("text", [("10", ""), ("20", "default"), ("50", ""), ("100", "")]),
-    "timeout": ("text", [("0.5", "seconds"), ("1", "seconds"), ("2", "default"), ("auto", "adapt to measured RTT")]),
-    "count": ("text", [("1", ""), ("2", ""), ("3", "default"), ("5", "")]),
-    "min_replies": ("text", [("1", ""), ("2", "default"), ("3", "")]),
-    "retry": ("text", [("0", "default"), ("1", ""), ("2", "")]),
-    "rate": ("text", [("0", "unlimited (default)"), ("50", "packets/s"), ("200", "packets/s")]),
-    "interface": ("iface", []),
-    "watch": ("text", [("30", "seconds"), ("60", "seconds"), ("300", "seconds")]),
-    "alive_out": ("file", [("alive.txt", "default")]),
-    "dead_out": ("file", [("dead.txt", "default")]),
-    "error_out": ("file", [("errors.txt", "default")]),
-    "hostnames_out": ("file", [("hostnames.txt", "live-host report"), ("hostnames.csv", "CSV rows"),
-                               ("hostnames.json", "JSON rows")]),
-    "changes_out": ("file", [("changes.txt", "default")]),
-    "html": ("file", [("report.html", "HTML report")]),
-    "nmap_xml": ("file", [("scan.xml", "nmap XML")]),
-    "label": ("text", [("<name>", "history label")]),
-    "diff": ("file", []),
-    "clear_history": ("file", []),
-    "uptime": ("file", []),
-    "keep": ("text", [("10", ""), ("50", "default"), ("0", "keep everything")]),
-    "data_dir": ("dir", []),
-    "notify": ("text", [("https://", "Slack/Teams/Discord/any webhook"), ("mailto:", "e-mail"),
-                        ("telegram://", "TOKEN@CHAT")]),
-    "serve": ("text", [("9109", "port"), ("127.0.0.1:9109", "local only"), ("0.0.0.0:9109", "all adapters")]),
-    "wol": ("text", [("<MAC>", "aa:bb:cc:dd:ee:ff")]),
-    "wol_broadcast": ("text", [("255.255.255.255", "default")]),
-    "config": ("file", []),
-}
-CHOICE_HELP: dict[str, dict[str, str]] = {
-    "ping_tool": {"auto": "pick the best available", "native": "built-in ICMP engine", "fping": "fping sweep",
-                  "ping": "system ping", "ask": "choose interactively"},
-    "out_format": {"txt": "one IP per line", "csv": "spreadsheet rows", "json": "full detail"},
-    "color": {"auto": "only on a terminal", "always": "force colors", "never": "plain text"},
-    "notify_on": {"changes": "when something changes", "down": "whenever a host is down",
-                  "always": "after every scan"},
-}
-
-
 def _load_pingme():
     import importlib.util
     spec = importlib.util.spec_from_file_location("pingme_completion_source", project_script())
@@ -86,30 +31,7 @@ def _load_pingme():
 
 def completion_spec() -> list[dict]:
     """Every option from pingme's parser with what its value completes to."""
-    pingme = _load_pingme()
-    presets = [(name, ports) for name, ports in pingme.TCP_PORT_PRESETS.items()]
-    options = []
-    for action in pingme.build_parser()._actions:
-        if not action.option_strings:
-            continue
-        takes_value = action.nargs != 0
-        kind, values = VALUE_HINTS.get(action.dest, ("text", []))
-        if action.choices:
-            kind, values = "choice", [(str(c), CHOICE_HELP.get(action.dest, {}).get(str(c), ""))
-                                      for c in action.choices]
-        if action.dest == "tcp_ports":
-            values = presets + [("22,80,443", "explicit list"), ("8000-8010", "range")]
-        options.append({
-            "names": list(action.option_strings),
-            "dest": action.dest,
-            "help": " ".join((action.help or "").split()).replace("%%", "%"),
-            "takes_value": takes_value,
-            "nargs": action.nargs,
-            "kind": kind if takes_value else None,
-            "values": values if takes_value else [],
-            "metavar": action.metavar if isinstance(action.metavar, str) else action.dest.upper(),
-        })
-    return options
+    return _load_pingme().option_spec()
 
 
 def all_options() -> list[str]:
