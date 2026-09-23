@@ -32,7 +32,7 @@ OPTIONS = [
     "--scan", "--dns", "--tcp-ports", "--tcp-timeout", "--ipinfo",
     "-t", "--threads", "--timeout", "--count", "--retry", "--rate",
     "--ping-tool", "--fast", "--resume", "--alive-out", "--dead-out", "--error-out",
-    "--hostnames-out", "--changes-out", "--out-format", "--label", "-q", "--quiet", "--compact", "--verbose",
+    "--hostnames-out", "--hostfile-out", "--names-only", "--changes-out", "--out-format", "--label", "-q", "--quiet", "--compact", "--verbose",
     "--no-banner", "--history", "--changes", "--compare", "--diff",
     "--clear-history", "--no-history",
     "--no-dns", "-r", "--reverse", "--min-replies", "--watch", "--color", "--exit-zero",
@@ -335,6 +335,8 @@ _pingme() {{
     '--dead-out[no-response hosts output file]:file:_files' \\
     '--error-out[probe errors output file]:file:_files' \\
     '--hostnames-out[complete hostname status report]:file:_files' \\
+    '--hostfile-out[same as --hostnames-out]:file:_files' \\
+    '--names-only[hostnames file lists only IP and hostname]' \\
     '--changes-out[changes report file]:file:_files' \\
     '--out-format[output format]:format:({formats})' \\
     '--label[custom scan history label]:label:' \\
@@ -388,7 +390,7 @@ def bash_completion() -> str:
             COMPREPLY=( $(compgen -d -- "$cur") )
             return
             ;;
-        -f|--file|--alive-out|--dead-out|--error-out|--hostnames-out|--changes-out|--config)
+        -f|--file|--alive-out|--dead-out|--error-out|--hostnames-out|--hostfile-out|--changes-out|--config)
             COMPREPLY=( $(compgen -f -- "$cur") )
             return
             ;;
@@ -473,6 +475,8 @@ def fish_completion() -> str:
         "verbose": "Full interface",
         "changes": "Report changes since last scan",
         "hostnames-out": "Full status report file",
+        "hostfile-out": "Same as --hostnames-out",
+        "names-only": "Hostnames file lists only IP and hostname",
         "changes-out": "Changes report file",
     }
 

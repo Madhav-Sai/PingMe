@@ -245,6 +245,37 @@ class StateTests(StateDirTestCase):
             pingme.save_scan("office", result, announce=False, keep=3)
         self.assertEqual(len(pingme.load_history("office")), 3)
 
+    def test_default_data_dir_is_local_data_folder(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PINGME_DATA_DIR", None)
+            self.assertEqual(pingme._default_data_dir(), Path.cwd() / "data")
+
+    def test_output_files_are_archived_per_scan(self) -> None:
+        alive = Path(self._tmp.name) / "alive.txt"
+        alive.write_text("10.0.0.1\n", encoding="utf-8")
+        stamps = iter(["2026-01-01_00-00-0%d" % n for n in range(5)])
+        with patch.object(pingme, "datetime") as fake:
+            fake.now.return_value.strftime.side_effect = lambda _fmt: next(stamps)
+            for _ in range(5):
+                pingme.archive_outputs("office", [str(alive), None], keep=3, announce=False)
+        snapshots = pingme._snapshot_dirs("office")
+        self.assertEqual([path.name for path in snapshots],
+                         ["2026-01-01_00-00-02", "2026-01-01_00-00-03", "2026-01-01_00-00-04"])
+        self.assertEqual((snapshots[-1] / "alive.txt").read_text(encoding="utf-8"), "10.0.0.1\n")
+
+    def test_names_only_report_lists_ip_and_hostname(self) -> None:
+        records = [
+            {"host": "web01", "ip": "10.0.0.1", "name": ""},
+            {"host": "web01", "ip": "10.0.0.1", "name": ""},
+            {"host": "10.0.0.2", "ip": "10.0.0.2", "name": "printer.lan"},
+            {"host": "gone", "ip": "UNRESOLVED", "name": ""},
+        ]
+        table = pingme._names_table(records, "T")
+        self.assertIn("| IP ADDRESS | HOSTNAME    |", table)
+        self.assertEqual(table.count("web01"), 1)
+        self.assertIn("printer.lan", table)
+        self.assertNotIn("UNRESOLVED", table)
+
     def test_legacy_cwd_state_is_still_read(self) -> None:
         legacy = Path(self._tmp.name) / "legacy"
         (legacy / "data").mkdir(parents=True)

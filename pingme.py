@@ -49,7 +49,7 @@ class C:
     BLUE    = "\033[94m"
     MAGENTA = "\033[95m"
     CYAN    = "\033[96m"
-    WHITE   = "\033[97m"
+    WHITE   = "\033[39m"   # default foreground: readable on light and dark themes
     ORANGE  = "\033[38;5;208m"
     LIME    = "\033[38;5;118m"
     PURPLE  = "\033[38;5;135m"
@@ -98,6 +98,63 @@ def colors_wanted(mode: Optional[str]) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────
+# TERMINAL LAYOUT HELPERS
+# ─────────────────────────────────────────────────────────────────
+SECTION_WIDTH = 64
+
+
+def _terminal_width() -> int:
+    return max(60, shutil.get_terminal_size((120, 24)).columns)
+
+
+def _clip(value: str, width: int) -> str:
+    """Truncate to ``width`` characters, marking the cut with an ellipsis."""
+    return value if len(value) <= width else value[:max(0, width - 1)] + "…"
+
+
+def _fit_widths(widths: list[int], minimums: list[int], available: int) -> list[int]:
+    """Shrink the columns with the most slack until the table fits ``available`` columns."""
+    widths = list(widths)
+    while sum(width + 3 for width in widths) + 1 > available:
+        slack = [(width - minimum, index) for index, (width, minimum) in enumerate(zip(widths, minimums))]
+        most, index = max(slack)
+        if most <= 0:
+            break
+        widths[index] -= 1
+    return widths
+
+
+def _print_box_table(title: str, headers: list[str], widths: list[int], rows: list[list[tuple[str, str]]]) -> None:
+    """Print a Unicode-bordered table; each cell is (text, color)."""
+    border = C.DIM
+
+    def rule(left: str, middle: str, right: str) -> str:
+        return f"  {border}{left}{middle.join('─' * (width + 2) for width in widths)}{right}{C.RESET}"
+
+    edge = f"{border}│{C.RESET}"
+    print(f"\n  {C.BOLD}{C.CYAN}{title}{C.RESET}")
+    print(rule("┌", "┬", "┐"))
+    print(f"  {edge} " + f" {edge} ".join(
+        f"{C.BOLD}{_clip(header, width):<{width}}{C.RESET}" for header, width in zip(headers, widths)
+    ) + f" {edge}")
+    print(rule("├", "┼", "┤"))
+    for row in rows:
+        print(f"  {edge} " + f" {edge} ".join(
+            f"{color}{_clip(text, width):<{width}}{C.RESET}" for (text, color), width in zip(row, widths)
+        ) + f" {edge}")
+    print(rule("└", "┴", "┘"))
+
+
+def _section(title: str, width: int = SECTION_WIDTH) -> None:
+    """Print a section heading rule: ── TITLE ─────────."""
+    print(f"\n  {C.BOLD}{C.CYAN}── {title} {'─' * max(0, width - len(title) - 4)}{C.RESET}")
+
+
+def _rule(width: int = SECTION_WIDTH) -> str:
+    return f"  {C.DIM}{'─' * width}{C.RESET}"
+
+
+# ─────────────────────────────────────────────────────────────────
 # HISTORY / PERSISTENCE
 # ─────────────────────────────────────────────────────────────────
 _DATA_DIR_OVERRIDE: Optional[Path] = None
@@ -110,10 +167,15 @@ DEFAULT_HISTORY_KEEP = 50
 
 
 def _default_data_dir() -> Path:
-    """Per-user state directory, independent of the current working directory."""
+    """State directory: $PINGME_DATA_DIR, else ./data next to where PingMe runs."""
     override = os.environ.get("PINGME_DATA_DIR")
     if override:
         return Path(override).expanduser()
+    return Path.cwd() / "data"
+
+
+def _user_data_dir() -> Path:
+    """Per-user directory that release 3.3 used by default; still read as a fallback."""
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
         return (Path(base) if base else Path.home() / "AppData" / "Local") / "PingMe"
@@ -170,11 +232,12 @@ def _legacy_state_path(kind: str, label: str) -> Path:
 
 def _read_state(kind: str, label: str) -> object:
     """Read a JSON state file, falling back to the pre-3.3 ./data location."""
-    candidates = [_state_path(kind, label, create=False)]
-    legacy = _legacy_state_path(kind, label)
-    if legacy.resolve() != candidates[0].resolve():
-        candidates.append(legacy)
-    for path in candidates:
+    candidates = [
+        _state_path(kind, label, create=False),
+        _legacy_state_path(kind, label),
+        _user_data_dir() / _state_name(kind, label),
+    ]
+    for path in dict.fromkeys(path.resolve() for path in candidates):
         if path.is_file():
             try:
                 return json.loads(path.read_text(encoding="utf-8"))
@@ -201,7 +264,8 @@ def _write_json_atomic(path: Path, data: object) -> None:
 
 def _remove_state(kind: str, label: str) -> bool:
     removed = False
-    for path in (_state_path(kind, label, create=False), _legacy_state_path(kind, label)):
+    for path in (_state_path(kind, label, create=False), _legacy_state_path(kind, label),
+                 _user_data_dir() / _state_name(kind, label)):
         if path.is_file():
             path.unlink()
             removed = True
@@ -233,6 +297,37 @@ def save_scan(label: str, results: list[dict], announce: bool = True, keep: int 
     _write_json_atomic(hf, existing)
     if announce:
         print(f"  {C.DIM}[data] saved → {hf}{C.RESET}")
+
+
+_SNAPSHOT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+
+
+def _snapshot_dirs(label: str, root: Optional[Path] = None) -> list[Path]:
+    """Timestamped output-file snapshots for a label, oldest first."""
+    base = (root or _data_dir()) / _safe_label(label)
+    if not base.is_dir():
+        return []
+    return sorted(path for path in base.iterdir() if path.is_dir() and _SNAPSHOT_NAME.match(path.name))
+
+
+def archive_outputs(label: str, paths: list[Optional[str]], keep: int = DEFAULT_HISTORY_KEEP,
+                    announce: bool = True) -> Optional[Path]:
+    """Copy this scan's output files to <data>/<label>/<timestamp>/ so the next run cannot overwrite them."""
+    files = list(dict.fromkeys(
+        Path(path).expanduser() for path in paths if path and Path(path).expanduser().is_file()
+    ))
+    if not files:
+        return None
+    destination = _data_dir() / _safe_label(label) / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in files:
+        shutil.copy2(path, destination / path.name)
+    if keep > 0:
+        for old in _snapshot_dirs(label)[:-keep]:
+            shutil.rmtree(old, ignore_errors=True)
+    if announce:
+        print(f"  {C.DIM}[data] files archived → {destination}{C.RESET}")
+    return destination
 
 
 def load_history(label: str) -> list[dict]:
@@ -522,19 +617,19 @@ def show_ipinfo(targets: list[str]):
     BW = LABEL_W + VALUE_W + 3
 
     def _border(l, r):
-        return f"  {C.MAGENTA}{C.BOLD}{l}{'─' * BW}{r}{C.RESET}"
+        return f"  {C.DIM}{l}{'─' * BW}{r}{C.RESET}"
 
-    def row(label, value, vcol=C.WHITE):
+    def row(label, value, vcol=""):
         return (
-            f"  {C.MAGENTA}{C.BOLD}│{C.RESET}"
-            f" {C.CYAN}{C.BOLD}{label:<{LABEL_W}}{C.RESET}"
-            f" {vcol}{str(value)[:VALUE_W]:<{VALUE_W}}{C.RESET}"
-            f"{C.MAGENTA}{C.BOLD}│{C.RESET}"
+            f"  {C.DIM}│{C.RESET}"
+            f" {C.CYAN}{label:<{LABEL_W}}{C.RESET}"
+            f" {vcol}{_clip(str(value), VALUE_W):<{VALUE_W}}{C.RESET} "
+            f"{C.DIM}│{C.RESET}"
         )
 
-    print(f"\n  {C.BOLD}{C.MAGENTA}┌{'─' * BW}┐")
-    print(f"  │{'  🔍  IP CLASSIFICATION':^{BW}}│")
-    print(f"  └{'─' * BW}┘{C.RESET}")
+    print()
+    print(_border("┌", "┐"))
+    print(f"  {C.DIM}│{C.RESET} {C.BOLD}{'IP CLASSIFICATION':<{BW - 2}}{C.RESET} {C.DIM}│{C.RESET}")
 
     for ip_str in targets:
         info = ip_classify(ip_str)
@@ -605,23 +700,19 @@ def show_subnet_info(
     LABEL_W, VALUE_W = 24, 26
     BW = LABEL_W + VALUE_W + 3
 
-    def _border(l, r): return f"  {C.MAGENTA}{C.BOLD}{l}{'─' * BW}{r}{C.RESET}"
+    def _border(l, r): return f"  {C.DIM}{l}{'─' * BW}{r}{C.RESET}"
     top = _border("┌", "┐"); bot = _border("└", "┘"); sep = _border("├", "┤")
 
     def hdr(title):
-        vis_len = len(title) + 1
-        pad = BW - vis_len - 2
-        return (f"  {C.MAGENTA}{C.BOLD}│{C.RESET}"
-                f"  {C.BOLD}{C.WHITE}{title}{' ' * max(pad,0)}{C.RESET}"
-                f"{C.MAGENTA}{C.BOLD}│{C.RESET}")
+        return f"  {C.DIM}│{C.RESET} {C.BOLD}{title:<{BW - 2}}{C.RESET} {C.DIM}│{C.RESET}"
 
     def row(label, value, vcol=C.WHITE):
-        return (f"  {C.MAGENTA}{C.BOLD}│{C.RESET}"
-                f" {C.CYAN}{C.BOLD}{label:<{LABEL_W}}{C.RESET}"
-                f" {vcol}{str(value)[:VALUE_W]:<{VALUE_W}}{C.RESET}"
-                f"{C.MAGENTA}{C.BOLD}│{C.RESET}")
+        return (f"  {C.DIM}│{C.RESET}"
+                f" {C.CYAN}{label:<{LABEL_W}}{C.RESET}"
+                f" {vcol}{_clip(str(value), VALUE_W):<{VALUE_W}}{C.RESET} "
+                f"{C.DIM}│{C.RESET}")
 
-    print(); print(top); print(hdr("🌐  SUBNET INFORMATION")); print(sep)
+    print(); print(top); print(hdr("SUBNET INFORMATION")); print(sep)
     print(row("CIDR",              cidr,                       C.LIME))
     print(row("Network Address",   str(net.network_address),   C.YELLOW))
     if is_ipv4:
@@ -644,9 +735,9 @@ def show_subnet_info(
     bar   = f"{C.TEAL}{'█' * fill}{C.DIM}{'░' * (bar_w - fill)}{C.RESET}"
     print(f"\n  {C.DIM}Prefix /{prefix} usage:{C.RESET}  {bar}  {C.DIM}/{prefix} of /{address_bits}  ({pct:.1f}% host space){C.RESET}")
 
-    print(f"\n  {C.BOLD}{C.MAGENTA}┌{'─' * BW}┐{C.RESET}")
-    print(hdr("📐  SUBNET BREAKDOWN"))
-    print(f"  {C.MAGENTA}{C.BOLD}├{'─' * BW}┤{C.RESET}")
+    print(); print(top)
+    print(hdr("SUBNET BREAKDOWN"))
+    print(sep)
     sub_prefixes = [24, 25, 26, 27, 28, 29, 30] if is_ipv4 else [64, 96, 112, 120, 124, 126]
     for sub_prefix in sub_prefixes:
         if sub_prefix <= prefix:
@@ -654,14 +745,14 @@ def show_subnet_info(
         n_subnets  = 2 ** (sub_prefix - prefix)
         hosts_each = max(2 ** (address_bits - sub_prefix) - 2, 0) if is_ipv4 else 2 ** (address_bits - sub_prefix)
         print(row(f"/{sub_prefix} subnets", f"{n_subnets:>5,}  ×  {hosts_each} hosts each", C.WHITE))
-    print(f"  {C.MAGENTA}{C.BOLD}├{'─' * BW}┤{C.RESET}")
+    print(sep)
     class_label = ("Class A (/8)" if prefix <= 8 else
                    "Class B (/16)" if prefix <= 16 else
                    "Class C (/24)" if prefix <= 24 else "Subnetted") if is_ipv4 else "IPv6 subnet"
     scope = f"{'Private' if net.is_private else 'Public'} · {class_label}"
     print(row("Address Scope",           scope,                   C.PINK))
     print(row("Total IPs (incl. net+bc)" if is_ipv4 else "Total Addresses", f"{net.num_addresses:,}", C.DIM + C.WHITE))
-    print(f"  {C.MAGENTA}{C.BOLD}└{'─' * BW}┘{C.RESET}\n")
+    print(bot + "\n")
     return net
 
 
@@ -2096,6 +2187,10 @@ class NeighborEvidence:
     """
 
     PROXY_THRESHOLD = 3
+    # A STALE entry that gets traffic waits delay_first_probe_time (5 s on Linux)
+    # in DELAY, then sends up to 3 unicast probes 1 s apart before it settles.
+    SETTLE_SECONDS = 8.0
+    _VERIFYING = {"DELAY", "PROBE"}
 
     def __init__(self, use_as_evidence: bool = True, max_age: float = 1.0):
         self.use_as_evidence = use_as_evidence and sys.platform != "darwin"  # macOS arp shows no state
@@ -2104,6 +2199,7 @@ class NeighborEvidence:
         self.mac_counts: dict[str, int] = {}
         self.read_at = 0.0
         self.lock = threading.Lock()
+        self.pending: dict[str, dict] = {}
 
     def _refresh(self) -> None:
         if time.monotonic() - self.read_at < self.max_age:
@@ -2128,6 +2224,12 @@ class NeighborEvidence:
                 return result
             mac, state = entry
             sharing = self.mac_counts.get(mac) or sum(1 for other, _s in self.table.values() if other == mac)
+            if self.use_as_evidence and not result["alive"] and state in self._VERIFYING:
+                self.pending[result["ip"]] = result
+        self._apply(result, mac, state, sharing)
+        return result
+
+    def _apply(self, result: dict, mac: str, state: str, sharing: int) -> bool:
         result["mac"] = mac
         result["vendor"] = mac_vendor(mac)
         if (
@@ -2135,7 +2237,33 @@ class NeighborEvidence:
             and sharing < self.PROXY_THRESHOLD
         ):
             result.update(alive=True, status="REACHABLE", evidence="ARP/ND reply", arp=True)
-        return result
+            return True
+        return False
+
+    def settle(self, timeout: Optional[float] = None) -> list[dict]:
+        """Wait for neighbor entries the kernel was still verifying, and upgrade the ones that answer.
+
+        A host that ignores ping but was seen recently has a STALE entry; the
+        scan's probes move it to DELAY/PROBE, and it only becomes REACHABLE
+        seconds later. Checking once at probe time would report it as down.
+        """
+        upgraded: list[dict] = []
+        deadline = time.monotonic() + (self.SETTLE_SECONDS if timeout is None else timeout)
+        while self.pending and time.monotonic() < deadline and not _STOP_EVENT.is_set():
+            time.sleep(0.25)
+            with self.lock:
+                self.read_at = 0.0
+                self._refresh()
+                for ip, result in list(self.pending.items()):
+                    entry = self.table.get(ip)
+                    if entry is None or entry[1] not in self._VERIFYING:
+                        del self.pending[ip]
+                    if entry is not None and not result["alive"]:
+                        mac, state = entry
+                        if self._apply(result, mac, state, self.mac_counts.get(mac, 0)):
+                            upgraded.append(result)
+        self.pending.clear()
+        return upgraded
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2555,6 +2683,16 @@ def run_scan(
         if old_handler is not None:
             signal.signal(signal.SIGINT, old_handler)
 
+    if neighbors is not None and not interrupted:
+        for result in neighbors.settle():
+            if not quiet:
+                sys.stdout.write(
+                    f"{_line_start()}  {C.GREEN}✔ {result['ip']:<18}{C.RESET}"
+                    f"  {C.DIM}{'ARP/ND':<12} {'TTL=?':<8} {'':<9}{C.RESET}"
+                    f"  {C.DIM}{'Unknown':<16}{C.RESET}"
+                    f"  {C.CYAN}[{result['scope']}]{C.RESET}\n"
+                )
+
     elapsed = time.time() - t_start
 
     if interrupted and not resumable:
@@ -2645,16 +2783,12 @@ def write_results(
         print(f"Saved: {alive_file}, {dead_file}, {error_file}")
         return
 
-    box_w = 58
-    div   = f"  {C.CYAN}{'─' * box_w}{C.RESET}"
-    print(f"\n  {C.BOLD}{C.LIME}┌{'─' * (box_w + 2)}┐")
-    print(f"  │{'  📊  SCAN RESULTS':^{box_w + 2}}│")
-    print(f"  └{'─' * (box_w + 2)}┘{C.RESET}")
-    print(div)
-    print(f"  {C.DIM}│{C.RESET}  {'Total scanned':<28}{C.BOLD}{C.WHITE}{total:>6}{C.RESET}")
-    print(f"  {C.DIM}│{C.RESET}  {C.GREEN}{'Reachable (ICMP/TCP)':<28}{C.BOLD}{len(alive):>6}{C.RESET}  {C.DIM}({pct_a:.1f}%){C.RESET}")
-    print(f"  {C.DIM}│{C.RESET}  {C.RED}{'No ICMP/TCP response':<28}{C.BOLD}{len(dead):>6}{C.RESET}  {C.DIM}({pct_d:.1f}%){C.RESET}")
-    print(f"  {C.DIM}│{C.RESET}  {C.YELLOW}{'Probe errors':<28}{C.BOLD}{len(errors):>6}{C.RESET}  {C.DIM}({pct_e:.1f}%){C.RESET}")
+    div = _rule()
+    _section("SCAN RESULTS")
+    print(f"    {'Total scanned':<28}{C.BOLD}{C.WHITE}{total:>6}{C.RESET}")
+    print(f"    {C.GREEN}{'Reachable (ICMP/TCP)':<28}{C.BOLD}{len(alive):>6}{C.RESET}  {C.DIM}({pct_a:.1f}%){C.RESET}")
+    print(f"    {C.RED}{'No ICMP/TCP response':<28}{C.BOLD}{len(dead):>6}{C.RESET}  {C.DIM}({pct_d:.1f}%){C.RESET}")
+    print(f"    {C.YELLOW}{'Probe errors':<28}{C.BOLD}{len(errors):>6}{C.RESET}  {C.DIM}({pct_e:.1f}%){C.RESET}")
     print(div)
 
     # OS breakdown from TTL
@@ -2663,22 +2797,22 @@ def write_results(
         g = r.get("os_guess") or "Unknown"
         os_counts[g] = os_counts.get(g, 0) + 1
     if os_counts:
-        print(f"  {C.DIM}│{C.RESET}  {C.BOLD}OS-family hints (TTL heuristic):{C.RESET}")
+        print(f"    {C.BOLD}OS-family hints (TTL heuristic):{C.RESET}")
         for os_g, cnt in sorted(os_counts.items(), key=lambda x: -x[1]):
             col = ttl_color(os_g)
-            print(f"  {C.DIM}│{C.RESET}    {col}{os_g:<20}{C.RESET}  {C.BOLD}{cnt}{C.RESET}")
+            print(f"      {col}{os_g:<20}{C.RESET}  {C.BOLD}{cnt}{C.RESET}")
         print(div)
 
-    print(f"  {C.DIM}│{C.RESET}  {C.CYAN}alive → {alive_file}  ({out_format}){C.RESET}")
-    print(f"  {C.DIM}│{C.RESET}  {C.CYAN}no response → {dead_file}  ({out_format}){C.RESET}")
-    print(f"  {C.DIM}│{C.RESET}  {C.CYAN}probe errors → {error_file}  ({out_format}){C.RESET}")
+    print(f"    {C.CYAN}alive → {alive_file}  ({out_format}){C.RESET}")
+    print(f"    {C.CYAN}no response → {dead_file}  ({out_format}){C.RESET}")
+    print(f"    {C.CYAN}probe errors → {error_file}  ({out_format}){C.RESET}")
     print(div)
 
     if total:
         bar_w = 40
         n   = int(pct_a / 100 * bar_w)
-        bar = f"{C.GREEN}{'█' * n}{C.RED}{'█' * (bar_w - n)}{C.RESET}"
-        print(f"\n  Reachable/other ratio:  {bar}  {C.GREEN}{pct_a:.0f}%{C.RESET} reachable\n")
+        bar = f"{C.GREEN}{'█' * n}{C.DIM}{'░' * (bar_w - n)}{C.RESET}"
+        print(f"\n    Reachable  {bar}  {C.GREEN}{pct_a:.0f}%{C.RESET}\n")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2741,14 +2875,15 @@ def compare_history(
     stayed_dn  = changes["stayed_down"]
     unknown    = changes["indeterminate"]
 
-    box_w = 60
-    div   = f"  {C.PURPLE}{'─' * box_w}{C.RESET}"
-    print(f"\n  {C.BOLD}{C.PURPLE}┌{'─' * (box_w + 2)}┐")
-    print(f"  │{'  🕐  HISTORY COMPARISON':^{box_w + 2}}│")
-    print(f"  └{'─' * (box_w + 2)}┘{C.RESET}")
-    print(div)
+    div = _rule()
+    _section("HISTORY COMPARISON")
     print(f"  {C.DIM}Previous scan : {prev_ts}{C.RESET}")
     print(f"  {C.DIM}Current scan  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{C.RESET}")
+    snapshots = _snapshot_dirs(label)
+    previous_files = snapshots[-2] if saved_current and len(snapshots) >= 2 else (
+        snapshots[-1] if not saved_current and snapshots else None)
+    if previous_files:
+        print(f"  {C.DIM}Previous files: {previous_files}{C.RESET}")
     print(div)
     print(f"  {C.GREEN}  ↑ Newly UP      : {len(newly_up):>4}{C.RESET}")
     print(f"  {C.RED}  ↓ Newly DOWN    : {len(newly_down):>4}{C.RESET}")
@@ -2838,12 +2973,8 @@ def diff_files(file_a: str, file_b: str):
     only_a = sorted(ips_a - ips_b); only_b = sorted(ips_b - ips_a)
     common = sorted(ips_a & ips_b)
 
-    box_w = 60
-    div   = f"  {C.PURPLE}{'─' * box_w}{C.RESET}"
-    print(f"\n  {C.BOLD}{C.PURPLE}┌{'─' * (box_w + 2)}┐")
-    print(f"  │{'  📂  FILE DIFF COMPARISON':^{box_w + 2}}│")
-    print(f"  └{'─' * (box_w + 2)}┘{C.RESET}")
-    print(div)
+    div = _rule()
+    _section("FILE DIFF COMPARISON")
     print(f"  {C.DIM}File A: {file_a}  ({len(ips_a)} IPs){C.RESET}")
     print(f"  {C.DIM}File B: {file_b}  ({len(ips_b)} IPs){C.RESET}")
     print(div)
@@ -3090,27 +3221,23 @@ def show_host_resolution(rows: list[dict], source: str) -> None:
     if not display_rows:
         return
 
-    host_w = min(34, max(12, max(len(str(row["host"])) for row in display_rows)))
-    ip_w = min(45, max(15, max(len(str(row["ip"])) for row in display_rows)))
-    type_w = 12
-    line = f"  {C.CYAN}+{'-'*(host_w+2)}+{'-'*(ip_w+2)}+{'-'*(type_w+2)}+{C.RESET}"
-    print(f"\n  {C.BOLD}{C.MAGENTA}HOST RESOLUTION · {source}{C.RESET}")
-    print(line)
-    print(f"  {C.CYAN}|{C.RESET} {C.BOLD}{'HOST':<{host_w}}{C.RESET} {C.CYAN}|{C.RESET} "
-          f"{C.BOLD}{'IP ADDRESS':<{ip_w}}{C.RESET} {C.CYAN}|{C.RESET} "
-          f"{C.BOLD}{'TYPE':<{type_w}}{C.RESET} {C.CYAN}|{C.RESET}")
-    print(line)
+    kind_colors = {"DNS": C.GREEN, "DIRECT IP": C.WHITE, "FILE MAP": C.CYAN}
+    widths = [
+        max(len("HOST"), max(len(str(row["host"])) for row in display_rows)),
+        max(len("IP ADDRESS"), max(len(str(row["ip"])) for row in display_rows)),
+        max(len("TYPE"), max(len(str(row.get("type", "DNS"))) for row in display_rows)),
+    ]
+    widths = _fit_widths(widths, [10, min(widths[1], 39), widths[2]], _terminal_width() - 2)
+    rows_out = []
     for row in display_rows:
         row_type = str(row.get("type", "DNS"))
-        kind_color = {
-            "DNS": C.LIME,
-            "DIRECT IP": C.YELLOW,
-            "FILE MAP": C.CYAN,
-        }.get(row_type, C.RED)
-        print(f"  {C.CYAN}|{C.RESET} {str(row['host'])[:host_w]:<{host_w}} {C.CYAN}|{C.RESET} "
-              f"{C.WHITE}{str(row['ip'])[:ip_w]:<{ip_w}}{C.RESET} {C.CYAN}|{C.RESET} "
-              f"{kind_color}{row_type[:type_w]:<{type_w}}{C.RESET} {C.CYAN}|{C.RESET}")
-    print(line + "\n")
+        rows_out.append([
+            (str(row["host"]), C.WHITE),
+            (str(row["ip"]), C.WHITE),
+            (row_type, kind_colors.get(row_type, C.RED)),
+        ])
+    _print_box_table(f"HOST RESOLUTION · {source}", ["HOST", "IP ADDRESS", "TYPE"], widths, rows_out)
+    print()
 
 
 def build_file_status_records(rows: list[dict], results: list[dict]) -> list[dict]:
@@ -3211,6 +3338,10 @@ _STATUS_COLUMNS = [
 ]
 
 
+# Narrowest width a column may be squeezed to so the table fits the terminal.
+_STATUS_SHRINK_MIN = {"host": 10, "method": 6, "os_guess": 8, "name": 8, "vendor": 6, "tags": 4}
+
+
 def _status_columns(
     records: list[dict], hide_host: bool = False, host_header: str = "HOST"
 ) -> list[tuple[str, str, int]]:
@@ -3258,16 +3389,44 @@ def _plain_table(records: list[dict], title: str) -> str:
     return "\n".join(output)
 
 
+def _host_name(record: dict) -> str:
+    """Best hostname for a record: the name from the target list, else reverse DNS."""
+    host = str(record.get("host") or "")
+    if host and host != record.get("ip"):
+        try:
+            ipaddress.ip_address(host.strip("[]").split("%", 1)[0])
+        except ValueError:
+            return host
+    return str(record.get("name") or "")
+
+
+def _names_table(records: list[dict], title: str) -> str:
+    """IP ADDRESS | HOSTNAME only, one row per resolved address."""
+    rows = list(dict.fromkeys(
+        (str(r.get("ip", "")), _host_name(r) or "-") for r in records if r.get("ip") != "UNRESOLVED"
+    ))
+    ip_w = max([len("IP ADDRESS")] + [len(ip) for ip, _name in rows])
+    name_w = max([len("HOSTNAME")] + [len(name) for _ip, name in rows])
+    line = f"+{'-' * (ip_w + 2)}+{'-' * (name_w + 2)}+"
+    output = [title, "", line, f"| {'IP ADDRESS':<{ip_w}} | {'HOSTNAME':<{name_w}} |", line]
+    output += [f"| {ip:<{ip_w}} | {name:<{name_w}} |" for ip, name in rows]
+    output += [line, f"{len(rows)} addresses", ""]
+    return "\n".join(output)
+
+
 def write_hostnames_report(
     records: list[dict],
     source: str,
     output_file: str = "hostnames.txt",
     announce: bool = True,
+    names_only: bool = False,
+    title: str = "FILE SCAN STATUS",
 ) -> Path:
-    """Save HOST, IP, STATUS, METHOD, TTL, and OS details after every file scan."""
+    """Save the host status table (or just IP | HOSTNAME with ``names_only``)."""
     destination = Path(output_file).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    report = _plain_table(records, f"FILE SCAN STATUS · {source}")
+    table = _names_table if names_only else _plain_table
+    report = table(records, f"{title} · {source}")
     destination.write_text(report, encoding="utf-8")
     if announce:
         print(f"  {C.CYAN}[report] host details → {destination}{C.RESET}")
@@ -3572,43 +3731,37 @@ def show_file_scan_status(
 
     records = build_file_status_records(rows, results)
     columns = _status_columns(records, hide_host, host_header)
-    line = "  " + C.PURPLE + "+" + "+".join("-" * (width + 2) for _h, _k, width in columns) + "+" + C.RESET
-    bar = " " + C.PURPLE + "|" + C.RESET + " "
+    # Addresses are never truncated; every other column may shrink to its floor.
+    minimums = [
+        min(39, max([len(header)] + [len(str(record.get(key, ""))) for record in records]))
+        if key in {"ip", "mac"} else min(width, _STATUS_SHRINK_MIN.get(key, width))
+        for header, key, width in columns
+    ]
+    widths = _fit_widths([width for _h, _k, width in columns], minimums, _terminal_width() - 2)
 
-    print(f"\n  {C.BOLD}{C.MAGENTA}{title} · {source}{C.RESET}")
-    print(line)
-    print("  " + C.PURPLE + "|" + C.RESET + " " + bar.join(
-        f"{C.BOLD}{header:<{width}}{C.RESET}" for header, _key, width in columns
-    ) + bar.rstrip())
-    print(line)
-
+    table_rows = []
     for record in records:
         cells = []
-        for _header, key, width in columns:
+        for _header, key, _width in columns:
             value = str(record.get(key, ""))
             if key == "status":
                 color = getattr(C, _STATUS_COLORS.get(value, "DIM"))
             elif key == "ip":
-                color = C.CYAN if value != "UNRESOLVED" else C.YELLOW
-            elif key == "method":
-                color = C.YELLOW
+                color = C.YELLOW if value == "UNRESOLVED" else C.WHITE
             elif key == "os_guess":
                 color = ttl_color(value) if value not in {"-", "Unknown"} else C.DIM
-            elif key in {"name", "vendor"}:
-                color = C.TEAL
-            elif key == "mac":
-                color = C.DIM + C.WHITE
-            elif key in {"rtt", "loss"}:
-                color = C.DIM if value == "-" else C.WHITE
+            elif key in {"mac", "tags"} or value in {"-", "?"}:
+                color = C.DIM
             else:
                 color = C.WHITE
-            cells.append(f"{color}{value[:width]:<{width}}{C.RESET}")
-        print("  " + C.PURPLE + "|" + C.RESET + " " + bar.join(cells) + bar.rstrip())
+            cells.append((value, color))
+        table_rows.append(cells)
+    _print_box_table(f"{title} · {source}", [header for header, _k, _w in columns], widths, table_rows)
 
-    print(line)
     counts = _status_counts(records)
     summary = (
-        f"  {C.GREEN}Reachable: {counts['reachable']}{C.RESET}  "
+        f"  {C.DIM}{len(records)} entries ·{C.RESET} "
+        f"{C.GREEN}Reachable: {counts['reachable']}{C.RESET}  "
         f"{C.RED}No response: {counts['no_response']}{C.RESET}  "
         f"{C.YELLOW}Probe errors: {counts['probe_error']}{C.RESET}  "
         f"{C.YELLOW}Unresolved: {counts['unresolved']}{C.RESET}"
@@ -3899,7 +4052,7 @@ def check_deps(
 def show_history_list():
     d = _data_dir()
     files = sorted(f for f in d.glob("*.json") if not f.name.startswith(".")) if d.is_dir() else []
-    legacy = _legacy_data_dir()
+    legacy = _user_data_dir()
     legacy_files = (
         sorted(f for f in legacy.glob("*.json") if not f.name.startswith("."))
         if legacy.is_dir() and legacy.resolve() != d.resolve() else []
@@ -3915,7 +4068,10 @@ def show_history_list():
             n     = len(data); last = data[-1] if data else {}
             ts    = last.get("timestamp", "?")[:16]
             alive = len(last.get("alive", []))
-            where = f"  {C.YELLOW}(legacy ./data){C.RESET}" if f in legacy_files else ""
+            where = f"  {C.YELLOW}({legacy}){C.RESET}" if f in legacy_files else ""
+            snapshots = _snapshot_dirs(f.stem, d) if f in files else []
+            if snapshots:
+                where += f"  {C.DIM}files: {d / f.stem}/ ({len(snapshots)} snapshots){C.RESET}"
             print(f"  {C.LIME}{f.stem:<30}{C.RESET}  {C.DIM}{n} scans  last: {ts}  alive: {alive}{C.RESET}{where}")
         except Exception:
             print(f"  {C.RED}{f.stem}  (corrupt){C.RESET}")
@@ -4887,6 +5043,7 @@ def print_topic_help(topic: str) -> int:
             ("--dead-out FILE", "Completed probes with no response (default dead.txt)."),
             ("--error-out FILE", "Probes that failed to run (default errors.txt)."),
             ("--hostnames-out FILE", "Full HOST/IP/STATUS/RTT/LOSS/OS table (file scans: hostnames.txt)."),
+            ("--names-only", "Hostnames file lists only IP ADDRESS | HOSTNAME."),
             ("--changes-out FILE", "Change summary written by --changes (default changes.txt)."),
             ("--out-format FMT", "txt | csv | json for the alive/dead/errors files."),
             ("-q, --quiet", "Write files only; no terminal output."),
@@ -5089,8 +5246,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Non-responsive-host output file (default: dead.txt)")
     og.add_argument("--error-out", default="errors.txt", metavar="FILE",
                     help="Probe-execution-error output file (default: errors.txt)")
-    og.add_argument("--hostnames-out", default=None, metavar="FILE",
-                    help="Full status table (file scans default to hostnames.txt)")
+    og.add_argument("--hostnames-out", "--hostfile-out", default=None, metavar="FILE",
+                    help="Host status table (file scans default to hostnames.txt)")
+    og.add_argument("--names-only", action="store_true",
+                    help="Hostnames file lists only IP ADDRESS | HOSTNAME")
     og.add_argument("--changes-out", default="changes.txt", metavar="FILE",
                     help="Change report written by --changes (default: changes.txt)")
     og.add_argument("--out-format", default="txt", choices=["txt", "csv", "json"],
@@ -5807,8 +5966,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             status_records = show_file_scan_status(status_rows, results, source, title)
         else:
             status_records = build_file_status_records(status_rows, results)
-        if hostnames_out:
-            write_hostnames_report(status_records, source, hostnames_out, announce=rich_output)
 
         if args.changes and not interrupted:
             previous_changes = load_changes_state(label)
@@ -5827,6 +5984,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif not interrupted:
             print(f"\n  {C.YELLOW}No hosts answered in {', '.join(subnets)}.{C.RESET} "
                   f"{C.DIM}Hosts that block ping can be found with --tcp-ports 22,80,443,445,3389.{C.RESET}\n")
+
+    if hostnames_out and not interrupted:
+        write_hostnames_report(
+            status_records if status_rows else records_for_results(results, []),
+            target_file or ", ".join(subnets + hosts) or label,
+            hostnames_out, announce=rich_output, names_only=args.names_only,
+            title="FILE SCAN STATUS" if target_file else "SCAN STATUS",
+        )
 
     write_results(
         results,
@@ -5876,6 +6041,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                                         records, uptime_rows, meta)
         if not args.quiet:
             print(f"  {C.CYAN}[report] HTML → {destination}{C.RESET}")
+
+    if not args.no_history and not interrupted:
+        archive_outputs(label, [
+            args.alive_out, args.dead_out, args.error_out, hostnames_out,
+            args.changes_out if args.changes else None, args.html, args.nmap_xml,
+        ], keep=args.keep, announce=rich_output)
 
     if args.notify and not interrupted:
         events = scan_events(args.notify_on, results, status_rows, change_groups, previous_scan)

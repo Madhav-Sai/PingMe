@@ -733,7 +733,11 @@ Stores the complete current file-scan report:
 HOST | IP ADDRESS | STATUS | METHOD | TTL | RTT ms | LOSS | OS GUESS | REVERSE DNS
 ```
 
-The REVERSE DNS column appears when at least one name was found. For `--host` and subnet scans the table is shown on screen; pass `--hostnames-out FILE` to save it too.
+The REVERSE DNS column appears when at least one name was found. For `--host` and subnet scans the table is shown on screen; pass `--hostnames-out FILE` (alias `--hostfile-out`) to save it too. Add `--names-only` to save just `IP ADDRESS | HOSTNAME`:
+
+```bash
+pingme -f hosts.txt --hostnames-out hostnames.txt --names-only
+```
 
 ### `changes.txt`
 
@@ -846,16 +850,26 @@ pingme --diff monday.csv friday.json     # csv and json results work too
 
 ### Where history is stored
 
-History, resume data, and `--changes` baselines live in a per-user directory, so running PingMe from different folders shares the same history:
+History, resume data, and `--changes` baselines are saved in a `data/` folder next to where you run PingMe. Every scan also copies its output files (`alive.txt`, `dead.txt`, `errors.txt`, the hostnames file, and any `--html`/`--nmap-xml` report) into a timestamped folder, so the next run never loses them:
 
-| Platform | Default location |
-|---|---|
-| Linux | `~/.local/share/pingme` (or `$XDG_DATA_HOME/pingme`) |
-| macOS | `~/Library/Application Support/PingMe` |
-| Windows | `%LOCALAPPDATA%\PingMe` |
+```text
+data/
+├── hosts-1a2b3c4d.json                 # scan history used by --compare, --uptime, --changes
+└── hosts-1a2b3c4d/
+    ├── 2026-09-23_09-00-00/alive.txt  dead.txt  errors.txt  hostnames.txt
+    └── 2026-09-23_17-00-00/alive.txt  dead.txt  errors.txt  hostnames.txt
+```
 
-Override it with `--data-dir DIR` or `PINGME_DATA_DIR`. History keeps the newest 50 scans per label (`--keep N`, `0` = all).
-Baselines saved by older versions in `./data` are still read, so upgrading does not lose your `--changes` history.
+`alive.txt` in your working folder is always the latest scan. To see what changed:
+
+```bash
+pingme -f hosts.txt --compare                 # compares with the previous scan; prints where its files are
+pingme --history                              # lists labels, scan counts, and snapshot folders
+pingme --diff data/hosts-1a2b3c4d/2026-09-23_09-00-00/alive.txt alive.txt
+```
+
+Override the location with `--data-dir DIR` or `PINGME_DATA_DIR` (the Docker image and systemd units use `/data` and `/var/lib/pingme`). History and snapshots keep the newest 50 scans per label (`--keep N`, `0` = all); `--no-history` saves neither.
+History saved by 3.3 in the per-user directory (`~/.local/share/pingme`, `~/Library/Application Support/PingMe`, or `%LOCALAPPDATA%\PingMe`) is still read, so `--compare` keeps working after upgrading.
 Target files are labelled by name plus a short hash of their full path, so two `hosts.txt` files in different folders never share a baseline. `pingme --clear-history endpoints.txt` accepts the file path directly.
 
 ---
@@ -1026,6 +1040,10 @@ TARGET [TARGET ...]
 --hostnames-out FILE
     Save the complete status table (HOST, IP ADDRESS, STATUS, METHOD, TTL,
     RTT, LOSS, OS GUESS, REVERSE DNS). Default for file scans: hostnames.txt.
+    Works for every scan type. Alias: --hostfile-out.
+
+--names-only
+    Make the hostnames file list only IP ADDRESS | HOSTNAME.
 
 --changes-out FILE
     Save newly-online and went-offline changes. Default: changes.txt.

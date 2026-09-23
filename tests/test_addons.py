@@ -85,6 +85,31 @@ class NeighborTests(unittest.TestCase):
         self.assertEqual(stale["status"], "NO RESPONSE")
         self.assertEqual(stale["mac"], "aa:bb:cc:00:00:06")
 
+    def test_entry_still_being_verified_is_settled_after_the_scan(self) -> None:
+        evidence = pingme.NeighborEvidence()
+        evidence.use_as_evidence = True
+        tables = iter([
+            [("10.0.0.7", "", "aa:bb:cc:00:00:07", "DELAY"), ("10.0.0.8", "", "aa:bb:cc:00:00:08", "DELAY")],
+            [("10.0.0.7", "", "aa:bb:cc:00:00:07", "PROBE"), ("10.0.0.8", "", "aa:bb:cc:00:00:08", "FAILED")],
+            [("10.0.0.7", "", "aa:bb:cc:00:00:07", "REACHABLE"), ("10.0.0.8", "", "aa:bb:cc:00:00:08", "FAILED")],
+        ])
+        latest: list = []
+
+        def read(family: int) -> list:
+            if family == 4:
+                latest[:] = next(tables, latest)
+                return list(latest)
+            return []
+
+        with patch.object(pingme, "read_neighbor_entries", side_effect=read), patch.object(pingme.time, "sleep"):
+            silent, gone = evidence.enrich(result("10.0.0.7")), evidence.enrich(result("10.0.0.8"))
+            self.assertEqual(silent["status"], "NO RESPONSE")
+            upgraded = evidence.settle(timeout=5)
+        self.assertEqual([r["ip"] for r in upgraded], ["10.0.0.7"])
+        self.assertEqual((silent["status"], silent["evidence"]), ("REACHABLE", "ARP/ND reply"))
+        self.assertEqual(gone["status"], "NO RESPONSE")
+        self.assertEqual(evidence.pending, {})
+
     def test_proxy_arp_mac_is_not_evidence(self) -> None:
         table = {f"10.0.0.{n}": ("00:11:22:33:44:55", "REACHABLE") for n in range(1, 6)}
         self.assertEqual(self._evidence(table, result("10.0.0.3"))["status"], "NO RESPONSE")
