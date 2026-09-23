@@ -223,29 +223,37 @@ pingme 3.3.0 (reliable-cross-platform)
 
 ## ⌨️ Automatic Tab Completion
 
-PingMe installs completion for:
-
-- Zsh
-- Bash
-- Fish
-- PowerShell
-
-Examples:
-
-```bash
-pingme --<TAB>
-pingme help <TAB>
-pingme --ping-tool <TAB>
-pingme --out-format <TAB>
-```
-
-Completion suggestions include:
+`python3 install.py` installs completion for **Zsh, Bash, Fish, and PowerShell**. The scripts are generated from PingMe's own option list, so every flag is covered, and pressing TAB after a flag offers the values *that flag* accepts:
 
 ```text
-auto  fping  ping
-txt   csv    json
-targets  scan  discovery  output  history  advanced  examples
+pingme --ping-tool <TAB>
+auto    -- pick the best available      native  -- built-in ICMP engine
+fping   -- fping sweep                  ping    -- system ping          ask -- choose interactively
+
+pingme --sub 10.10.11.0/24 --scan --hostnames-out <TAB>
+hostnames.txt  -- live-host report   hostnames.csv  -- CSV rows   hostnames.json -- JSON rows   (+ files)
+
+pingme -I <TAB>
+eth0  lo  wlan0  docker0 ...          10.10.11.30 -- wlan0   127.0.0.1 -- lo
+
+pingme --tcp-ports <TAB>
+web -- 80,443,8080,8443   windows -- 135,139,445,3389,5985   linux -- 22,111,2049   db -- ...
+
+pingme --sub <TAB>
+10.10.11.0/24  172.17.0.0/16 ...      (networks this machine is connected to)
 ```
+
+| After | TAB offers |
+|---|---|
+| a flag with fixed choices (`--ping-tool`, `--out-format`, `--color`, `--notify-on`, `--help-topic`) | the choices, with descriptions |
+| an output flag (`--hostnames-out`, `--alive-out`, `--html`, `--nmap-xml`, …) | files, plus the usual file names and formats |
+| `-I`/`--interface`, `--discover6` | adapter names and their IP addresses |
+| `--sub` or a bare target | the networks this machine is on |
+| `--tcp-ports` | port presets with the ports they expand to |
+| numbers (`--timeout`, `--threads`, `--count`, `--keep`, …) | common values, with the default marked |
+| free text (`--host`, `--label`, `--wol`, …) | a hint describing what to type (zsh) |
+
+Re-run `python3 install.py` after updating PingMe to refresh completion. Zsh and PowerShell show descriptions; Bash shows the values only.
 
 ---
 
@@ -699,7 +707,23 @@ pingme hosts.txt --tag prod                 # only lines tagged @prod (web01 @pr
 
 `--trace-down` explains each outage: "path stops after 10.0.0.1 (hop 3)", "on your local network but silent at layer 2: powered off, unplugged, or moved to another IP", or "path is fine; the host itself ignores ping".
 
-### 15. Running as a service
+### 15. Choosing the network adapter (`-I` / `--interface`)
+
+On a machine with several adapters (Ethernet, Wi-Fi, VPN, Docker bridges), pin the whole scan to the in-scope one:
+
+```bash
+pingme 10.10.11.0/24 -I wlan0 --hostnames-out hostnames.txt
+pingme -f scope.txt --interface 10.10.11.30     # the adapter's IP works too (required on Windows)
+```
+
+- **Everything goes out that adapter:** ICMP (all engines), TCP checks, traceroute, Wake-on-LAN, and name lookups. Reverse and forward DNS go to *that adapter's* DNS server through a bound socket, and mDNS/NetBIOS name queries go to the target itself. Nothing falls back to another adapter silently.
+- **ARP evidence** only counts replies seen on that adapter.
+- **Checked before the scan:** unknown or down adapters and adapters without an address are refused, with a list of the valid ones. PingMe warns when targets normally route through a different adapter.
+- **Recorded in the report:** `Interface : wlan0, forced with -I` and `Name lookups : DNS 10.10.11.1 via wlan0`.
+- **Platforms:** Linux pins sockets to the device (`SO_BINDTODEVICE`), macOS uses `IP_BOUND_IF`, and Windows uses `IP_UNICAST_IF` for PingMe's own sockets. Windows `ping.exe` can only set the source address, and the report says so.
+- Set it permanently with `interface = "wlan0"` in the config file.
+
+### 16. Running as a service
 
 - **Docker:** `docker build -t pingme .` then `docker run --rm --network host pingme 192.168.1.0/24`
 - **systemd:** `contrib/systemd/pingme-check.{service,timer}` (every 5 min, alerts via `/etc/pingme/pingme.env`) and `pingme-serve.service` (metrics exporter)

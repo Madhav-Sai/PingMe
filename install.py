@@ -21,30 +21,99 @@ SCRIPT = "pingme.py"
 MARKER_START = "# >>> pingme completion >>>"
 MARKER_END = "# <<< pingme completion <<<"
 
-PING_TOOLS = ["auto", "native", "fping", "ping", "ask"]
-NOTIFY_MODES = ["changes", "down", "always"]
-OUTPUT_FORMATS = ["txt", "csv", "json"]
-COLOR_MODES = ["auto", "always", "never"]
+# Completion is generated from pingme.py's own argument parser, so every option
+# is always covered. VALUE_HINTS adds what argparse cannot know: what to suggest
+# for a value. Kinds: file, dir, iface, subnet, text (free text; the hint is shown).
+VALUE_HINTS: dict[str, tuple[str, list[tuple[str, str]]]] = {
+    "sub": ("subnet", []),
+    "file": ("file", []),
+    "host": ("text", [("<IP or hostname>", "")]),
+    "exclude": ("text", [("<IP or CIDR>", "")]),
+    "max_hosts": ("text", [("256", ""), ("1024", ""), ("65536", "default")]),
+    "tag": ("text", [("<tag>", "lines marked @tag in the target file")]),
+    "column": ("text", [("<column>", "CSV header name holding the targets")]),
+    "discover6": ("iface", []),
+    "reverse": ("text", [("<IP or CIDR>", "")]),
+    "tcp_ports": ("text", []),  # filled from pingme.TCP_PORT_PRESETS
+    "tcp_timeout": ("text", [("0.5", "seconds"), ("1", "seconds"), ("2", "default")]),
+    "ipinfo": ("text", [("<IP>", "")]),
+    "threads": ("text", [("10", ""), ("20", "default"), ("50", ""), ("100", "")]),
+    "timeout": ("text", [("0.5", "seconds"), ("1", "seconds"), ("2", "default"), ("auto", "adapt to measured RTT")]),
+    "count": ("text", [("1", ""), ("2", ""), ("3", "default"), ("5", "")]),
+    "min_replies": ("text", [("1", ""), ("2", "default"), ("3", "")]),
+    "retry": ("text", [("0", "default"), ("1", ""), ("2", "")]),
+    "rate": ("text", [("0", "unlimited (default)"), ("50", "packets/s"), ("200", "packets/s")]),
+    "interface": ("iface", []),
+    "watch": ("text", [("30", "seconds"), ("60", "seconds"), ("300", "seconds")]),
+    "alive_out": ("file", [("alive.txt", "default")]),
+    "dead_out": ("file", [("dead.txt", "default")]),
+    "error_out": ("file", [("errors.txt", "default")]),
+    "hostnames_out": ("file", [("hostnames.txt", "live-host report"), ("hostnames.csv", "CSV rows"),
+                               ("hostnames.json", "JSON rows")]),
+    "changes_out": ("file", [("changes.txt", "default")]),
+    "html": ("file", [("report.html", "HTML report")]),
+    "nmap_xml": ("file", [("scan.xml", "nmap XML")]),
+    "label": ("text", [("<name>", "history label")]),
+    "diff": ("file", []),
+    "clear_history": ("file", []),
+    "uptime": ("file", []),
+    "keep": ("text", [("10", ""), ("50", "default"), ("0", "keep everything")]),
+    "data_dir": ("dir", []),
+    "notify": ("text", [("https://", "Slack/Teams/Discord/any webhook"), ("mailto:", "e-mail"),
+                        ("telegram://", "TOKEN@CHAT")]),
+    "serve": ("text", [("9109", "port"), ("127.0.0.1:9109", "local only"), ("0.0.0.0:9109", "all adapters")]),
+    "wol": ("text", [("<MAC>", "aa:bb:cc:dd:ee:ff")]),
+    "wol_broadcast": ("text", [("255.255.255.255", "default")]),
+    "config": ("file", []),
+}
+CHOICE_HELP: dict[str, dict[str, str]] = {
+    "ping_tool": {"auto": "pick the best available", "native": "built-in ICMP engine", "fping": "fping sweep",
+                  "ping": "system ping", "ask": "choose interactively"},
+    "out_format": {"txt": "one IP per line", "csv": "spreadsheet rows", "json": "full detail"},
+    "color": {"auto": "only on a terminal", "always": "force colors", "never": "plain text"},
+    "notify_on": {"changes": "when something changes", "down": "whenever a host is down",
+                  "always": "after every scan"},
+}
 
-OPTIONS = [
-    "-h", "--help", "--version", "help", "--help-topic", "--help-all",
-    "-s", "--sub", "-f", "--file", "--host", "--exclude", "--max-hosts",
-    "--scan", "--dns", "--tcp-ports", "--tcp-timeout", "--ipinfo",
-    "-t", "--threads", "--timeout", "--count", "--retry", "--rate",
-    "--ping-tool", "--fast", "--resume", "--alive-out", "--dead-out", "--error-out",
-    "--hostnames-out", "--hostfile-out", "--names-only", "--changes-out", "--out-format", "--label", "-q", "--quiet", "--compact", "--verbose",
-    "--no-banner", "--history", "--changes", "--compare", "--diff",
-    "--clear-history", "--no-history",
-    "--no-dns", "-r", "--reverse", "--min-replies", "--watch", "--color", "--exit-zero",
-    "--keep", "--data-dir", "--config", "--no-config", "--init-config",
-    "--discover6", "-4", "--ipv4-only", "-6", "--ipv6-only",
-    "--no-arp", "--update-oui", "--trace-down", "--tag", "--column", "--html", "--nmap-xml",
-    "--uptime", "--notify", "--notify-on", "--serve", "--wake", "--wol", "--wol-broadcast",
-]
-HELP_TOPICS = [
-    "targets", "scan", "discovery", "output", "history", "alerts", "config",
-    "exitcodes", "advanced", "examples",
-]
+
+def _load_pingme():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("pingme_completion_source", project_script())
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def completion_spec() -> list[dict]:
+    """Every option from pingme's parser with what its value completes to."""
+    pingme = _load_pingme()
+    presets = [(name, ports) for name, ports in pingme.TCP_PORT_PRESETS.items()]
+    options = []
+    for action in pingme.build_parser()._actions:
+        if not action.option_strings:
+            continue
+        takes_value = action.nargs != 0
+        kind, values = VALUE_HINTS.get(action.dest, ("text", []))
+        if action.choices:
+            kind, values = "choice", [(str(c), CHOICE_HELP.get(action.dest, {}).get(str(c), ""))
+                                      for c in action.choices]
+        if action.dest == "tcp_ports":
+            values = presets + [("22,80,443", "explicit list"), ("8000-8010", "range")]
+        options.append({
+            "names": list(action.option_strings),
+            "dest": action.dest,
+            "help": " ".join((action.help or "").split()).replace("%%", "%"),
+            "takes_value": takes_value,
+            "nargs": action.nargs,
+            "kind": kind if takes_value else None,
+            "values": values if takes_value else [],
+            "metavar": action.metavar if isinstance(action.metavar, str) else action.dest.upper(),
+        })
+    return options
+
+
+def all_options() -> list[str]:
+    return [name for option in completion_spec() for name in option["names"]]
 
 
 def color(code: str, text: str) -> str:
@@ -262,140 +331,126 @@ def install_windows_launcher(source: Path) -> Path:
     return launcher
 
 
-def zsh_completion() -> str:
-    ping_tools = " ".join(PING_TOOLS)
-    formats = " ".join(OUTPUT_FORMATS)
-    colors = " ".join(COLOR_MODES)
-    topics = " ".join(HELP_TOPICS)
+IFACE_ADDRESSES_SH = "ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1"
+# "10.10.11.30:wlan0" pairs for zsh's described list (IPv4; IPv6 colons would split the description).
+IFACE_V4_DESCRIBED_SH = "ip -o -4 addr show 2>/dev/null | awk '{print $4, $2}' | sed 's|/[0-9]* |:|'"
+LOCAL_SUBNETS_SH = "ip -o -4 route show scope link 2>/dev/null | awk '{print $1}'"
 
-    return f'''#compdef pingme
+
+def _zsh_quote(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:").replace("[", "\\[").replace("]", "\\]")
+
+
+def _zsh_value_function(option: dict) -> str:
+    """Completion function for one option's value; the option's help is the list heading."""
+    heading = option["help"].replace("'", "")
+    real = [(v, d) for v, d in option["values"] if not v.startswith("<")]
+    placeholder = next((f"{v}{': ' + d if d else ''}" for v, d in option["values"] if v.startswith("<")), "")
+    kind = option["kind"]
+    body = []
+    if kind == "file":
+        body.append("_files")
+    elif kind == "dir":
+        body.append("_files -/")
+    elif kind == "iface":
+        body.append("_net_interfaces")
+        body.append(f'local -a addrs; addrs=(${{(f)"$({IFACE_V4_DESCRIBED_SH})"}})')
+        body.append("(( ${#addrs} )) && _describe -t addresses 'adapter IP address' addrs")
+    elif kind == "subnet":
+        body.append(f'local -a nets; nets=(${{(f)"$({LOCAL_SUBNETS_SH})"}})')
+        body.append("(( ${#nets} )) && _describe -t networks 'networks on this machine' nets")
+    if real:
+        items = " ".join("'" + (v.replace(":", "\\:") + (":" + d if d else "")).replace("'", "'\\''") + "'"
+                         for v, d in real)
+        body.append(f"local -a vals; vals=({items})")
+        body.append(f"_describe -t values '{heading}' vals")
+    elif kind == "text":
+        body.append(f"_message -r '{heading}{' — ' + placeholder if placeholder else ''}'")
+    return f"_pingme_value_{option['dest']}() {{\n  " + "\n  ".join(body) + "\n}\n"
+
+
+def zsh_completion() -> str:
+    spec = completion_spec()
+    functions = "\n".join(_zsh_value_function(option) for option in spec if option["takes_value"])
+    lines = []
+    for option in spec:
+        names = option["names"]
+        exclude = f"'({' '.join(names)})'" if len(names) > 1 else ""
+        name_part = ("{" + ",".join(names) + "}") if len(names) > 1 else names[0]
+        repeat = "*" if option["nargs"] in ("+", "*") or option["dest"] in {"tag", "notify"} else ""
+        desc = f"'[{_zsh_quote(option['help'])}]"
+        if option["takes_value"]:
+            value = f":{_zsh_quote(option['metavar'].lower())}:_pingme_value_{option['dest']}"
+            if option["nargs"] == 2:
+                value += value  # --diff takes two files
+            desc += value
+        desc += "'"
+        if len(names) > 1:
+            lines.append(f"    {exclude[:-1]}{repeat}'{name_part}{desc}")
+        else:
+            lines.append(f"    '{repeat}{names[0]}{desc[1:]}")
+    arguments = " \\\n".join(lines + ["    '*:target:_pingme_targets'"])
+    return f"""#compdef pingme
+# Generated by install.py from pingme.py's option list.
+
+{functions}
+_pingme_targets() {{
+  _files
+  local -a nets; nets=(${{(f)"$({LOCAL_SUBNETS_SH})"}})
+  (( ${{#nets}} )) && _describe -t networks 'networks on this machine' nets
+  local -a words; words=('help:show help topics')
+  _describe -t commands 'command' words
+}}
 
 _pingme() {{
-  _arguments -C \\
-    '(-s --sub)'{{-s,--sub}}'[show subnet information]:CIDR:' \\
-    '(-f --file)'{{-f,--file}}'[scan targets from file]:target file:_files' \\
-    '--host[scan one or more IPs or hostnames]:host or IP: ' \\
-    '--diff[compare two snapshot files]:first file:_files:second file:_files' \\
-    '--history[list stored scan history]' \\
-    '--clear-history[delete history for a label]:label:' \\
-    '--ipinfo[classify one or more IP addresses]:IP address: ' \\
-    '--scan[run host discovery scan]' \\
-    '(-t --threads)'{{-t,--threads}}'[concurrent threads]:threads:' \\
-    '--timeout[per-packet timeout in seconds]:seconds:' \\
-    '--count[ping attempts per host]:count:' \\
-    '--min-replies[replies required for reachable]:count:' \\
-    '--watch[rescan every N seconds]:seconds:' \\
-    '--no-dns[skip IP to hostname lookups]' \\
-    '--discover6[find IPv6 hosts on local links]:interface: ' \\
-    '--no-arp[do not use ARP/ND replies as evidence]' \\
-    '--update-oui[download the MAC vendor database]' \\
-    '--trace-down[traceroute down hosts]' \\
-    '--tag[only file lines with this @tag]:tag:' \\
-    '--column[CSV column holding targets]:column:' \\
-    '--html[HTML report file]:file:_files' \\
-    '--nmap-xml[nmap XML output file]:file:_files' \\
-    '--uptime[availability from history]:label or file:_files' \\
-    '--notify[alert target URL]:url:' \\
-    '--notify-on[when to alert]:mode:(changes down always)' \\
-    '--serve[serve metrics on HOST:PORT]:address:' \\
-    '--wake[Wake-on-LAN for down hosts]' \\
-    '--wol[send Wake-on-LAN to MACs]:mac:' \\
-    '--wol-broadcast[Wake-on-LAN broadcast address]:address:' \\
-    '(-4 --ipv4-only -6 --ipv6-only)'{{-4,--ipv4-only}}'[IPv4 addresses only]' \\
-    '(-4 --ipv4-only -6 --ipv6-only)'{{-6,--ipv6-only}}'[IPv6 addresses only]' \\
-    '(-r --reverse)'{{-r,--reverse}}'[look up hostnames for IPs or CIDRs]:IP or CIDR: ' \\
-    '--color[colored output]:mode:({colors})' \\
-    '--exit-zero[always exit 0 after a scan]' \\
-    '--keep[history entries kept per label]:count:' \\
-    '--data-dir[state directory]:directory:_files -/' \\
-    '--config[config file]:file:_files' \\
-    '--no-config[ignore the config file]' \\
-    '--init-config[create a config template]' \\
-    '--help-all[show every option]' \\
-    '--help-topic[focused help]:topic:({topics})' \\
-    '--version[show version]' \\
-    '*:target:_files' \\
-    '--tcp-ports[TCP ports or ranges]:ports:' \\
-    '--tcp-timeout[TCP connect timeout]:seconds:' \\
-    '--max-hosts[maximum expanded CIDR hosts]:count:' \\
-    '--retry[retry attempts for dead hosts]:count:' \\
-    '--rate[maximum packets per second]:packets per second:' \\
-    '--exclude[exclude IPs or CIDRs]:IP or CIDR: ' \\
-    '--dns[perform reverse DNS lookup]' \\
-    '--resume[resume interrupted scan]' \\
-    '--ping-tool[select ping backend]:backend:({ping_tools})' \\
-    '--fast[use fast scan settings]' \\
-    '--no-history[do not save scan history]' \\
-    '--changes[show simple hostname-aware changes]' \\
-    '--compare[legacy IP-only comparison]' \\
-    '(-q --quiet)'{{-q,--quiet}}'[write files only]' \\
-    '--compact[summary and file paths only]' \\
-    '--verbose[full interface when redirected]' \\
-    '--alive-out[alive hosts output file]:file:_files' \\
-    '--dead-out[no-response hosts output file]:file:_files' \\
-    '--error-out[probe errors output file]:file:_files' \\
-    '--hostnames-out[complete hostname status report]:file:_files' \\
-    '--hostfile-out[same as --hostnames-out]:file:_files' \\
-    '--names-only[hostnames file lists only IP and hostname]' \\
-    '--changes-out[changes report file]:file:_files' \\
-    '--out-format[output format]:format:({formats})' \\
-    '--label[custom scan history label]:label:' \\
-    '--no-banner[hide ASCII banner]' \\
-    '(-h --help)'{{-h,--help}}'[show help]'
+  _arguments -s -S \\
+{arguments}
 }}
 
 _pingme "$@"
-'''
+"""
 
 
 def bash_completion() -> str:
-    options = " ".join(OPTIONS)
-    ping_tools = " ".join(PING_TOOLS)
-    formats = " ".join(OUTPUT_FORMATS)
-    colors = " ".join(COLOR_MODES)
-    topics = " ".join(HELP_TOPICS)
-
-    return f'''_pingme_completion() {{
-    local cur prev
+    spec = completion_spec()
+    options = " ".join(all_options())
+    cases = []
+    for option in spec:
+        if not option["takes_value"]:
+            continue
+        pattern = "|".join(option["names"])
+        words = " ".join(v for v, _d in option["values"] if not v.startswith("<"))
+        kind = option["kind"]
+        if kind == "file":
+            action = f'COMPREPLY=( $(compgen -f -- "$cur") $(compgen -W "{words}" -- "$cur") ); compopt -o filenames 2>/dev/null'
+        elif kind == "dir":
+            action = 'COMPREPLY=( $(compgen -d -- "$cur") ); compopt -o filenames 2>/dev/null'
+        elif kind == "iface":
+            action = f'COMPREPLY=( $(compgen -W "$(ls /sys/class/net 2>/dev/null) $({IFACE_ADDRESSES_SH})" -- "$cur") )'
+        elif kind == "subnet":
+            action = f'COMPREPLY=( $(compgen -W "$({LOCAL_SUBNETS_SH})" -- "$cur") )'
+        else:
+            action = f'COMPREPLY=( $(compgen -W "{words}" -- "$cur") )'
+        cases.append(f"        {pattern})\n            {action}\n            return\n            ;;")
+    diff = "|".join(next(o["names"] for o in spec if o["dest"] == "diff"))
+    return f"""# Generated by install.py from pingme.py's option list.
+_pingme_completion() {{
+    local cur prev prev2
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
+    prev2="${{COMP_WORDS[COMP_CWORD-2]}}"
 
+    case "$prev2" in
+        {diff})
+            COMPREPLY=( $(compgen -f -- "$cur") ); compopt -o filenames 2>/dev/null
+            return
+            ;;
+    esac
     case "$prev" in
-        --ping-tool)
-            COMPREPLY=( $(compgen -W "{ping_tools}" -- "$cur") )
-            return
-            ;;
-        --out-format)
-            COMPREPLY=( $(compgen -W "{formats}" -- "$cur") )
-            return
-            ;;
-        --color)
-            COMPREPLY=( $(compgen -W "{colors}" -- "$cur") )
-            return
-            ;;
-        --notify-on)
-            COMPREPLY=( $(compgen -W "changes down always" -- "$cur") )
-            return
-            ;;
-        --html|--nmap-xml|--uptime)
-            COMPREPLY=( $(compgen -f -- "$cur") )
-            return
-            ;;
-        help|--help-topic)
-            COMPREPLY=( $(compgen -W "{topics}" -- "$cur") )
-            return
-            ;;
-        --data-dir)
-            COMPREPLY=( $(compgen -d -- "$cur") )
-            return
-            ;;
-        -f|--file|--alive-out|--dead-out|--error-out|--hostnames-out|--hostfile-out|--changes-out|--config)
-            COMPREPLY=( $(compgen -f -- "$cur") )
-            return
-            ;;
-        --diff)
-            COMPREPLY=( $(compgen -f -- "$cur") )
+{chr(10).join(cases)}
+        help)
+            COMPREPLY=( $(compgen -W "{' '.join(v for v, _d in next(o['values'] for o in spec if o['dest'] == 'help_topic'))}" -- "$cur") )
             return
             ;;
     esac
@@ -403,115 +458,117 @@ def bash_completion() -> str:
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W "{options}" -- "$cur") )
     else
-        COMPREPLY=( $(compgen -f -- "$cur") $(compgen -W "help" -- "$cur") )
+        COMPREPLY=( $(compgen -f -- "$cur") $(compgen -W "help $({LOCAL_SUBNETS_SH})" -- "$cur") )
+        compopt -o filenames 2>/dev/null
     fi
 }}
 complete -F _pingme_completion pingme
-'''
+"""
+
+
+def _fish_quote(text: str) -> str:
+    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
 def fish_completion() -> str:
-    descriptions = {
-        "help": "Show help",
-        "sub": "Show subnet information",
-        "file": "Scan targets from a file",
-        "host": "Scan IPs or hostnames",
-        "diff": "Compare two snapshot files",
-        "history": "List stored scan history",
-        "clear-history": "Delete history for a label",
-        "ipinfo": "Classify IP addresses",
-        "scan": "Run host discovery scan",
-        "threads": "Concurrent threads",
-        "timeout": "Per-packet timeout",
-        "count": "Packets per host",
-        "tcp-ports": "TCP ports or ranges",
-        "tcp-timeout": "TCP connect timeout",
-        "max-hosts": "Maximum CIDR targets",
-        "retry": "Retry dead hosts",
-        "rate": "Maximum packets per second",
-        "exclude": "Exclude IPs or CIDRs",
-        "dns": "Reverse DNS lookup",
-        "resume": "Resume interrupted scan",
-        "ping-tool": "Select ping backend",
-        "fast": "Fast scan settings",
-        "no-history": "Do not save history",
-        "compare": "Compare with previous scan",
-        "quiet": "Suppress per-host output",
-        "alive-out": "Alive output file",
-        "dead-out": "No-response output file",
-        "error-out": "Probe error output file",
-        "out-format": "Output format",
-        "label": "Custom history label",
-        "no-banner": "Hide ASCII banner",
-        "no-dns": "Skip hostname lookups",
-        "discover6": "Find IPv6 hosts on local links",
-        "ipv4-only": "IPv4 addresses only",
-        "ipv6-only": "IPv6 addresses only",
-        "no-arp": "Do not use ARP/ND evidence",
-        "update-oui": "Download MAC vendor database",
-        "trace-down": "Traceroute down hosts",
-        "tag": "Only lines with this @tag",
-        "column": "CSV column with targets",
-        "html": "HTML report file",
-        "nmap-xml": "nmap XML output file",
-        "uptime": "Availability from history",
-        "notify": "Alert target (webhook, mailto:, telegram://)",
-        "notify-on": "When to alert",
-        "serve": "Serve metrics and live page",
-        "wake": "Wake-on-LAN for down hosts",
-        "wol": "Send Wake-on-LAN to MACs",
-        "wol-broadcast": "Wake-on-LAN broadcast address",
-        "reverse": "Look up hostnames for IPs",
-        "min-replies": "Replies required for reachable",
-        "watch": "Rescan every N seconds",
-        "color": "Colored output",
-        "exit-zero": "Always exit 0 after a scan",
-        "keep": "History entries kept",
-        "data-dir": "State directory",
-        "config": "Config file",
-        "no-config": "Ignore the config file",
-        "init-config": "Create a config template",
-        "compact": "Summary only",
-        "verbose": "Full interface",
-        "changes": "Report changes since last scan",
-        "hostnames-out": "Full status report file",
-        "hostfile-out": "Same as --hostnames-out",
-        "names-only": "Hostnames file lists only IP and hostname",
-        "changes-out": "Changes report file",
-    }
-
-    lines = ["complete -c pingme -f"]
-    for option in OPTIONS:
-        if option.startswith("--"):
-            long_name = option[2:]
-            description = descriptions.get(long_name, "PingMe option")
-            lines.append(f"complete -c pingme -l {long_name} -d '{description}'")
-        elif option.startswith("-") and len(option) == 2:
-            lines.append(f"complete -c pingme -s {option[1:]}")
-
-    lines.extend(
-        [
-            f"complete -c pingme -n '__fish_seen_argument -l ping-tool' -a '{' '.join(PING_TOOLS)}'",
-            f"complete -c pingme -n '__fish_seen_argument -l out-format' -a '{' '.join(OUTPUT_FORMATS)}'",
-            f"complete -c pingme -n '__fish_seen_argument -l color' -a '{' '.join(COLOR_MODES)}'",
-            "complete -c pingme -n '__fish_seen_argument -s f -l file -l alive-out -l dead-out -l error-out -l diff' -a '(__fish_complete_path)'",
-        ]
-    )
-
+    lines = ["# Generated by install.py from pingme.py's option list.", "complete -c pingme -f",
+             "complete -c pingme -n '__fish_is_first_arg' -a help -d 'Show help topics'",
+             "complete -c pingme -a '(__fish_complete_path)'",
+             "complete -c pingme -a '(ip -o -4 route show scope link 2>/dev/null | string split -f1 \" \")' -d 'local network'"]
+    for option in completion_spec():
+        flags = " ".join(f"-l {n[2:]}" if n.startswith("--") else f"-s {n[1:]}" for n in option["names"])
+        base = f"complete -c pingme {flags} -d {_fish_quote(option['help'])}"
+        if not option["takes_value"]:
+            lines.append(base)
+            continue
+        kind = option["kind"]
+        values = [(v, d) for v, d in option["values"] if not v.startswith("<")]
+        if values:
+            printf = " ".join(f"{_fish_quote(v)} {_fish_quote(d)}" for v, d in values)
+            source = f"(printf '%s\\t%s\\n' {printf})"
+        else:
+            source = ""
+        if kind == "file":
+            lines.append(f"{base} -r -F" + (f" -a {_fish_quote(source)}" if source else ""))
+        elif kind == "dir":
+            lines.append(f"{base} -x -a '(__fish_complete_directories)'")
+        elif kind == "iface":
+            lines.append(f"{base} -x -a '(__fish_print_interfaces)'")
+        elif kind == "subnet":
+            lines.append(f"{base} -x -a '(ip -o -4 route show scope link 2>/dev/null | string split -f1 \" \")'")
+        else:
+            lines.append(f"{base} -x" + (f" -a {_fish_quote(source)}" if source else ""))
     return "\n".join(lines) + "\n"
 
 
-def powershell_completion() -> str:
-    all_words = OPTIONS + PING_TOOLS + OUTPUT_FORMATS + COLOR_MODES + NOTIFY_MODES + HELP_TOPICS
-    words = ",".join(repr(item) for item in all_words)
+def _ps_quote(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
 
-    return (
-        "Register-ArgumentCompleter -Native -CommandName pingme -ScriptBlock {\n"
-        "  param($wordToComplete, $commandAst, $cursorPosition)\n"
-        f"  @({words}) | Where-Object {{ $_ -like \"$wordToComplete*\" }} | "
-        "ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }\n"
-        "}\n"
-    )
+
+def powershell_completion() -> str:
+    spec = completion_spec()
+    option_rows = ",\n".join(
+        f"    @({_ps_quote(name)}, {_ps_quote(option['help'] or name)})"
+        for option in spec for name in option["names"])
+    value_rows = []
+    for option in spec:
+        if not option["takes_value"]:
+            continue
+        values = ", ".join(f"@({_ps_quote(v)}, {_ps_quote(d or v)})"
+                           for v, d in option["values"] if not v.startswith("<"))
+        for name in option["names"]:
+            value_rows.append(f"    {_ps_quote(name)} = @{{ kind = {_ps_quote(option['kind'])}; values = @({values}) }}")
+    return f"""# Generated by install.py from pingme.py's option list.
+$PingMeOptions = @(
+{option_rows}
+)
+$PingMeValues = @{{
+{chr(10).join(value_rows)}
+}}
+Register-ArgumentCompleter -Native -CommandName pingme, pingme.py, pingme.cmd -ScriptBlock {{
+  param($wordToComplete, $commandAst, $cursorPosition)
+  $words = @($commandAst.CommandElements | Where-Object {{ $_.Extent.EndOffset -lt $cursorPosition -or $_.Extent.Text -ne $wordToComplete }} | ForEach-Object {{ $_.Extent.Text }})
+  $previous = if ($words.Count -ge 2) {{ $words[-1] }} else {{ '' }}
+  if ($wordToComplete -and $words.Count -ge 1 -and $words[-1] -eq $wordToComplete) {{
+    $previous = if ($words.Count -ge 2) {{ $words[-2] }} else {{ '' }}
+  }}
+  $spec = $PingMeValues[$previous]
+  if ($spec) {{
+    foreach ($item in $spec.values) {{
+      if ($item[0] -like "$wordToComplete*") {{
+        [System.Management.Automation.CompletionResult]::new($item[0], $item[0], 'ParameterValue', $item[1])
+      }}
+    }}
+    if ($spec.kind -eq 'iface') {{
+      [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | ForEach-Object {{
+        $name = $_.Name
+        $_.GetIPProperties().UnicastAddresses | ForEach-Object {{
+          $ip = $_.Address.ToString()
+          if ($ip -like "$wordToComplete*") {{ [System.Management.Automation.CompletionResult]::new($ip, $ip, 'ParameterValue', $name) }}
+        }}
+      }}
+    }}
+    if ($spec.kind -in @('file', 'dir')) {{
+      Get-ChildItem -Path "$wordToComplete*" -ErrorAction SilentlyContinue | Where-Object {{ $spec.kind -eq 'file' -or $_.PSIsContainer }} | ForEach-Object {{
+        [System.Management.Automation.CompletionResult]::new($_.Name, $_.Name, 'ProviderItem', $_.FullName)
+      }}
+    }}
+    return
+  }}
+  if ($wordToComplete -like '-*' -or -not $wordToComplete) {{
+    foreach ($item in $PingMeOptions) {{
+      if ($item[0] -like "$wordToComplete*") {{
+        [System.Management.Automation.CompletionResult]::new($item[0], $item[0], 'ParameterName', $item[1])
+      }}
+    }}
+  }}
+  if ($wordToComplete -notlike '-*') {{
+    Get-ChildItem -Path "$wordToComplete*" -ErrorAction SilentlyContinue | ForEach-Object {{
+      [System.Management.Automation.CompletionResult]::new($_.Name, $_.Name, 'ProviderItem', $_.FullName)
+    }}
+  }}
+}}
+"""
 
 
 def replace_managed_block(path: Path, content: str) -> None:

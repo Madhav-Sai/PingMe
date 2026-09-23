@@ -474,8 +474,15 @@ def reverse_lookup(ip: str, timeout: float = 1.5, deep: bool = False) -> tuple[s
 
     address = ip.split("%", 1)[0]
     lookups: list[tuple[str, Callable[[str], str]]] = [("dns", lambda value: _reverse_with_system(value, timeout))]
+    if _BOUND is not None:
+        lookups = [("local", _reverse_local)]
+        if _BOUND.dns_servers:
+            lookups.append(("dns", lambda value: _reverse_via_interface_dns(value, timeout)))
     if deep and ip_classify(address)["scope"] in {"Private", "Link-Local"}:
-        lookups += [("mdns", _reverse_with_mdns), ("netbios", _reverse_with_netbios)]
+        if _BOUND is not None:
+            lookups += [("mdns", _reverse_via_unicast_mdns), ("netbios", _reverse_via_netbios_status)]
+        else:
+            lookups += [("mdns", _reverse_with_mdns), ("netbios", _reverse_with_netbios)]
     found = ("", "")
     for source, lookup in lookups:
         name = lookup(address)
@@ -490,6 +497,411 @@ def reverse_lookup(ip: str, timeout: float = 1.5, deep: bool = False) -> tuple[s
 def reverse_dns(ip: str, timeout: float = 1.5, deep: bool = False) -> str:
     """Hostname for an IP, or an empty string when none is known."""
     return reverse_lookup(ip, timeout, deep)[0]
+
+
+# ─────────────────────────────────────────────────────────────────
+# OUTBOUND INTERFACE (--interface)
+# ─────────────────────────────────────────────────────────────────
+_SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
+_IP_BOUND_IF, _IPV6_BOUND_IF = 25, 125      # macOS
+_IP_UNICAST_IF, _IPV6_UNICAST_IF = 31, 31   # Windows
+
+
+class BoundInterface:
+    """The adapter every probe must leave from.
+
+    ``mode`` is "device" when the OS pins sockets to the adapter itself
+    (Linux, macOS, Windows sockets) and "source" when only the source address
+    can be chosen (Windows ping.exe), which routing may still override.
+    """
+
+    def __init__(self, name: str, index: int, addresses: dict[int, list[str]], mode: str):
+        self.name = name
+        self.index = index
+        self.addresses = addresses
+        self.mode = mode
+        self.dns_servers: list[str] = []
+
+    def source(self, family: int) -> str:
+        candidates = self.addresses.get(family, [])
+        preferred = [a for a in candidates if not ipaddress.ip_address(a.split("%", 1)[0]).is_link_local]
+        return (preferred or candidates or [""])[0]
+
+    def owns(self, address: str) -> bool:
+        return any(_same_ip(address, own) for family in (4, 6) for own in self.addresses.get(family, []))
+
+    def describe(self) -> str:
+        primary = self.source(4) or self.source(6)
+        how = "all probes bound" if self.mode == "device" else "source address only"
+        return f"{self.name} ({primary}, {how})" if primary else f"{self.name} ({how})"
+
+
+_BOUND: Optional[BoundInterface] = None
+
+
+def local_interfaces() -> dict[str, dict]:
+    """{name: {"index": int, "up": bool, 4: [addresses], 6: [addresses]}} for this machine."""
+    table: dict[str, dict] = {}
+
+    def entry(name: str) -> dict:
+        return table.setdefault(name, {"index": 0, "up": True, 4: [], 6: []})
+
+    try:
+        for index, name in socket.if_nameindex():
+            entry(name)["index"] = index
+    except (AttributeError, OSError):
+        pass
+    if sys.platform.startswith("linux") and shutil.which("ip"):
+        output = _run_resolution_command(["ip", "-o", "addr", "show"], timeout=4)
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) > 3 and fields[2] in {"inet", "inet6"}:
+                address = fields[3].split("/", 1)[0]
+                if fields[2] == "inet6" and address.lower().startswith("fe80:"):
+                    address = f"{address}%{fields[1]}"
+                entry(fields[1])[4 if fields[2] == "inet" else 6].append(address)
+        for name in table:
+            try:
+                state = Path(f"/sys/class/net/{name}/operstate").read_text().strip()
+            except OSError:
+                continue
+            table[name]["up"] = state in {"up", "unknown"}
+    elif shutil.which("ifconfig"):
+        output = _run_resolution_command(["ifconfig"], timeout=4)
+        current = ""
+        for line in output.splitlines():
+            header = re.match(r"^([\w.\-]+):\s+flags=\S*<([^>]*)>", line)
+            if header:
+                current = header.group(1)
+                entry(current)["up"] = "UP" in header.group(2).split(",")
+                continue
+            match = re.match(r"^\s+inet6?\s+(\S+)", line)
+            if current and match:
+                address = match.group(1)
+                entry(current)[6 if ":" in address else 4].append(address)
+    return table
+
+
+def resolve_interface(value: str) -> BoundInterface:
+    """Validate --interface (an adapter name or one of its addresses) and return it."""
+    table = local_interfaces()
+    name = value
+    try:
+        wanted_ip = str(ipaddress.ip_address(value))
+    except ValueError:
+        wanted_ip = ""
+    if wanted_ip:
+        name = next((n for n, info in table.items()
+                     if any(_same_ip(wanted_ip, a) for a in info[4] + info[6])), "")
+        if not name and not _is_local_address(wanted_ip):
+            raise ValueError(f"no local adapter has the address {value}")
+    if sys.platform == "win32":
+        if not wanted_ip:
+            raise ValueError("on Windows, pass the adapter's IP address (for example --interface 192.168.1.20)")
+        family = 6 if ":" in wanted_ip else 4
+        index = table.get(name, {}).get("index", 0)
+        return BoundInterface(name or wanted_ip, index, {family: [wanted_ip]}, "device" if index else "source")
+    if name not in table:
+        available = ", ".join(
+            f"{n} ({(info[4] or info[6] or ['no address'])[0]})"
+            for n, info in sorted(table.items()) if info[4] or info[6]) or "none found"
+        raise ValueError(f"unknown adapter '{value}'. Available: {available}")
+    info = table[name]
+    if not info["up"]:
+        raise ValueError(f"adapter {name} is down")
+    if not info[4] and not info[6]:
+        raise ValueError(f"adapter {name} has no IP address")
+    bound = BoundInterface(name, info["index"], {4: info[4], 6: info[6]}, "device")
+    if sys.platform == "darwin" and not bound.index:
+        raise ValueError(f"cannot find the interface index of {name}")
+    try:
+        with socket.socket(socket.AF_INET if info[4] else socket.AF_INET6, socket.SOCK_DGRAM) as test:
+            _apply_binding(test, 4 if info[4] else 6, bound)
+    except PermissionError:
+        raise ValueError(f"binding to {name} needs root or CAP_NET_RAW on this system") from None
+    except OSError as exc:
+        raise ValueError(f"cannot bind to {name}: {exc}") from None
+    return bound
+
+
+def _apply_binding(sock: socket.socket, family: int, bound: BoundInterface) -> None:
+    if sys.platform.startswith("linux"):
+        sock.setsockopt(socket.SOL_SOCKET, _SO_BINDTODEVICE, bound.name.encode() + b"\0")
+    elif sys.platform == "darwin":
+        if family == 6:
+            sock.setsockopt(socket.IPPROTO_IPV6, _IPV6_BOUND_IF, bound.index)
+        else:
+            sock.setsockopt(socket.IPPROTO_IP, _IP_BOUND_IF, bound.index)
+    elif sys.platform == "win32" and bound.index:
+        if family == 6:
+            sock.setsockopt(socket.IPPROTO_IPV6, _IPV6_UNICAST_IF, bound.index)
+        else:
+            sock.setsockopt(socket.IPPROTO_IP, _IP_UNICAST_IF, socket.htonl(bound.index))
+    else:
+        source = bound.source(family)
+        if not source:
+            raise OSError(f"{bound.name} has no IPv{family} address")
+        sock.bind((source.split("%", 1)[0], 0))
+
+
+def bind_to_interface(sock: socket.socket, family: int) -> None:
+    """Pin a socket to the --interface adapter (no-op when none was chosen)."""
+    if _BOUND is not None:
+        _apply_binding(sock, family, _BOUND)
+
+
+def ping_interface_args(ipv6: bool) -> list[str]:
+    """ping options that force the --interface adapter."""
+    if _BOUND is None:
+        return []
+    if sys.platform == "win32":
+        source = _BOUND.source(6 if ipv6 else 4)
+        return ["-S", source.split("%", 1)[0]] if source else []
+    if _is_bsd_ping():
+        return ["-B" if ipv6 and _PING6_PATH else "-b", _BOUND.name]
+    return ["-I", _BOUND.name]
+
+
+def fping_interface_args(ipv6: bool) -> list[str]:
+    if _BOUND is None:
+        return []
+    if sys.platform.startswith("linux"):
+        return ["-I", _BOUND.name]
+    source = _BOUND.source(6 if ipv6 else 4)
+    return ["-S", source.split("%", 1)[0]] if source else []
+
+
+def interface_dns_servers(name: str) -> list[str]:
+    """DNS servers configured for one adapter (NetworkManager, systemd-resolved, resolv.conf)."""
+    servers: list[str] = []
+    if shutil.which("nmcli"):
+        output = _run_resolution_command(["nmcli", "-g", "IP4.DNS,IP6.DNS", "device", "show", name], timeout=4)
+        servers += [item.strip() for line in output.splitlines() for item in line.split("|") if item.strip()]
+    if not servers and shutil.which("resolvectl"):
+        output = _run_resolution_command(["resolvectl", "dns", name], timeout=4)
+        servers += output.split(":", 1)[1].split() if ":" in output else []
+    if not servers:
+        try:
+            for line in Path("/etc/resolv.conf").read_text().splitlines():
+                fields = line.split()
+                if len(fields) >= 2 and fields[0] == "nameserver":
+                    servers.append(fields[1])
+        except OSError:
+            pass
+    usable = []
+    for server in dict.fromkeys(servers):
+        try:
+            if not ipaddress.ip_address(server.split("%", 1)[0]).is_loopback:
+                usable.append(server)
+        except ValueError:
+            continue
+    return usable
+
+
+def name_lookup_description() -> str:
+    if _BOUND is None:
+        return "system resolver"
+    if _BOUND.dns_servers:
+        return (f"DNS {', '.join(_BOUND.dns_servers)} via {_BOUND.name}; "
+                f"mDNS/NetBIOS queries sent to targets via {_BOUND.name}")
+    return f"system resolver (no DNS server known for {_BOUND.name}; lookups may use another adapter)"
+
+
+# ── Minimal DNS / NetBIOS client, so name lookups also leave through --interface ──
+_DNS_TYPES = {"A": 1, "PTR": 12, "AAAA": 28, "CNAME": 5}
+
+
+def _dns_encode_name(name: str) -> bytes:
+    out = b""
+    for label in name.rstrip(".").split("."):
+        raw = label.encode("idna") if label else b""
+        if not raw or len(raw) > 63:
+            raise ValueError(f"bad DNS label in {name!r}")
+        out += bytes([len(raw)]) + raw
+    return out + b"\0"
+
+
+def _dns_read_name(packet: bytes, offset: int) -> tuple[str, int]:
+    labels, jumped, end, hops = [], False, offset, 0
+    while True:
+        if offset >= len(packet) or hops > 64:
+            raise ValueError("truncated DNS name")
+        length = packet[offset]
+        if length & 0xC0 == 0xC0:
+            pointer = ((length & 0x3F) << 8) | packet[offset + 1]
+            if not jumped:
+                end = offset + 2
+            offset, jumped, hops = pointer, True, hops + 1
+            continue
+        offset += 1
+        if length == 0:
+            break
+        labels.append(packet[offset:offset + length].decode("ascii", "replace"))
+        offset += length
+    return ".".join(labels), (end if jumped else offset)
+
+
+def dns_query(name: str, qtype: str, server: str, port: int = 53, timeout: float = 1.5,
+              unicast_mdns: bool = False) -> list[str]:
+    """One DNS question over UDP from a socket bound to --interface; returns answer data."""
+    ident = int.from_bytes(os.urandom(2), "big")
+    flags = 0x0000 if unicast_mdns else 0x0100
+    question = _dns_encode_name(name) + _DNS_TYPES[qtype].to_bytes(2, "big") + (1).to_bytes(2, "big")
+    request = ident.to_bytes(2, "big") + flags.to_bytes(2, "big") + (1).to_bytes(2, "big") + bytes(6) + question
+    address = server.split("%", 1)[0]
+    family = 6 if ":" in address else 4
+    with socket.socket(socket.AF_INET6 if family == 6 else socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        bind_to_interface(sock, family)
+        sock.settimeout(timeout)
+        target = (server, port, 0, 0) if family == 6 else (server, port)
+        if family == 6 and "%" in server:
+            target = socket.getaddrinfo(server, port, socket.AF_INET6, socket.SOCK_DGRAM)[0][4]
+        sock.sendto(request, target)
+        deadline = time.monotonic() + timeout
+        while True:
+            sock.settimeout(max(0.05, deadline - time.monotonic()))
+            packet, _peer = sock.recvfrom(4096)
+            if len(packet) >= 12 and (unicast_mdns or int.from_bytes(packet[:2], "big") == ident):
+                break
+    if packet[3] & 0x0F:
+        return []
+    qd, an = int.from_bytes(packet[4:6], "big"), int.from_bytes(packet[6:8], "big")
+    offset = 12
+    for _ in range(qd):
+        _name, offset = _dns_read_name(packet, offset)
+        offset += 4
+    answers = []
+    for _ in range(an):
+        _name, offset = _dns_read_name(packet, offset)
+        rtype = int.from_bytes(packet[offset:offset + 2], "big")
+        length = int.from_bytes(packet[offset + 8:offset + 10], "big")
+        data_at = offset + 10
+        if rtype == 1 and length == 4:
+            answers.append(socket.inet_ntop(socket.AF_INET, packet[data_at:data_at + 4]))
+        elif rtype == 28 and length == 16:
+            answers.append(socket.inet_ntop(socket.AF_INET6, packet[data_at:data_at + 16]))
+        elif rtype in (5, 12):
+            answers.append(_dns_read_name(packet, data_at)[0])
+        offset = data_at + length
+    return answers
+
+
+def _reverse_local(ip: str) -> str:
+    """Names this machine already knows (hosts file, its own addresses, its gateway); sends no packets."""
+    hosts = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32/drivers/etc/hosts" \
+        if sys.platform == "win32" else Path("/etc/hosts")
+    try:
+        for line in hosts.read_text(encoding="utf-8", errors="ignore").splitlines():
+            fields = line.split("#", 1)[0].split()
+            if len(fields) >= 2 and _same_ip(fields[0], ip):
+                return _clean_reverse_name(fields[1], ip)
+    except OSError:
+        pass
+    if _is_local_address(ip):
+        return socket.gethostname()
+    if ip in _default_gateways():
+        return "_gateway"
+    return ""
+
+
+def _reverse_via_interface_dns(ip: str, timeout: float) -> str:
+    pointer = ipaddress.ip_address(ip).reverse_pointer
+    for server in _BOUND.dns_servers if _BOUND else []:
+        try:
+            names = dns_query(pointer, "PTR", server, timeout=timeout)
+        except (OSError, ValueError):
+            continue
+        if names:
+            return _clean_reverse_name(names[0], ip)
+    return ""
+
+
+def _reverse_via_unicast_mdns(ip: str) -> str:
+    """Ask the device itself on port 5353 (RFC 6762 legacy unicast); answers name most phones and printers."""
+    try:
+        names = dns_query(ipaddress.ip_address(ip).reverse_pointer, "PTR", ip, port=5353,
+                          timeout=1.0, unicast_mdns=True)
+    except (OSError, ValueError):
+        return ""
+    return _clean_reverse_name(names[0], ip) if names else ""
+
+
+def _reverse_via_netbios_status(ip: str) -> str:
+    """NetBIOS node-status query (UDP 137) to the host, sent from --interface."""
+    if ":" in ip:
+        return ""
+    ident = os.urandom(2)
+    encoded = b"\x20" + b"CK" + b"AA" * 15 + b"\x00"
+    request = ident + b"\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00" + encoded + b"\x00\x21\x00\x01"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            bind_to_interface(sock, 4)
+            sock.settimeout(1.5)
+            sock.sendto(request, (ip, 137))
+            packet, _peer = sock.recvfrom(2048)
+    except OSError:
+        return ""
+    if len(packet) < 57 or packet[:2] != ident:
+        return ""
+    count = packet[56]
+    for index in range(count):
+        start = 57 + index * 18
+        entry = packet[start:start + 18]
+        if len(entry) < 18:
+            break
+        name, suffix, flags = entry[:15].decode("ascii", "replace").strip(), entry[15], entry[16]
+        if suffix == 0x00 and not flags & 0x80 and name:
+            return _clean_reverse_name(name, ip)
+    return ""
+
+
+def _hosts_file_addresses(hostname: str) -> list[str]:
+    path = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32/drivers/etc/hosts" \
+        if sys.platform == "win32" else Path("/etc/hosts")
+    found = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            fields = line.split("#", 1)[0].split()
+            if len(fields) >= 2 and hostname.lower() in (name.lower() for name in fields[1:]):
+                found.append(fields[0])
+    except OSError:
+        pass
+    return found
+
+
+def _resolve_via_interface_dns(hostname: str) -> list[str]:
+    addresses = _hosts_file_addresses(hostname)
+    if addresses:
+        return addresses
+    for server in _BOUND.dns_servers if _BOUND else []:
+        for qtype in ("A", "AAAA"):
+            try:
+                answers = dns_query(hostname, qtype, server)
+            except (OSError, ValueError):
+                continue
+            addresses += [a for a in answers if _normalise_probe_address(a)]
+        if addresses:
+            break
+    return addresses
+
+
+def route_mismatches(targets: list[str], sample: int = 64) -> list[tuple[str, str]]:
+    """(target, usual source address) pairs whose normal route avoids --interface."""
+    if _BOUND is None:
+        return []
+    mismatched = []
+    for ip in list(dict.fromkeys(targets))[:sample]:
+        address = ip.split("%", 1)[0]
+        try:
+            family = socket.AF_INET6 if ipaddress.ip_address(address).version == 6 else socket.AF_INET
+            with socket.socket(family, socket.SOCK_DGRAM) as probe:
+                probe.connect((address, 9))
+                usual = probe.getsockname()[0]
+        except (OSError, ValueError):
+            continue
+        if not _BOUND.owns(usual) and not ipaddress.ip_address(address).is_loopback:
+            mismatched.append((ip, usual))
+    return mismatched
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1021,7 +1433,7 @@ def _ping_via_fping(ip: str, timeout: float, count: int) -> tuple[bool, Optional
     proc_timeout = (count * timeout) + 5
 
     try:
-        command = [_FPING_PATH]
+        command = [_FPING_PATH, *fping_interface_args(_is_ipv6(ip))]
         if _is_ipv6(ip):
             command.append("-6")
         command.extend([
@@ -1076,6 +1488,12 @@ def _system_ping_commands(ip: str, timeout: float, count: int) -> tuple[list[lis
     should also be read as "no reply" (for pings without a per-reply timeout).
     """
     ipv6 = _is_ipv6(ip)
+    commands, deadline, no_reply_codes, deadline_means_no_reply = _base_ping_commands(ip, ipv6, timeout, count)
+    bind = ping_interface_args(ipv6)
+    return [command[:-1] + bind + command[-1:] for command in commands], deadline, no_reply_codes, deadline_means_no_reply
+
+
+def _base_ping_commands(ip: str, ipv6: bool, timeout: float, count: int) -> tuple[list[list[str]], float, tuple[int, ...], bool]:
     if sys.platform == "win32":
         command = [_PING_PATH or "ping", "-n", str(count), "-w", str(_timeout_ms(timeout)), ip]
         return [command], (count * timeout) + 5, (1,), False
@@ -1241,6 +1659,8 @@ TCP_CONCURRENCY = 64
 
 async def _tcp_port_accepts(ip: str, port: int, timeout: float, gate: asyncio.Semaphore) -> Optional[int]:
     async with gate:
+        if _BOUND is not None:
+            return await _tcp_port_accepts_bound(ip, port, timeout)
         try:
             _reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
         except (OSError, asyncio.TimeoutError, ValueError):
@@ -1251,6 +1671,27 @@ async def _tcp_port_accepts(ip: str, port: int, timeout: float, gate: asyncio.Se
         except (OSError, asyncio.TimeoutError):
             pass
         return port
+
+
+async def _tcp_port_accepts_bound(ip: str, port: int, timeout: float) -> Optional[int]:
+    """TCP connect from a socket pinned to --interface."""
+    address = ip.split("%", 1)[0]
+    try:
+        family = 6 if ipaddress.ip_address(address).version == 6 else 4
+        target = socket.getaddrinfo(ip, port, socket.AF_INET6 if family == 6 else socket.AF_INET,
+                                    socket.SOCK_STREAM)[0][4]
+    except (OSError, ValueError):
+        return None
+    sock = socket.socket(socket.AF_INET6 if family == 6 else socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setblocking(False)
+        bind_to_interface(sock, family)
+        await asyncio.wait_for(asyncio.get_running_loop().sock_connect(sock, target), timeout)
+        return port
+    except (OSError, asyncio.TimeoutError):
+        return None
+    finally:
+        sock.close()
 
 
 def tcp_open_ports(ip: str, ports: list[int], timeout: float) -> list[int]:
@@ -1395,6 +1836,7 @@ def _fping_batch_alive(
         raise ProbeExecutionError("fping is unavailable")
     command = [
         _FPING_PATH,
+        *fping_interface_args(any(_is_ipv6(ip) for ip in ip_list[:1])),
         "-a",
         "-r", str(max(attempts - 1, 0)),
         "-B", "1.0",
@@ -1655,6 +2097,11 @@ def _open_icmp_socket(family: int) -> tuple[socket.socket, str]:
         except OSError as exc:
             errors.append(f"{kind}: {exc}")
             continue
+        try:
+            bind_to_interface(sock, family)
+        except OSError as exc:
+            sock.close()
+            raise ProbeExecutionError(f"cannot bind the ICMP socket to {_BOUND.name}: {exc}") from exc
         for option in (socket.SO_RCVBUF, socket.SO_SNDBUF):
             try:
                 sock.setsockopt(socket.SOL_SOCKET, option, 4 * 1024 * 1024)
@@ -2207,6 +2654,8 @@ class NeighborEvidence:
         table: dict[str, tuple[str, str]] = {}
         for family in (4, 6):
             for address, zone, mac, state in read_neighbor_entries(family):
+                if _BOUND is not None and zone and zone not in {_BOUND.name, str(_BOUND.index)}:
+                    continue  # an ARP reply on another adapter is not evidence for this scan
                 key = _with_zone(address, zone) if family == 6 else _normalise_probe_address(address)
                 if key and mac:
                     table[key] = (_normalise_mac(mac), state)
@@ -2552,6 +3001,7 @@ def run_scan(
     retry_str = f"  retry={retry}" if retry > 0 else ""
     dns_str  = "  +dns" if do_dns else ""
     tcp_str  = f"  tcp={','.join(str(port) for port in tcp_ports)}" if tcp_ports else ""
+    tcp_str += f"  iface={_BOUND.name}" if _BOUND is not None else ""
     if not quiet:
         print(
             f"\n  {C.CYAN}⠿ Scanning {C.BOLD}{total:,}{C.RESET}{C.CYAN} hosts"
@@ -3198,6 +3648,12 @@ def resolve_hostname(hostname: str) -> list[str]:
     if not is_safe_hostname(hostname):
         return []
 
+    if _BOUND is not None and _BOUND.dns_servers:
+        addresses = _resolve_via_interface_dns(hostname)
+        if _ADDRESS_FAMILY:
+            addresses = [address for address in addresses if address_family(address) == _ADDRESS_FAMILY]
+        return list(dict.fromkeys(addresses))
+
     if sys.platform.startswith("linux") and shutil.which("getent"):
         # getent follows NSS (DNS, /etc/hosts, mDNS, winbind, and configured
         # providers). Running it out-of-process lets PingMe enforce a deadline.
@@ -3537,7 +3993,9 @@ def render_hosts_report(records: list[dict], meta: dict, names_only: bool = Fals
         ("Scan started", meta.get("started", "")),
         ("Duration", meta.get("duration", "")),
         ("Scanner", meta.get("scanner", "")),
+        ("Interface", meta.get("interface", "")),
         ("Method", meta.get("method", "")),
+        ("Name lookups", meta.get("name_lookups", "")),
         ("Result", f"{_plural(len(rows), 'live host')}; {counts['no_response']} no response; "
                    f"{_plural(counts['probe_error'], 'probe error')}; {counts['unresolved']} unresolved"),
     ]
@@ -3574,7 +4032,12 @@ def render_hosts_report(records: list[dict], meta: dict, names_only: bool = Fals
     notes = _report_notes(rows, meta)
     if notes:
         out += ["", "NOTES"] + [f"  - {note}" for note in notes]
-    out += ["", "LIMITATIONS"] + [f"  - {item}" for item in _REPORT_LIMITATIONS] + [""]
+    limitations = list(_REPORT_LIMITATIONS)
+    lookups = meta.get("name_lookups", "")
+    if lookups.startswith("system resolver"):
+        limitations.append("Hostname lookups used the system resolver, which follows the OS routing table "
+                           "rather than the scan interface.")
+    out += ["", "LIMITATIONS"] + [f"  - {item}" for item in limitations] + [""]
     return "\n".join(out)
 
 
@@ -3585,6 +4048,7 @@ def _source_address(results: list[dict]) -> str:
         try:
             family = socket.AF_INET6 if ipaddress.ip_address(ip).version == 6 else socket.AF_INET
             with socket.socket(family, socket.SOCK_DGRAM) as probe:
+                bind_to_interface(probe, 6 if family == socket.AF_INET6 else 4)
                 probe.connect((ip, 9))
                 return probe.getsockname()[0]
         except (OSError, ValueError):
@@ -3615,7 +4079,8 @@ def scan_report_meta(args: argparse.Namespace, scope: str, results: list[dict], 
     if args.arp:
         method += " + ARP/ND replies"
     if args.tcp_ports:
-        method += f" + TCP connect {args.tcp_ports}"
+        ports = args.tcp_ports if isinstance(args.tcp_ports, str) else ",".join(str(p) for p in args.tcp_ports)
+        method += f" + TCP connect {ports}"
     source = _source_address(results)
     return {
         "scope": f"{scope} ({len(results):,} addresses)",
@@ -3624,7 +4089,12 @@ def scan_report_meta(args: argparse.Namespace, scope: str, results: list[dict], 
         "scanner": f"{socket.gethostname()}"
                    + (f" ({', '.join(filter(None, [source, _interface_for(source)]))})" if source else "")
                    + f", PingMe {VERSION}",
+        "interface": (f"{_BOUND.name}, forced with -I (every probe bound to this adapter)"
+                      if _BOUND is not None and _BOUND.mode == "device" else
+                      f"{_BOUND.name}, source address only (the OS may still route through another adapter)"
+                      if _BOUND is not None else "chosen by the OS routing table"),
         "method": method,
+        "name_lookups": name_lookup_description(),
     }
 
 
@@ -4518,13 +4988,17 @@ def _trace_command(ip: str) -> Optional[list[str]]:
     ipv6 = ipaddress.ip_address(base).version == 6
     if sys.platform == "win32":
         tracert = shutil.which("tracert.exe") or shutil.which("tracert")
-        return [tracert, "-d", "-h", str(TRACE_MAX_HOPS), "-w", "1000", *(["-6"] if ipv6 else []), ip] if tracert else None
+        if _BOUND is not None and not (ipv6 and _BOUND.source(6)):
+            return None  # tracert can only choose a source address for IPv6
+        bind = ["-S", _BOUND.source(6).split("%", 1)[0]] if _BOUND is not None else []
+        return [tracert, "-d", "-h", str(TRACE_MAX_HOPS), "-w", "1000", *(["-6"] if ipv6 else []), *bind, ip] if tracert else None
     traceroute = shutil.which("traceroute6" if ipv6 and _is_bsd_ping() else "traceroute")
     if traceroute:
         family = ["-6"] if ipv6 and not traceroute.endswith("6") else []
-        return [traceroute, *family, "-n", "-q", "1", "-w", "1", "-m", str(TRACE_MAX_HOPS), ip]
+        bind = ["-i", _BOUND.name] if _BOUND is not None else []
+        return [traceroute, *family, *bind, "-n", "-q", "1", "-w", "1", "-m", str(TRACE_MAX_HOPS), ip]
     tracepath = shutil.which("tracepath")
-    if tracepath:
+    if tracepath and _BOUND is None:
         return [tracepath, *(["-6"] if ipv6 else []), "-n", "-m", str(TRACE_MAX_HOPS), ip]
     return None
 
@@ -4607,6 +5081,7 @@ def send_wake_on_lan(macs: list[str], broadcast: str = "255.255.255.255") -> lis
     """Send magic packets to UDP ports 9 and 7; returns the MACs that were sent."""
     sent = []
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        bind_to_interface(sock, 4)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         for mac in macs:
             packet = magic_packet(mac)
@@ -4950,6 +5425,7 @@ CONFIG_TYPES: dict[str, type] = {
     "notify": list,
     "notify_on": str,
     "arp": bool,
+    "interface": str,
 }
 
 CONFIG_TEMPLATE = """\
@@ -4963,6 +5439,7 @@ CONFIG_TEMPLATE = """\
 # retry = 0             # extra rounds for hosts that did not answer
 # rate = 0              # packets per second, 0 = unlimited
 # ping_tool = "auto"    # auto | fping | ping | ask
+# interface = "wlan0"   # send every probe from this adapter (name or its IP)
 # tcp_ports = "22,80,443,3389"
 # tcp_timeout = 2
 # dns = true            # reverse-resolve IPs to hostnames (default: auto)
@@ -5249,6 +5726,7 @@ def print_topic_help(topic: str) -> int:
             ("--resume", "Continue a scan interrupted with Ctrl+C."),
             ("--watch SEC", "Rescan every SEC seconds and print only changes."),
             ("--ping-tool MODE", "auto | native | fping | ping | ask (ask = choose interactively)."),
+            ("-I, --interface IFACE", "Send every probe (and DNS lookup) from one adapter: wlan0, eth0, or its IP."),
             ("--timeout auto", "Adapt the wait to measured round-trip times (native engine)."),
         ]
     elif topic == "discovery":
@@ -5458,6 +5936,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Extra rounds for non-responsive hosts (default: 0)")
     sg.add_argument("--rate", type=int, default=0, metavar="PPS",
                     help="Maximum packets/sec; 0 = unlimited")
+    sg.add_argument("-I", "--interface", metavar="IFACE",
+                    help="Send every probe from this adapter (name like wlan0, or its IP address)")
     sg.add_argument("--ping-tool", default="auto", choices=["auto", "native", "fping", "ping", "ask"],
                     help="ICMP backend (default: auto)")
     sg.add_argument("--fast", action="store_true",
@@ -5906,6 +6386,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     _validate_ranges(parser, args)
     if args.data_dir:
         _DATA_DIR_OVERRIDE = Path(args.data_dir).expanduser()
+    global _BOUND
+    _BOUND = None
+    if args.interface:
+        try:
+            _BOUND = resolve_interface(args.interface)
+        except ValueError as exc:
+            parser.error(f"--interface: {exc}")
+        _BOUND.dns_servers = interface_dns_servers(_BOUND.name)
     global _ADDRESS_FAMILY
     _ADDRESS_FAMILY = args.family
     if args.tcp_ports:
@@ -6058,7 +6546,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     neighbor_rows: list[dict] = []
     if args.discover6 is not None:
-        interfaces = args.discover6 or ipv6_interfaces()
+        interfaces = args.discover6 or ([_BOUND.name] if _BOUND is not None else ipv6_interfaces())
         unknown = [name for name in args.discover6 if not interface_exists(name)]
         if unknown:
             available = ", ".join(ipv6_interfaces()) or "none found"
@@ -6172,6 +6660,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             names, status_rows, f"PingMe · {target_file or ', '.join(subnets + hosts) or 'scan'}",
         )
 
+    if _BOUND is not None and not args.quiet:
+        print(f"  {C.CYAN}Interface:{C.RESET} {_BOUND.describe()}  "
+              f"{C.DIM}name lookups: {name_lookup_description()}{C.RESET}")
+        mismatched = route_mismatches(ip_list)
+        if mismatched:
+            example, usual = mismatched[0]
+            print(C.warn(f"  ⚠  {len(mismatched)} target(s) normally route through another adapter "
+                         f"(e.g. {example} from {usual}). They will be sent out {_BOUND.name} instead; "
+                         f"if {_BOUND.name} has no path to them they will show as NO RESPONSE."))
     started_at = time.time()
     previous_scan = (load_history(label) or [None])[-1]
     results = run_scan(ip_list, label=label, quiet=not rich_output, resume=args.resume, **scan_kwargs)

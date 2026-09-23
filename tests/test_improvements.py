@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
+import sys
 import subprocess
 import tempfile
 import threading
@@ -345,12 +347,42 @@ class CliTests(StateDirTestCase):
         written = "".join(call.args[0] for call in stderr.write.call_args_list)
         self.assertIn("--tcp-ports", written)
 
-    def test_installer_completes_every_option(self) -> None:
+    def test_every_option_completes_with_its_values(self) -> None:
         import install
 
+        spec = install.completion_spec()
         options = {option for action in pingme.build_parser()._actions for option in action.option_strings}
-        self.assertEqual(sorted(options - set(install.OPTIONS)), [])
-        self.assertEqual(list(pingme.HELP_TOPICS), install.HELP_TOPICS)
+        self.assertEqual({name for entry in spec for name in entry["names"]}, options)
+        for entry in spec:
+            if entry["takes_value"]:
+                self.assertTrue(entry["kind"] in {"file", "dir", "iface", "subnet", "choice"} or entry["values"],
+                                f"{entry['names']} has no value completion")
+        scripts = {shell: getattr(install, f"{shell}_completion")() for shell in ("zsh", "bash", "fish", "powershell")}
+        for shell, script in scripts.items():
+            for name in options:
+                spelled = (f"-l {name[2:]}" if name.startswith("--") else f"-s {name[1:]}") if shell == "fish" else name
+                self.assertIn(spelled, script, f"{name} missing from {shell} completion")
+
+    @unittest.skipUnless(shutil.which("bash"), "bash not installed")
+    def test_bash_completion_offers_values_for_the_previous_flag(self) -> None:
+        import install
+
+        script = Path(self._tmp.name) / "pingme.bash"
+        script.write_text(install.bash_completion(), encoding="utf-8")
+
+        def complete(*words: str) -> list[str]:
+            line = " ".join(["pingme", *words])
+            probe = (f"source {script}; COMP_WORDS=(pingme {' '.join(repr(w) for w in words)}); "
+                     f"COMP_CWORD={len(words)}; COMP_LINE={line!r}; _pingme_completion; printf '%s\\n' \"${{COMPREPLY[@]}}\"")
+            output = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, cwd=self._tmp.name)
+            return output.stdout.split()
+
+        self.assertEqual(complete("--ping-tool", ""), ["auto", "native", "fping", "ping", "ask"])
+        self.assertIn("hostnames.csv", complete("--sub", "10.0.0.0/24", "--scan", "--hostnames-out", ""))
+        self.assertIn("web", complete("--tcp-ports", ""))
+        self.assertIn("lo", complete("-I", ""))
+        self.assertIn("examples", complete("--help-topic", ""))
+        self.assertIn("--interface", complete("--int"))
 
     def test_every_help_topic_renders(self) -> None:
         with patch("builtins.print"):
@@ -362,3 +394,66 @@ class CliTests(StateDirTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InterfaceTests(unittest.TestCase):
+    """-I/--interface pins probes and name lookups to one adapter."""
+
+    def setUp(self) -> None:
+        self.addCleanup(setattr, pingme, "_BOUND", None)
+
+    def test_unknown_adapter_lists_the_real_ones(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            pingme.resolve_interface("definitely-not-an-adapter0")
+        self.assertIn("Available:", str(caught.exception))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux device binding")
+    def test_loopback_binding_is_enforced(self) -> None:
+        pingme._BOUND = pingme.resolve_interface("lo")
+        self.assertEqual(pingme.ping_interface_args(False), ["-I", "lo"])
+        self.assertEqual(pingme.fping_interface_args(False), ["-I", "lo"])
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        self.assertEqual(pingme.tcp_open_ports("127.0.0.1", [port], 1), [port])
+        self.assertEqual(pingme.route_mismatches(["127.0.0.1"]), [])
+        self.assertTrue(pingme.route_mismatches(["192.0.2.1"]))  # normally leaves via the default route
+
+    def test_neighbor_entries_from_other_adapters_are_not_evidence(self) -> None:
+        pingme._BOUND = pingme.BoundInterface("wlan0", 3, {4: ["10.0.0.30"]}, "device")
+        rows = [("10.0.0.5", "eth0", "aa:bb:cc:00:00:05", "REACHABLE"),
+                ("10.0.0.6", "wlan0", "aa:bb:cc:00:00:06", "REACHABLE")]
+        with patch.object(pingme, "read_neighbor_entries", side_effect=lambda family: rows if family == 4 else []):
+            evidence = pingme.NeighborEvidence()
+            evidence.use_as_evidence = True
+            other = evidence.enrich(pingme._build_probe_result("10.0.0.5", False, None, []))
+            same = evidence.enrich(pingme._build_probe_result("10.0.0.6", False, None, []))
+        self.assertEqual((other["status"], same["status"]), ("NO RESPONSE", "REACHABLE"))
+
+    def test_dns_client_parses_compressed_answers(self) -> None:
+        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server.bind(("127.0.0.1", 0))
+        self.addCleanup(server.close)
+
+        def answer() -> None:
+            query, peer = server.recvfrom(512)
+            question_end = 12 + query[12:].index(b"\0") + 5
+            ptr = b"\xc0\x0c" + b"\x00\x0c\x00\x01\x00\x00\x00\x3c"
+            rdata = b"\x07printer\x03lan\x00"
+            reply = query[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + query[12:question_end]
+            server.sendto(reply + ptr + len(rdata).to_bytes(2, "big") + rdata, peer)
+
+        threading.Thread(target=answer, daemon=True).start()
+        names = pingme.dns_query("5.0.0.10.in-addr.arpa", "PTR", "127.0.0.1", port=server.getsockname()[1])
+        self.assertEqual(names, ["printer.lan"])
+
+    def test_report_records_the_interface_and_lookup_path(self) -> None:
+        pingme._BOUND = pingme.BoundInterface("wlan0", 3, {4: ["10.0.0.30"]}, "device")
+        pingme._BOUND.dns_servers = ["10.0.0.1"]
+        self.assertEqual(pingme.name_lookup_description(),
+                         "DNS 10.0.0.1 via wlan0; mDNS/NetBIOS queries sent to targets via wlan0")
+        pingme._BOUND.dns_servers = []
+        report = pingme.render_hosts_report([], {"scope": "x", "name_lookups": pingme.name_lookup_description()})
+        self.assertIn("system resolver", report.split("LIMITATIONS", 1)[1])
