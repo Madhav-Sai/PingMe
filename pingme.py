@@ -1805,8 +1805,9 @@ def native_icmp_sweep(
                     if not target.error
                     and echo_attempt_allowed(len(target.received), target.sent, attempts, required)
                 ]
+                active_ids = {id(target) for target in active}
                 for target in targets:
-                    if target not in active:
+                    if id(target) not in active_ids:
                         _finish(target)
             if not active:
                 break
@@ -2100,6 +2101,7 @@ class NeighborEvidence:
         self.use_as_evidence = use_as_evidence and sys.platform != "darwin"  # macOS arp shows no state
         self.max_age = max_age
         self.table: dict[str, tuple[str, str]] = {}
+        self.mac_counts: dict[str, int] = {}
         self.read_at = 0.0
         self.lock = threading.Lock()
 
@@ -2113,6 +2115,9 @@ class NeighborEvidence:
                 if key and mac:
                     table[key] = (_normalise_mac(mac), state)
         self.table = table
+        self.mac_counts = {}
+        for mac, _state in table.values():
+            self.mac_counts[mac] = self.mac_counts.get(mac, 0) + 1
         self.read_at = time.monotonic()
 
     def enrich(self, result: dict) -> dict:
@@ -2122,7 +2127,7 @@ class NeighborEvidence:
             if entry is None:
                 return result
             mac, state = entry
-            sharing = sum(1 for other_mac, _state in self.table.values() if other_mac == mac)
+            sharing = self.mac_counts.get(mac) or sum(1 for other, _s in self.table.values() if other == mac)
         result["mac"] = mac
         result["vendor"] = mac_vendor(mac)
         if (

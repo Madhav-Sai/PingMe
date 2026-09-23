@@ -71,7 +71,7 @@ It is designed for network engineers, system administrators, VAPT teams, penetra
 - **Just type a target:** `pingme 192.168.1.0/24`, `pingme hosts.txt`, `pingme server01` — no flags needed.
 - **IP → hostname for every address** through DNS, the hosts file, mDNS and NetBIOS, plus `--reverse` for lookups without pinging.
 - **Watch mode** (`--watch 60`) prints a line whenever a host goes up or down.
-- **Lossy hosts no longer look dead:** `--count 5 --min-replies 2` accepts 2 replies out of 5.
+- **Lossy hosts no longer look dead:** silent hosts get 3 tries and responders 2 extra to confirm; at 5% packet loss the chance of missing a live host drops from 9.7% to 0.013%.
 - **Latency and packet loss** columns, and IP-change detection in `changes.txt`.
 - **Friendlier help:** a short `-h`, focused `pingme help <topic>` pages, and "did you mean" suggestions for mistyped options.
 - **Config file** (`pingme --init-config`), `--color`/`NO_COLOR`, fractional timeouts, and meaningful exit codes.
@@ -961,7 +961,8 @@ TARGET [TARGET ...]
     Wait per ping; fractions such as 0.5 are allowed. Default: 2.
 
 --count N
-    Ping attempts per host. Default: 2.
+    Ping attempts for a silent host. Default: 3.
+    A host that answers gets 2 extra attempts to reach --min-replies.
 
 --min-replies N
     Replies needed before a host is REACHABLE. Default: 2.
@@ -1322,7 +1323,7 @@ pingme --ipinfo 8.8.8.8 192.168.1.1
 |---|---:|---|
 | Threads | `20` | Avoids flooding smaller networks |
 | Timeout | `2s` | Practical default for automated discovery |
-| Count | `2` | Confirms responses without excessive delay |
+| Count | `3` | Attempts for a silent host; responders get 2 more to confirm |
 | TCP timeout | `2s` | Keeps fallback checks practical |
 | Maximum CIDR targets | `65,536` | Prevents accidental huge expansion |
 | Minimum replies | `2` | Two independent echo replies before REACHABLE |
@@ -1334,6 +1335,34 @@ A target is reachable only after `--min-replies` (default two) independent valid
 Interactive scans show the graphical subnet/backend interface, live progress, reachable-host events, and final tables. `auto` picks fping when installed without prompting; use `--ping-tool ask` to choose interactively. Use `--compact` for a short summary or `--quiet` for file-only automation; redirected output becomes compact automatically.
 
 ---
+
+## 🎯 Accuracy
+
+PingMe is built for engagements where both mistakes are costly: reporting a host that is not there (false positive) and missing one that is (false negative).
+
+**False positives are prevented by design.** A host is REACHABLE only with:
+- `--min-replies` (default 2) echo replies from the target itself, each matching a random per-run token and the exact payload that was sent (native engine), or confirmed by separate `ping` processes (fping/ping engines). Replies from other addresses, duplicates, and altered payloads never count; altered payloads become PROBE ERROR.
+- or an accepted TCP connection, **unless** the address also accepts two random high "canary" ports (SYN proxy / tarpit), or nearly every scanned address accepts TCP without ever answering ping or ARP (transparent proxy). Those become PROBE ERROR.
+- or a fresh (REACHABLE, never STALE) ARP/ND entry for an on-link host, ignoring MACs that answer for several addresses (proxy ARP).
+
+**False negatives are kept rare by retrying.** Silent hosts get `--count` attempts; a host that answered once gets two extra attempts to confirm. Simulated miss rate for a live host (200,000 trials per row):
+
+| Packet loss | PingMe 3.2 default | **3.3 default** | `--count 4` |
+|---:|---:|---:|---:|
+| 1% | 2.0% | **< 0.001%** | < 0.001% |
+| 5% | 9.7% | **0.013%** | 0.001% |
+| 10% | 19.0% | **0.11%** | 0.013% |
+| 20% | 36.1% | 1.2% | 0.24% |
+
+For the remaining blind spots — hosts that drop ICMP — use `--tcp-ports common` (routed networks) and keep ARP/ND evidence on (local networks). A host that drops ICMP, has no open port, and is not on your LAN cannot be seen by any ping scanner.
+
+Recommended engagement profile:
+
+```bash
+pingme scope.txt --tcp-ports common --count 4 --retry 1 --html report.html
+```
+
+`tests/test_accuracy.py` enforces the loss table and the false-positive guards on every CI run.
 
 ## 🗂️ Repository Structure
 
@@ -1362,7 +1391,8 @@ pingme/
     ├── test_improvements.py
     ├── test_ipv6.py
     ├── test_native.py
-    └── test_addons.py
+    ├── test_addons.py
+    └── test_accuracy.py
 ```
 
 Generated during file scans (in the current directory):

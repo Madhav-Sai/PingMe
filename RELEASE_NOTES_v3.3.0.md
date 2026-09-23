@@ -29,6 +29,8 @@
 - `pyproject.toml` (`pipx install .`) and GitHub Actions CI on Linux, macOS, and Windows.
 
 ## Engines and accuracy
+- **Fewer missed hosts:** silent hosts get `--count` tries (default now 3) and a host that answered gets 2 extra attempts to reach `--min-replies`. Simulated miss rate at 5% packet loss fell from 9.7% to 0.013% (1% loss: 2.0% → under 0.001%). All engines share one schedule.
+- **No TCP false positives from proxies:** two random canary ports are probed with the requested ones; an address that accepts them all is not counted. If nearly every address in a scan answers TCP only, those results become PROBE ERROR.
 - **Native ICMP engine** (`--ping-tool native`, default on Linux): one socket instead of a `ping` process per host. Replies must come from the target and carry this run's random token and the exact payload; duplicates are ignored and altered payloads become PROBE ERROR. Requests are spread over a pool of sockets so unresolved LAN neighbours cannot stall sending.
 - fping output is streamed, so positives are confirmed while the sweep continues.
 - `--timeout auto` adapts the wait to measured round-trip times (native engine).
