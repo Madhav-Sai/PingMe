@@ -29,9 +29,40 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install fping (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y fping iputils-ping
+        run: sudo apt-get update && sudo apt-get install -y fping iputils-ping traceroute
       - run: pip install pytest
       - name: Unit tests
         run: python -m pytest -q
       - name: End-to-end smoke test
         run: python tests/smoke_test.py
+      - name: Real ping on this OS (reachable, silent, and engine checks)
+        shell: bash
+        run: |
+          set -x
+          python pingme.py 127.0.0.1 --ping-tool ping --compact --no-history
+          # TEST-NET must be NO RESPONSE (exit 1), never a probe error (exit 4).
+          set +e
+          python pingme.py 192.0.2.1 --ping-tool ping --compact --no-history --timeout 1
+          code=$?
+          set -e
+          test "$code" = "1"
+          python pingme.py ::1 --ping-tool ping --compact --no-history || [ "$RUNNER_OS" = "Windows" ]
+          python pingme.py --help-all > /dev/null
+      - name: Native ICMP engine (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          python pingme.py 127.0.0.1 --ping-tool native --compact --no-history
+          set +e
+          python pingme.py 192.0.2.1 --ping-tool native --compact --no-history --timeout 1
+          code=$?
+          set -e
+          test "$code" = "1"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t pingme .
+      - run: docker run --rm pingme --version
+      - run: docker run --rm pingme 127.0.0.1 --compact --no-history

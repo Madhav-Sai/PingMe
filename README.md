@@ -65,6 +65,9 @@ It is designed for network engineers, system administrators, VAPT teams, penetra
 
 ### 🆕 What's new in 3.3
 
+- **Built-in ICMP engine:** one socket instead of one `ping` process per host — a /24 in about 2.6 s on Linux, with exact payload and source matching.
+- **MAC address, vendor, and ARP/ND evidence:** see who made each device, and find LAN hosts that block ping.
+- **Alerts and integrations:** `--notify` (Slack, Teams, Discord, Telegram, e-mail, webhooks), `--html` reports, `--uptime`, `--serve` Prometheus metrics, `--trace-down`, Wake-on-LAN, nmap XML import/export, `@tags`, port presets, Docker and systemd units.
 - **Just type a target:** `pingme 192.168.1.0/24`, `pingme hosts.txt`, `pingme server01` — no flags needed.
 - **IP → hostname for every address** through DNS, the hosts file, mDNS and NetBIOS, plus `--reverse` for lookups without pinging.
 - **Watch mode** (`--watch 60`) prints a line whenever a host goes up or down.
@@ -120,6 +123,12 @@ Reachable: 2  No response: 1  Probe errors: 0  Unresolved: 0
 | `--changes` incl. IP changes | "Did you mean" suggestions | Validated ports and ranges |
 | Resume interrupted scans | Bash/Zsh/Fish/PowerShell completion | Thread and timeout limits |
 | `--watch` live monitoring | Config file, `NO_COLOR` | Scripting-friendly exit codes |
+
+| 🔔 Alerts | 📈 Integrations | 🧰 LAN Tools |
+|:---:|:---:|:---:|
+| Slack / Teams / Discord / Telegram | Prometheus `/metrics` + JSON API | MAC address + vendor |
+| E-mail and generic webhooks | HTML report with uptime | ARP/ND evidence for ping-blocking hosts |
+| On changes, down, or always | nmap XML import/export | Wake-on-LAN, traceroute to down hosts |
 
 </div>
 
@@ -624,6 +633,81 @@ Recognized categories include:
 
 ---
 
+### 10. Scan engines
+
+| Engine | How it works | When it is used |
+|---|---|---|
+| `native` | One ICMP socket sends to every target and matches each reply by source address, random token, and exact payload. No process per host. | Default on Linux when unprivileged ICMP sockets are allowed (most distributions) |
+| `fping` | fping sweeps the list; every positive is re-confirmed with separate system `ping` processes while the sweep continues. | Default when the native engine is unavailable and fping is installed |
+| `ping` | Separate system `ping` processes per host, in parallel. | Fallback everywhere, including Windows |
+
+```bash
+pingme 10.0.0.0/24 --ping-tool native     # force an engine
+pingme 10.0.0.0/24 --timeout auto         # native: adapt the wait to measured RTTs
+```
+
+All engines need `--min-replies` (default 2) replies from separate requests before a host is REACHABLE, and a reply whose payload was altered becomes a PROBE ERROR.
+
+### 11. MAC address, vendor, and hosts that block ping
+
+For hosts on your local network PingMe reads the operating system's neighbor table (ARP for IPv4, ND for IPv6) and adds **MAC** and **VENDOR** columns:
+
+```text
+| 192.168.0.1   | REACHABLE | ICMP   | ... | 5c:a6:e6:cc:0e:fb | TP-Link Systems          |
+| 192.168.0.162 | REACHABLE | ARP/ND | ... | a6:71:b5:07:b4:46 | Private (randomized MAC) |
+```
+
+A LAN host that drops every ping still has to answer ARP to receive traffic. When the neighbor entry for a scanned address is fresh (**REACHABLE**) after the probe, PingMe reports the host as REACHABLE with method `ARP/ND`. Stale entries never count, and a MAC answering for several addresses (proxy ARP) is ignored. Turn this off with `--no-arp`. macOS does not report neighbor state, so it shows MACs but does not use them as evidence.
+
+Vendors come from the nmap or IEEE databases when installed (`/usr/share/nmap/nmap-mac-prefixes`, `/usr/share/ieee-data/oui.txt`), otherwise from a built-in list. `pingme --update-oui` downloads the full IEEE registry. Phones and laptops often use randomized MACs, shown as `Private (randomized MAC)`.
+
+### 12. Alerts
+
+```bash
+pingme hosts.txt --changes --notify https://hooks.slack.com/services/T/B/X
+pingme hosts.txt --watch 60 --notify "https://outlook.office.com/webhook/…"
+pingme hosts.txt --notify https://discord.com/api/webhooks/…
+pingme hosts.txt --notify telegram://BOT_TOKEN@CHAT_ID
+pingme hosts.txt --notify mailto:ops@example.com       # uses PINGME_SMTP_HOST/PORT/USER/PASSWORD/FROM
+pingme hosts.txt --notify https://example.com/hook     # JSON payload with every event
+```
+
+`--notify-on changes` (default) alerts when hosts go offline or come online, or when an IP or MAC changes. `down` alerts whenever something is not responding, and `always` sends a summary every run. In `--watch` mode an alert is sent only when something changes, never repeatedly for the same outage. A failed alert is reported but never stops the scan. `--notify` can be repeated and set in the config file.
+
+### 13. HTML report, uptime, and dashboards
+
+```bash
+pingme hosts.txt --html report.html      # self-contained page: summary, filters, sortable table, uptime
+pingme --uptime hosts.txt                # availability %, flaps, and last-seen from history
+pingme hosts.txt --serve 9109 --watch 60 # rescan every minute; serve /metrics, /api/results, and a live page
+```
+
+`--serve` binds to 127.0.0.1 unless you give an address (`--serve 0.0.0.0:9109`). Prometheus metrics include `pingme_up`, `pingme_rtt_milliseconds`, `pingme_packet_loss_ratio`, `pingme_probe_error`, `pingme_targets`, and scan duration/timestamp. `/healthz` returns 200 once the first scan finished.
+
+### 14. More tools
+
+```bash
+pingme web01 --tcp-ports web,windows        # presets: web, windows, linux, mail, db, printers, network, common
+pingme hosts.txt --trace-down               # where does the path to each down host stop?
+pingme --wol aa:bb:cc:dd:ee:ff              # Wake-on-LAN
+pingme hosts.txt --wake                     # wake down hosts whose MAC was seen in earlier scans
+pingme scan.xml                             # use an nmap -oX file as the target list
+pingme hosts.txt --nmap-xml out.xml         # export for tools that import nmap scans
+pingme inventory.csv --column ip_address    # take targets from one CSV column
+pingme hosts.txt --tag prod                 # only lines tagged @prod (web01 @prod @web)
+```
+
+`--trace-down` explains each outage: "path stops after 10.0.0.1 (hop 3)", "on your local network but silent at layer 2: powered off, unplugged, or moved to another IP", or "path is fine; the host itself ignores ping".
+
+### 15. Running as a service
+
+- **Docker:** `docker build -t pingme .` then `docker run --rm --network host pingme 192.168.1.0/24`
+- **systemd:** `contrib/systemd/pingme-check.{service,timer}` (every 5 min, alerts via `/etc/pingme/pingme.env`) and `pingme-serve.service` (metrics exporter)
+- **Windows:** `contrib/windows/Register-PingMeTask.ps1 -Targets C:\pingme\targets.txt -Minutes 15`
+- **Homebrew / AUR:** templates in `contrib/homebrew` and `contrib/aur`
+
+---
+
 ## 📊 Output Files and Formats
 
 ### Default file-scan reports
@@ -842,6 +926,12 @@ TARGET [TARGET ...]
 -r, --reverse IP/CIDR [...]
     Look up hostnames for addresses without pinging them.
 
+--tag TAG
+    Only target-file lines tagged @TAG (repeatable).
+
+--column NAME
+    Read targets from one column of a CSV file with a header row.
+
 --discover6 [IFACE ...]
     Find IPv6 hosts on local links (multicast echo + neighbor cache).
 
@@ -898,8 +988,17 @@ TARGET [TARGET ...]
 --watch SEC
     Rescan every SEC seconds and print only changes.
 
---ping-tool auto|fping|ping|ask
-    Select the ICMP backend. "ask" chooses interactively.
+--ping-tool auto|native|fping|ping|ask
+    Select the ICMP engine. "ask" chooses interactively.
+
+--no-arp
+    Do not count fresh ARP/ND replies as reachability evidence.
+
+--trace-down
+    Traceroute up to 10 down hosts and explain where the path stops.
+
+--update-oui
+    Download the IEEE MAC vendor registry.
 
 --fast
     Use 100 threads, one-second timeout, and one attempt. Positives are still confirmed.
@@ -955,6 +1054,12 @@ TARGET [TARGET ...]
 --color auto|always|never
     Colored output. NO_COLOR is honoured in auto mode.
 
+--html FILE
+    Self-contained HTML report with filters, sorting, and uptime.
+
+--nmap-xml FILE
+    nmap-compatible XML output.
+
 --exit-zero
     Exit 0 after any completed scan.
 
@@ -967,6 +1072,20 @@ TARGET [TARGET ...]
 
 --keep N
     History entries kept per label. Default: 50. 0 keeps everything.
+
+--uptime LABEL|FILE
+    Availability per host from stored history.
+```
+
+### Alerts and integrations
+
+```text
+--notify TARGET         Slack/Teams/Discord webhook, telegram://TOKEN@CHAT, mailto:, or any URL (repeatable)
+--notify-on MODE        changes (default) | down | always
+--serve [HOST:]PORT     Rescan every --watch SEC and serve /metrics, /api/results, and a live page
+--wake                  Wake-on-LAN for down hosts whose MAC is known
+--wol MAC [...]         Send Wake-on-LAN magic packets and exit
+--wol-broadcast IP      Broadcast address for Wake-on-LAN (default 255.255.255.255)
 
 --data-dir DIR
     State directory. Default: per-user data directory.
@@ -985,7 +1104,7 @@ TARGET [TARGET ...]
 ```text
 -h, --help           Quick, task-oriented help
 --help-all           Every option
-pingme help TOPIC    targets | scan | discovery | output | history | config | exitcodes | advanced | examples
+pingme help TOPIC    targets | scan | discovery | output | history | alerts | config | exitcodes | advanced | examples
 --help-topic TOPIC   Same as "pingme help TOPIC"
 --version
 ```
@@ -1124,6 +1243,17 @@ pingme endpoints.txt --count 5 --min-replies 2
 # Create a config file
 pingme --init-config
 
+# Alerts, reports, dashboards
+pingme hosts.txt --changes --notify https://hooks.slack.com/services/T/B/X
+pingme hosts.txt --html report.html
+pingme --uptime hosts.txt
+pingme hosts.txt --serve 9109 --watch 60
+
+# LAN tools
+pingme hosts.txt --trace-down
+pingme --wol aa:bb:cc:dd:ee:ff
+pingme web01 --tcp-ports web,windows
+
 # Version
 pingme --version
 
@@ -1217,13 +1347,22 @@ pingme/
 ├── RELEASE_NOTES_v3.3.0.md
 ├── PingMe_v3.0_Manual.pdf
 ├── LICENSE
-├── .github/workflows/ci.yml  # Linux/macOS/Windows tests
+├── Dockerfile
+├── .github/workflows/ci.yml  # Linux/macOS/Windows tests, real pings, Docker build
+├── contrib/
+│   ├── systemd/              # pingme-check.service/.timer, pingme-serve.service
+│   ├── windows/              # Register-PingMeTask.ps1
+│   ├── homebrew/             # formula template
+│   └── aur/                  # PKGBUILD template
 ├── examples/
 │   └── targets.txt
 └── tests/
     ├── smoke_test.py
     ├── test_reachability.py
-    └── test_improvements.py
+    ├── test_improvements.py
+    ├── test_ipv6.py
+    ├── test_native.py
+    └── test_addons.py
 ```
 
 Generated during file scans (in the current directory):

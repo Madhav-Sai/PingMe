@@ -1,0 +1,18 @@
+# Periodic check of a target file; alerts on changes. Install:
+#   sudo install -m 0644 pingme-check.service pingme-check.timer /etc/systemd/system/
+#   sudo mkdir -p /etc/pingme && sudo cp targets.txt /etc/pingme/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pingme-check.timer
+[Unit]
+Description=PingMe reachability check
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=pingme
+WorkingDirectory=/var/lib/pingme
+Environment=PINGME_DATA_DIR=/var/lib/pingme
+# Optional: NOTIFY=--notify https://hooks.slack.com/services/XXX
+EnvironmentFile=-/etc/pingme/pingme.env
+ExecStart=/usr/local/bin/pingme /etc/pingme/targets.txt --changes --quiet --exit-zero --html /var/lib/pingme/report.html $NOTIFY

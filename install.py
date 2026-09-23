@@ -21,7 +21,8 @@ SCRIPT = "pingme.py"
 MARKER_START = "# >>> pingme completion >>>"
 MARKER_END = "# <<< pingme completion <<<"
 
-PING_TOOLS = ["auto", "fping", "ping", "ask"]
+PING_TOOLS = ["auto", "native", "fping", "ping", "ask"]
+NOTIFY_MODES = ["changes", "down", "always"]
 OUTPUT_FORMATS = ["txt", "csv", "json"]
 COLOR_MODES = ["auto", "always", "never"]
 
@@ -37,9 +38,11 @@ OPTIONS = [
     "--no-dns", "-r", "--reverse", "--min-replies", "--watch", "--color", "--exit-zero",
     "--keep", "--data-dir", "--config", "--no-config", "--init-config",
     "--discover6", "-4", "--ipv4-only", "-6", "--ipv6-only",
+    "--no-arp", "--update-oui", "--trace-down", "--tag", "--column", "--html", "--nmap-xml",
+    "--uptime", "--notify", "--notify-on", "--serve", "--wake", "--wol", "--wol-broadcast",
 ]
 HELP_TOPICS = [
-    "targets", "scan", "discovery", "output", "history", "config",
+    "targets", "scan", "discovery", "output", "history", "alerts", "config",
     "exitcodes", "advanced", "examples",
 ]
 
@@ -284,6 +287,20 @@ _pingme() {{
     '--watch[rescan every N seconds]:seconds:' \\
     '--no-dns[skip IP to hostname lookups]' \\
     '--discover6[find IPv6 hosts on local links]:interface: ' \\
+    '--no-arp[do not use ARP/ND replies as evidence]' \\
+    '--update-oui[download the MAC vendor database]' \\
+    '--trace-down[traceroute down hosts]' \\
+    '--tag[only file lines with this @tag]:tag:' \\
+    '--column[CSV column holding targets]:column:' \\
+    '--html[HTML report file]:file:_files' \\
+    '--nmap-xml[nmap XML output file]:file:_files' \\
+    '--uptime[availability from history]:label or file:_files' \\
+    '--notify[alert target URL]:url:' \\
+    '--notify-on[when to alert]:mode:(changes down always)' \\
+    '--serve[serve metrics on HOST:PORT]:address:' \\
+    '--wake[Wake-on-LAN for down hosts]' \\
+    '--wol[send Wake-on-LAN to MACs]:mac:' \\
+    '--wol-broadcast[Wake-on-LAN broadcast address]:address:' \\
     '(-4 --ipv4-only -6 --ipv6-only)'{{-4,--ipv4-only}}'[IPv4 addresses only]' \\
     '(-4 --ipv4-only -6 --ipv6-only)'{{-6,--ipv6-only}}'[IPv6 addresses only]' \\
     '(-r --reverse)'{{-r,--reverse}}'[look up hostnames for IPs or CIDRs]:IP or CIDR: ' \\
@@ -355,6 +372,14 @@ def bash_completion() -> str:
             COMPREPLY=( $(compgen -W "{colors}" -- "$cur") )
             return
             ;;
+        --notify-on)
+            COMPREPLY=( $(compgen -W "changes down always" -- "$cur") )
+            return
+            ;;
+        --html|--nmap-xml|--uptime)
+            COMPREPLY=( $(compgen -f -- "$cur") )
+            return
+            ;;
         help|--help-topic)
             COMPREPLY=( $(compgen -W "{topics}" -- "$cur") )
             return
@@ -420,6 +445,20 @@ def fish_completion() -> str:
         "discover6": "Find IPv6 hosts on local links",
         "ipv4-only": "IPv4 addresses only",
         "ipv6-only": "IPv6 addresses only",
+        "no-arp": "Do not use ARP/ND evidence",
+        "update-oui": "Download MAC vendor database",
+        "trace-down": "Traceroute down hosts",
+        "tag": "Only lines with this @tag",
+        "column": "CSV column with targets",
+        "html": "HTML report file",
+        "nmap-xml": "nmap XML output file",
+        "uptime": "Availability from history",
+        "notify": "Alert target (webhook, mailto:, telegram://)",
+        "notify-on": "When to alert",
+        "serve": "Serve metrics and live page",
+        "wake": "Wake-on-LAN for down hosts",
+        "wol": "Send Wake-on-LAN to MACs",
+        "wol-broadcast": "Wake-on-LAN broadcast address",
         "reverse": "Look up hostnames for IPs",
         "min-replies": "Replies required for reachable",
         "watch": "Rescan every N seconds",
@@ -459,7 +498,7 @@ def fish_completion() -> str:
 
 
 def powershell_completion() -> str:
-    all_words = OPTIONS + PING_TOOLS + OUTPUT_FORMATS + COLOR_MODES + HELP_TOPICS
+    all_words = OPTIONS + PING_TOOLS + OUTPUT_FORMATS + COLOR_MODES + NOTIFY_MODES + HELP_TOPICS
     words = ",".join(repr(item) for item in all_words)
 
     return (

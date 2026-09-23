@@ -28,6 +28,29 @@
 - Exit codes: 0 all up / host found, 1 down or unresolved, 2 usage, 3 no ping tool, 4 probe errors, 130 interrupted. `--exit-zero` keeps the old behaviour.
 - `pyproject.toml` (`pipx install .`) and GitHub Actions CI on Linux, macOS, and Windows.
 
+## Engines and accuracy
+- **Native ICMP engine** (`--ping-tool native`, default on Linux): one socket instead of a `ping` process per host. Replies must come from the target and carry this run's random token and the exact payload; duplicates are ignored and altered payloads become PROBE ERROR. Requests are spread over a pool of sockets so unresolved LAN neighbours cannot stall sending.
+- fping output is streamed, so positives are confirmed while the sweep continues.
+- `--timeout auto` adapts the wait to measured round-trip times (native engine).
+- Target files resolve hostnames in parallel (16 at a time) instead of one after another.
+
+## LAN visibility
+- MAC address and vendor for on-link hosts (neighbor table + nmap/IEEE OUI databases, built-in fallback, `--update-oui`).
+- Fresh ARP/ND replies count as reachability evidence for hosts that drop ICMP (REACHABLE entries only; proxy-ARP MACs ignored; `--no-arp` disables).
+- `--changes` reports MAC changes (replaced device or IP conflict) and reverse-DNS name changes.
+
+## Alerts and integrations
+- `--notify` for Slack, Microsoft Teams, Discord, Telegram (`telegram://TOKEN@CHAT`), e-mail (`mailto:` + `PINGME_SMTP_*`), and generic JSON webhooks; `--notify-on changes|down|always`; watch mode alerts on transitions only.
+- `--html` self-contained report with summary, filters, sortable columns, and uptime.
+- `--uptime LABEL|FILE` availability, flaps, and last-seen per host from history.
+- `--serve [HOST:]PORT` long-running exporter with Prometheus `/metrics`, `/api/results`, `/healthz`, and a live page.
+- `--trace-down` explains where the path to each down host stops.
+- Wake-on-LAN: `--wol MAC` and `--wake` (down hosts with a known MAC).
+- nmap XML: import `-oX` files as target lists, export with `--nmap-xml`.
+- `@tags` in target files with `--tag`, `--column` for CSV inventories, TCP port presets (`web`, `windows`, `linux`, `mail`, `db`, `printers`, `network`, `common`).
+- SIGTERM stops `--watch` and `--serve` cleanly (systemd, Docker).
+- Dockerfile, systemd service/timer units, Windows scheduled-task script, Homebrew and AUR templates.
+
 ## Bug fixes
 - `--rate` below `--count` hung forever (the token bucket could never hold the requested packets).
 - macOS/BSD: `ping -W` was given seconds but expects milliseconds, so live hosts were reported as down.

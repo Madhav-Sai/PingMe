@@ -1,0 +1,23 @@
+# Maintainer: Madhav Sai
+pkgname=pingme
+pkgver=3.3.0
+pkgrel=1
+pkgdesc="Fast, fail-closed ICMP/TCP host discovery with hostnames and change tracking"
+arch=('any')
+url="https://github.com/Madhav-Sai/PingMe"
+license=('MIT')
+depends=('python>=3.9' 'iputils' 'iproute2')
+optdepends=('fping: fping discovery backend'
+            'traceroute: --trace-down'
+            'nmap: MAC vendor database'
+            'samba: NetBIOS names for --reverse'
+            'avahi: mDNS names for --reverse')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Madhav-Sai/PingMe/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "PingMe-$pkgver"
+  install -Dm755 pingme.py "$pkgdir/usr/bin/pingme"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

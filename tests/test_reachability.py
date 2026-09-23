@@ -108,6 +108,7 @@ class BackendTests(unittest.TestCase):
             patch.object(pingme, "_FPING_PATH", "fping"),
             patch.object(pingme, "_PING_PATH", "ping"),
             patch.object(pingme, "_PING6_PATH", None),
+            patch.object(pingme, "native_engine_available", return_value=False),
             patch("builtins.input", side_effect=AssertionError("interactive prompt used")),
         ):
             self.assertEqual(pingme.check_deps("auto"), "fping")
@@ -118,6 +119,7 @@ class BackendTests(unittest.TestCase):
             patch.object(pingme, "_PING_PATH", "ping"),
             patch.object(pingme, "_PING6_PATH", None),
             patch.object(pingme.sys.stdin, "isatty", return_value=True),
+            patch.object(pingme, "native_engine_available", return_value=False),
             patch("builtins.input", return_value="2") as input_mock,
             patch("builtins.print"),
         ):

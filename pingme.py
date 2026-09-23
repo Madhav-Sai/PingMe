@@ -751,10 +751,14 @@ def _use_fping() -> bool:
     """Return True if fping should be used for this scan."""
     if _PING_TOOL == "fping":
         return _FPING_PATH is not None
-    if _PING_TOOL == "ping":
+    if _PING_TOOL in {"ping", "native"}:
         return False
     # auto: prefer fping if available
     return _FPING_PATH is not None
+
+
+def _use_native() -> bool:
+    return _PING_TOOL == "native"
 
 
 def _is_ipv6(ip: str) -> bool:
@@ -1189,6 +1193,9 @@ def _build_probe_result(
         "rtt_avg": round(sum(rtts) / len(rtts), 2) if rtts else None,
         "loss_pct": round((sent - received) / sent * 100) if sent and not probe_error else None,
         "os_guess": ttl_to_os(ttl) if icmp_alive else "",
+        "mac": "",
+        "vendor": "",
+        "arp": False,
         # Every scanned address gets a PTR/hosts lookup; LAN-only mDNS and
         # NetBIOS queries are reserved for hosts that answered.
         "hostname": reverse_dns(ip, deep=alive) if do_dns else "",
@@ -1197,13 +1204,55 @@ def _build_probe_result(
     }
 
 
+def _fping_stream(command: list[str], payload: bytes, proc_timeout: float,
+                  on_line: Callable[[str], None]) -> tuple[int, str, str]:
+    """Run fping, handing each stdout line to ``on_line`` as soon as it is printed."""
+    try:
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise ProbeExecutionError(f"batch fping could not execute: {exc}") from exc
+
+    def _feed() -> None:
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    stderr_chunks: list[bytes] = []
+    feeder = threading.Thread(target=_feed, daemon=True)
+    drainer = threading.Thread(target=lambda: stderr_chunks.append(proc.stderr.read()), daemon=True)
+    feeder.start()
+    drainer.start()
+    killer = threading.Timer(proc_timeout, proc.kill)
+    killer.start()
+    stdout_lines: list[str] = []
+    try:
+        for raw in proc.stdout:
+            line = _decode_probe_output(raw).strip()
+            stdout_lines.append(line)
+            on_line(line)
+        returncode = proc.wait()
+    finally:
+        killer.cancel()
+    drainer.join(2)
+    if returncode < 0 and not _STOP_EVENT.is_set():
+        raise ProbeExecutionError("batch fping exceeded its process deadline")
+    return returncode, "\n".join(stdout_lines), _decode_probe_output(b"".join(stderr_chunks))
+
+
 def _fping_batch_alive(
     ip_list: list[str],
     timeout: float,
     attempts: int,
     rate: int = 0,
+    on_alive: Optional[Callable[[str], None]] = None,
 ) -> set[str]:
-    """Discover all fping-positive targets in one process using stdin."""
+    """Discover all fping-positive targets in one process using stdin.
+
+    With ``on_alive`` the output is streamed, so each positive can be confirmed
+    while fping is still sweeping the rest of the list.
+    """
     if not _FPING_PATH:
         raise ProbeExecutionError("fping is unavailable")
     command = [
@@ -1219,6 +1268,21 @@ def _fping_batch_alive(
     payload = ("\n".join(ip_list) + "\n").encode()
     interval_budget = (len(ip_list) * max(attempts, 1) / max(rate, 100)) + 2
     proc_timeout = (max(attempts, 1) * timeout) + interval_budget + 10
+    requested = {_normalise_probe_address(ip) for ip in ip_list}
+    if on_alive is not None:
+        streamed: set[str] = set()
+
+        def _line(line: str) -> None:
+            candidate = _normalise_probe_address(line)
+            if candidate is not None and candidate in requested and candidate not in streamed:
+                streamed.add(candidate)
+                on_alive(candidate)
+
+        returncode, stdout_text, stderr_text = _fping_stream(command, payload, proc_timeout, _line)
+        if returncode not in (0, 1) and not _STOP_EVENT.is_set():
+            detail = (stderr_text or stdout_text).strip().splitlines()
+            raise ProbeExecutionError(f"batch fping failed: {detail[-1] if detail else f'exit code {returncode}'}")
+        return streamed
     try:
         result = subprocess.run(
             command,
@@ -1239,7 +1303,6 @@ def _fping_batch_alive(
         message = detail[-1] if detail else f"exit code {result.returncode}"
         raise ProbeExecutionError(f"batch fping failed: {message}")
 
-    requested = {_normalise_probe_address(ip) for ip in ip_list}
     alive: set[str] = set()
     for line in stdout_text.splitlines():
         candidate = _normalise_probe_address(line.strip())
@@ -1262,20 +1325,8 @@ def _scan_fping_batch(
     min_replies: int = 2,
     rate_limiter: Optional[RateLimiter] = None,
 ) -> list[dict]:
-    """Batch discovery followed by parallel validation of positives and TCP checks."""
+    """Batch discovery with positives confirmed in parallel while fping is still running."""
     attempts = count * (retry + 1)
-    try:
-        candidates = _fping_batch_alive(ip_list, timeout, attempts, rate)
-    except Exception as exc:
-        failed = [
-            _build_probe_result(ip, False, None, [], f"fping batch failed: {exc}", do_dns)
-            for ip in ip_list
-        ]
-        if progress_callback:
-            for index, result in enumerate(failed, 1):
-                progress_callback(result, index, len(ip_list))
-        return failed
-
     def _validate(ip: str) -> dict:
         icmp_alive = False
         ttl = None
@@ -1295,10 +1346,37 @@ def _scan_fping_batch(
         open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
         return _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns, echo)
 
+    candidates: set[str] = set()
+    pool = ThreadPoolExecutor(max_workers=max(1, threads))
+    futures: dict = {}
+    by_address = {_normalise_probe_address(ip): ip for ip in ip_list}
+
+    def _on_alive(address: str) -> None:
+        candidates.add(address)
+        ip = by_address.get(address)
+        if ip is not None and ip not in futures.values():
+            futures[pool.submit(_validate, ip)] = ip
+
+    try:
+        candidates |= _fping_batch_alive(ip_list, timeout, attempts, rate, on_alive=_on_alive)
+    except Exception as exc:
+        pool.shutdown(wait=True, cancel_futures=True)
+        failed = [
+            _build_probe_result(ip, False, None, [], f"fping batch failed: {exc}", do_dns)
+            for ip in ip_list
+        ]
+        if progress_callback:
+            for index, result in enumerate(failed, 1):
+                progress_callback(result, index, len(ip_list))
+        return failed
+
     by_ip: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
-        futures = {pool.submit(_validate, ip): ip for ip in ip_list}
-        for future in as_completed(futures):
+    with pool:
+        started = set(futures.values())
+        for ip in ip_list:
+            if ip not in started:
+                futures[pool.submit(_validate, ip)] = ip
+        for future in as_completed(list(futures)):
             ip = futures[future]
             try:
                 result = future.result()
@@ -1400,6 +1478,362 @@ def _probe_with_retry(
         if again["alive"] or (result.get("status") == "PROBE ERROR" and again.get("status") == "NO RESPONSE"):
             result = again
     return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# NATIVE ICMP ENGINE  (one socket, no ping process per host)
+# ─────────────────────────────────────────────────────────────────
+_ICMP_TYPES = {4: (8, 0), 6: (128, 129)}  # family: (echo request, echo reply)
+_IP_RECVTTL = getattr(socket, "IP_RECVTTL", 12)
+_IP_TTL = getattr(socket, "IP_TTL", 2)
+_IPV6_RECVHOPLIMIT = getattr(socket, "IPV6_RECVHOPLIMIT", 51)
+_IPV6_HOPLIMIT = getattr(socket, "IPV6_HOPLIMIT", 52)
+NATIVE_DEFAULT_INTERVAL = 0.002  # seconds between requests unless --rate is set
+# Requests to local addresses wait in the kernel for ARP/ND and stay charged to the
+# sending socket's buffer; ~200 unresolved neighbours can block sendto() for seconds.
+# Spreading requests over several sockets keeps every buffer well below that.
+NATIVE_REQUESTS_PER_SOCKET = 100
+ADAPTIVE_TIMEOUT_CAP = 3.0
+
+
+def _icmp_checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b"\x00"
+    total = sum(int.from_bytes(data[i:i + 2], "big") for i in range(0, len(data), 2))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
+
+def _open_icmp_socket(family: int) -> tuple[socket.socket, str]:
+    """Open an unprivileged ICMP datagram socket, or a raw socket when running as root."""
+    domain = socket.AF_INET if family == 4 else socket.AF_INET6
+    protocol = socket.IPPROTO_ICMP if family == 4 else socket.IPPROTO_ICMPV6
+    errors = []
+    for kind, sock_type in (("dgram", socket.SOCK_DGRAM), ("raw", socket.SOCK_RAW)):
+        try:
+            sock = socket.socket(domain, sock_type, protocol)
+        except OSError as exc:
+            errors.append(f"{kind}: {exc}")
+            continue
+        for option in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, option, 4 * 1024 * 1024)
+            except OSError:
+                pass
+        try:
+            if family == 4:
+                sock.setsockopt(socket.IPPROTO_IP, _IP_RECVTTL, 1)
+            else:
+                sock.setsockopt(socket.IPPROTO_IPV6, _IPV6_RECVHOPLIMIT, 1)
+        except OSError:
+            pass
+        return sock, kind
+    raise ProbeExecutionError("cannot open an ICMP socket (" + "; ".join(errors) + ")")
+
+
+def native_engine_available() -> bool:
+    """True when this process may send ICMP from its own socket (no ping process needed)."""
+    if sys.platform == "win32":
+        return False
+    try:
+        sock, _kind = _open_icmp_socket(4)
+    except ProbeExecutionError:
+        return False
+    sock.close()
+    return True
+
+
+def _zone_index(zone: str) -> int:
+    if not zone:
+        return 0
+    if zone.isdigit():
+        return int(zone)
+    try:
+        return socket.if_nametoindex(zone)
+    except OSError:
+        return -1
+
+
+class _TargetState:
+    __slots__ = ("ip", "family", "sockaddr", "scope", "sent", "received", "rtts", "ttl", "error", "round_seen")
+
+    def __init__(self, ip: str):
+        base, _separator, zone = ip.partition("%")
+        self.ip = ip
+        self.family = ipaddress.ip_address(base).version
+        self.scope = _zone_index(zone) if self.family == 6 else 0
+        self.sockaddr = (base, 0) if self.family == 4 else (base, 0, 0, max(self.scope, 0))
+        self.sent = 0
+        self.received: set[int] = set()
+        self.rtts: list[float] = []
+        self.ttl: Optional[int] = None
+        self.error = ""
+        self.round_seen = -1
+
+
+class NativePinger:
+    """Send ICMP echo requests to many targets and accept only exact replies.
+
+    A reply counts only when it comes from the target address, carries this
+    run's random token and the counter of a request sent to that target, and
+    its payload is byte-for-byte what was sent. Duplicates are ignored, and a
+    reply whose payload was altered marks the target as a probe error.
+    """
+
+    def __init__(self):
+        self.token = os.urandom(8)
+        self.ident = int.from_bytes(os.urandom(2), "big")
+        self.sockets: dict[int, list[tuple[socket.socket, str]]] = {}
+        self.sends: dict[int, int] = {}
+        self.lock = threading.Lock()
+        self.outstanding: dict[int, tuple[_TargetState, float, int]] = {}  # counter -> (target, sent at, round)
+        self.counter = int.from_bytes(os.urandom(2), "big")
+        self.stop = threading.Event()
+
+    def _socket(self, family: int) -> tuple[socket.socket, str]:
+        """Return the family's current socket, opening another every N requests."""
+        with self.lock:
+            pool = self.sockets.setdefault(family, [])
+            wanted = self.sends.get(family, 0) // NATIVE_REQUESTS_PER_SOCKET + 1
+            if len(pool) < wanted:
+                try:
+                    pool.append(_open_icmp_socket(family))
+                except ProbeExecutionError:
+                    if not pool:
+                        raise
+                except OSError:
+                    if not pool:
+                        raise  # e.g. out of file descriptors; reuse what exists
+            self.sends[family] = self.sends.get(family, 0) + 1
+            return pool[-1]
+
+    def close(self) -> None:
+        for pool in self.sockets.values():
+            for sock, _kind in pool:
+                sock.close()
+
+    def _payload(self, counter: int) -> bytes:
+        return self.token + counter.to_bytes(4, "big") + b"PingMe" + bytes(range(14))
+
+    def send(self, target: _TargetState, round_index: int) -> None:
+        sock, kind = self._socket(target.family)
+        with self.lock:
+            self.counter = (self.counter + 1) & 0xFFFFFFFF
+            counter = self.counter
+        request, _reply = _ICMP_TYPES[target.family]
+        payload = self._payload(counter)
+        header = request.to_bytes(1, "big") + b"\x00\x00\x00" + self.ident.to_bytes(2, "big") + (counter & 0xFFFF).to_bytes(2, "big")
+        packet = header + payload
+        if target.family == 4:
+            checksum = _icmp_checksum(packet)
+            packet = packet[:2] + checksum.to_bytes(2, "big") + packet[4:]
+        with self.lock:
+            self.outstanding[counter] = (target, time.monotonic(), round_index)
+            target.sent += 1
+        try:
+            sock.sendto(packet, target.sockaddr)
+        except OSError as exc:
+            with self.lock:
+                self.outstanding.pop(counter, None)
+                target.error = target.error or f"send failed: {exc.strerror or exc}"
+
+    def _handle(self, family: int, kind: str, data: bytes, ancdata: list, source: tuple) -> None:
+        received_at = time.monotonic()
+        ttl: Optional[int] = None
+        if family == 4 and len(data) >= 20 and data[0] >> 4 == 4:
+            # Raw sockets (and macOS datagram sockets) include the IPv4 header.
+            ttl = data[8]
+            data = data[(data[0] & 0x0F) * 4:]
+        for level, kind_type, value in ancdata:
+            if (level, kind_type) in ((socket.IPPROTO_IP, _IP_TTL), (socket.IPPROTO_IPV6, _IPV6_HOPLIMIT)) and value:
+                ttl = int.from_bytes(value[:4], sys.byteorder) if len(value) >= 4 else value[0]
+        _request, reply_type = _ICMP_TYPES[family]
+        if len(data) < 8 + 12 or data[0] != reply_type:
+            return
+        if kind == "raw" and int.from_bytes(data[4:6], "big") != self.ident:
+            return  # another program's echo reply
+        payload = data[8:]
+        if payload[:8] != self.token:
+            return
+        counter = int.from_bytes(payload[8:12], "big")
+        with self.lock:
+            entry = self.outstanding.get(counter)
+            if entry is None:
+                return
+            target, sent_at, round_index = entry
+            if not _same_ip(str(source[0]), target.ip):
+                return  # a different host answered with our payload; never credit the target
+            if family == 6 and target.scope > 0 and len(source) >= 4 and source[3] not in (0, target.scope):
+                return
+            if payload != self._payload(counter):
+                target.error = "echo reply payload does not match the transmitted request"
+                return
+            if counter in target.received:
+                return  # duplicate (DUP!) reply
+            target.received.add(counter)
+            target.rtts.append((received_at - sent_at) * 1000)
+            target.round_seen = max(target.round_seen, round_index)
+            if ttl is not None:
+                target.ttl = ttl
+
+    def receive_loop(self) -> None:
+        import select
+        while not self.stop.is_set():
+            with self.lock:
+                sockets = {sock: (family, kind) for family, pool in self.sockets.items() for sock, kind in pool}
+            if not sockets:
+                time.sleep(0.01)
+                continue
+            try:
+                readable, _w, _x = select.select(list(sockets), [], [], 0.05)
+            except (OSError, ValueError):
+                return
+            for sock in readable:
+                family, kind = sockets[sock]
+                try:
+                    data, ancdata, _flags, source = sock.recvmsg(2048, 256)
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except OSError:
+                    continue  # ICMP errors surface here on some systems; they are not replies
+                self._handle(family, kind, data, ancdata, source)
+
+
+def native_icmp_sweep(
+    ip_list: list[str],
+    timeout: Optional[float],
+    attempts: int,
+    min_replies: int,
+    rate: int = 0,
+    on_done: Optional[Callable[[str, EchoResult, str], None]] = None,
+) -> dict[str, tuple[EchoResult, str]]:
+    """Probe every target in rounds from one socket; returns {ip: (echo, probe error)}.
+
+    Round 1 goes to every target; later rounds only to targets that can still
+    reach ``min_replies``, so silent hosts cost one timeout. ``timeout=None``
+    adapts the wait to observed round-trip times (capped at 3 s).
+    """
+    required = max(1, min_replies)
+    attempts = max(attempts, required)
+    interval = 1.0 / rate if rate > 0 else NATIVE_DEFAULT_INTERVAL
+    pinger = NativePinger()
+    targets = [_TargetState(ip) for ip in ip_list]
+    for target in targets:
+        if target.family == 6 and target.scope < 0:
+            target.error = f"unknown interface in {target.ip}"
+    for family in sorted({target.family for target in targets}):
+        try:
+            pinger._socket(family)
+        except ProbeExecutionError as exc:
+            for target in targets:
+                if target.family == family:
+                    target.error = str(exc)
+    receiver = threading.Thread(target=pinger.receive_loop, daemon=True)
+    receiver.start()
+    finished: set[str] = set()
+
+    def _finish(target: _TargetState) -> None:
+        if target.ip in finished:
+            return
+        finished.add(target.ip)
+        if on_done:
+            alive = len(target.received) >= required and not target.error
+            on_done(target.ip, EchoResult(alive, target.ttl if alive else None, target.rtts if alive else [],
+                                          target.sent, len(target.received)), target.error)
+
+    try:
+        for round_index in range(attempts):
+            if _STOP_EVENT.is_set():
+                break
+            with pinger.lock:
+                active = [
+                    target for target in targets
+                    if not target.error and len(target.received) < required
+                    and len(target.received) + (attempts - round_index) >= required
+                ]
+                for target in targets:
+                    if target not in active:
+                        _finish(target)
+            if not active:
+                break
+            last_send = time.monotonic()
+            for target in active:
+                if _STOP_EVENT.is_set():
+                    break
+                pinger.send(target, round_index)
+                last_send = time.monotonic()
+                time.sleep(interval)
+            # Wait for this round's replies; stop early when every active target answered.
+            while not _STOP_EVENT.is_set():
+                with pinger.lock:
+                    waiting = [t for t in active if t.round_seen < round_index and not t.error]
+                    if timeout is None:
+                        samples = sorted(rtt for t in targets for rtt in t.rtts)
+                        wait = ADAPTIVE_TIMEOUT_CAP if len(samples) < 3 else min(
+                            ADAPTIVE_TIMEOUT_CAP, max(0.3, 4 * samples[int(len(samples) * 0.95) - 1] / 1000))
+                    else:
+                        wait = timeout
+                if not waiting or time.monotonic() >= last_send + wait:
+                    break
+                time.sleep(0.01)
+        with pinger.lock:
+            for target in targets:
+                _finish(target)
+    finally:
+        pinger.stop.set()
+        receiver.join(1)
+        pinger.close()
+
+    results: dict[str, tuple[EchoResult, str]] = {}
+    for target in targets:
+        alive = len(target.received) >= required and not target.error
+        results[target.ip] = (
+            EchoResult(alive, target.ttl if alive else None, target.rtts if alive else [], target.sent, len(target.received)),
+            target.error,
+        )
+    return results
+
+
+def _scan_native_batch(
+    ip_list: list[str],
+    timeout: Optional[float],
+    count: int,
+    retry: int,
+    rate: int,
+    do_dns: bool,
+    tcp_ports: Optional[list[int]],
+    tcp_timeout: float,
+    progress_callback: Optional[Callable[[dict, int, int], None]] = None,
+    threads: int = 20,
+    min_replies: int = 2,
+) -> list[dict]:
+    """Native ICMP sweep, with TCP checks and name lookups finished in a worker pool."""
+    attempts = max(count, min_replies) * (retry + 1)
+    by_ip: dict[str, dict] = {}
+    lock = threading.Lock()
+    pool = ThreadPoolExecutor(max_workers=max(1, threads))
+    futures = []
+
+    def _complete(ip: str, echo: EchoResult, error: str) -> dict:
+        open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
+        return _build_probe_result(ip, bool(echo[0]), echo[1], open_ports, error, do_dns, echo)
+
+    def _on_done(ip: str, echo: EchoResult, error: str) -> None:
+        # TCP checks and DNS start as soon as a target's ICMP verdict is known.
+        futures.append(pool.submit(_complete, ip, echo, error))
+
+    try:
+        native_icmp_sweep(ip_list, timeout, attempts, min_replies, rate, _on_done)
+        for future in as_completed(list(futures)):
+            result = future.result()
+            with lock:
+                by_ip[result["ip"]] = result
+            if progress_callback:
+                progress_callback(result, len(by_ip), len(ip_list))
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return [by_ip[ip] for ip in ip_list if ip in by_ip]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1512,28 +1946,37 @@ def _multicast_echo_replies(interface: str, timeout: float) -> set[str]:
     return found
 
 
-def ipv6_neighbor_cache(interfaces: Optional[list[str]] = None) -> dict[str, str]:
-    """Read the OS IPv6 neighbor cache as {address: MAC}, skipping failed entries."""
-    wanted = set(interfaces or [])
-    neighbors: dict[str, str] = {}
+_NEIGHBOR_STATES = {
+    "reachable": "REACHABLE", "r": "REACHABLE",
+    "stale": "STALE", "s": "STALE",
+    "delay": "DELAY", "d": "DELAY",
+    "probe": "PROBE", "p": "PROBE",
+    "permanent": "PERMANENT",
+    "failed": "FAILED", "incomplete": "INCOMPLETE", "unreachable": "FAILED",
+}
 
-    def add(address: str, zone: str, mac: str) -> None:
-        if wanted and zone not in wanted:
-            return
-        normalized = _with_zone(address, zone)
-        if normalized:
-            neighbors[normalized] = mac.lower().replace("-", ":")
 
+def read_neighbor_entries(family: int) -> list[tuple[str, str, str, str]]:
+    """Read the OS neighbor (ARP/ND) table as (address, interface, MAC, state) rows.
+
+    ``state`` is REACHABLE, STALE, DELAY, PROBE, PERMANENT, FAILED, INCOMPLETE,
+    or "" when the platform does not report one (macOS ``arp``).
+    """
+    rows: list[tuple[str, str, str, str]] = []
     if sys.platform.startswith("linux") and shutil.which("ip"):
-        output = _run_resolution_command(["ip", "-6", "neigh", "show"], timeout=4)
+        output = _run_resolution_command(["ip", f"-{family}", "neigh", "show"], timeout=4)
         for line in output.splitlines():
             match = re.match(r"^(\S+)\s+dev\s+(\S+)(?:\s+lladdr\s+(\S+))?", line)
-            if match and not re.search(r"\b(FAILED|INCOMPLETE)\b", line):
-                add(match.group(1), match.group(2), match.group(3) or "")
+            if not match:
+                continue
+            state = next((_NEIGHBOR_STATES[word.lower()] for word in reversed(line.split())
+                          if word.lower() in _NEIGHBOR_STATES and word.isupper()), "")
+            rows.append((match.group(1), match.group(2), match.group(3) or "", state))
     elif sys.platform == "win32":
         netsh = shutil.which("netsh.exe") or shutil.which("netsh")
         if netsh:
-            output = _run_resolution_command([netsh, "interface", "ipv6", "show", "neighbors"], timeout=8)
+            output = _run_resolution_command(
+                [netsh, "interface", f"ipv{family}", "show", "neighbors"], timeout=8)
             zone = ""
             for line in output.splitlines():
                 header = re.match(r"^\s*Interface\s+(\d+)\s*:", line, re.IGNORECASE)
@@ -1541,16 +1984,223 @@ def ipv6_neighbor_cache(interfaces: Optional[list[str]] = None) -> dict[str, str
                     zone = header.group(1)
                     continue
                 fields = line.split()
-                if len(fields) >= 3 and ":" in fields[0] and zone and \
-                        not re.search(r"Unreachable|Incomplete|Permanent", line, re.IGNORECASE):
-                    add(fields[0], zone, fields[1])
-    elif shutil.which("ndp"):
+                if len(fields) < 2 or not zone or _normalise_probe_address(fields[0].split("%", 1)[0]) is None:
+                    continue
+                has_mac = re.fullmatch(r"[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5}", fields[1]) is not None
+                mac = fields[1] if has_mac else ""
+                state_word = (fields[2] if has_mac and len(fields) > 2 else fields[1]).lower()
+                rows.append((fields[0], zone, mac, _NEIGHBOR_STATES.get(state_word, "")))
+    elif family == 6 and shutil.which("ndp"):
         output = _run_resolution_command(["ndp", "-an"], timeout=4)
         for line in output.splitlines()[1:]:
             fields = line.split()
-            if len(fields) >= 3 and "incomplete" not in fields[1]:
-                add(fields[0].split("%", 1)[0], fields[2], fields[1])
+            if len(fields) >= 3:
+                incomplete = "incomplete" in fields[1]
+                state = "INCOMPLETE" if incomplete else _NEIGHBOR_STATES.get((fields[4] if len(fields) > 4 else "").lower(), "")
+                rows.append((fields[0].split("%", 1)[0], fields[2], "" if incomplete else fields[1], state))
+    elif family == 4 and shutil.which("arp"):
+        output = _run_resolution_command(["arp", "-an"], timeout=4)
+        for line in output.splitlines():
+            match = re.search(r"\(([\d.]+)\) at (\S+)(?: on (\S+))?", line)
+            if match and "incomplete" not in match.group(2):
+                rows.append((match.group(1), match.group(3) or "", match.group(2), ""))
+    return rows
+
+
+def _normalise_mac(mac: str) -> str:
+    """aa:bb:cc:dd:ee:ff form; also pads macOS's short octets (0:11:2 → 00:11:02)."""
+    parts = re.split(r"[:\-]", mac.strip().lower())
+    if len(parts) != 6 or not all(re.fullmatch(r"[0-9a-f]{1,2}", part) for part in parts):
+        return mac.strip().lower()
+    return ":".join(part.zfill(2) for part in parts)
+
+
+def ipv6_neighbor_cache(interfaces: Optional[list[str]] = None) -> dict[str, str]:
+    """Read the OS IPv6 neighbor cache as {address: MAC}, skipping failed entries."""
+    wanted = set(interfaces or [])
+    neighbors: dict[str, str] = {}
+    for address, zone, mac, state in read_neighbor_entries(6):
+        if state in {"FAILED", "INCOMPLETE"} or (sys.platform == "win32" and state == "PERMANENT"):
+            continue
+        if wanted and zone not in wanted:
+            continue
+        normalized = _with_zone(address, zone)
+        if normalized:
+            neighbors[normalized] = mac.lower().replace("-", ":")
     return neighbors
+
+
+class NeighborEvidence:
+    """Add MAC/vendor details and ARP/ND reachability evidence to scan results.
+
+    Sending a probe to an on-link address makes the kernel resolve it with
+    ARP (IPv4) or neighbor discovery (IPv6). A neighbor entry in the
+    REACHABLE state therefore proves the host answered at layer 2, even when
+    it drops ICMP. Only REACHABLE entries count (never STALE ones, which can
+    be minutes old), and a MAC that answers for several scanned addresses is
+    treated as proxy ARP and ignored as evidence.
+    """
+
+    PROXY_THRESHOLD = 3
+
+    def __init__(self, use_as_evidence: bool = True, max_age: float = 1.0):
+        self.use_as_evidence = use_as_evidence and sys.platform != "darwin"  # macOS arp shows no state
+        self.max_age = max_age
+        self.table: dict[str, tuple[str, str]] = {}
+        self.read_at = 0.0
+        self.lock = threading.Lock()
+
+    def _refresh(self) -> None:
+        if time.monotonic() - self.read_at < self.max_age:
+            return
+        table: dict[str, tuple[str, str]] = {}
+        for family in (4, 6):
+            for address, zone, mac, state in read_neighbor_entries(family):
+                key = _with_zone(address, zone) if family == 6 else _normalise_probe_address(address)
+                if key and mac:
+                    table[key] = (_normalise_mac(mac), state)
+        self.table = table
+        self.read_at = time.monotonic()
+
+    def enrich(self, result: dict) -> dict:
+        with self.lock:
+            self._refresh()
+            entry = self.table.get(result["ip"])
+            if entry is None:
+                return result
+            mac, state = entry
+            sharing = sum(1 for other_mac, _state in self.table.values() if other_mac == mac)
+        result["mac"] = mac
+        result["vendor"] = mac_vendor(mac)
+        if (
+            self.use_as_evidence and not result["alive"] and state == "REACHABLE"
+            and sharing < self.PROXY_THRESHOLD
+        ):
+            result.update(alive=True, status="REACHABLE", evidence="ARP/ND reply", arp=True)
+        return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# MAC VENDOR (OUI) LOOKUP
+# ─────────────────────────────────────────────────────────────────
+_OUI_TABLE: Optional[dict[str, str]] = None
+_OUI_LOCK = threading.Lock()
+OUI_URL = "https://standards-oui.ieee.org/oui/oui.txt"
+
+# Used only when no OUI database is installed; covers common LAN vendors.
+_BUILTIN_OUI = {
+    "000C29": "VMware", "005056": "VMware", "000569": "VMware", "080027": "VirtualBox",
+    "525400": "QEMU/KVM", "00155D": "Microsoft Hyper-V", "0242AC": "Docker", "B827EB": "Raspberry Pi",
+    "DCA632": "Raspberry Pi", "E45F01": "Raspberry Pi", "D83ADD": "Raspberry Pi", "28CDC1": "Raspberry Pi",
+    "001B63": "Apple", "3C0754": "Apple", "A4C361": "Apple", "F01898": "Apple", "ACBC32": "Apple",
+    "001A11": "Google", "F4F5D8": "Google", "3C5AB4": "Google", "00000C": "Cisco", "0019E7": "Cisco",
+    "001D7E": "Cisco-Linksys", "C0C1C0": "Cisco-Linksys", "00095B": "Netgear", "A42B8C": "Netgear",
+    "F4F26D": "TP-Link", "50C7BF": "TP-Link", "C025E9": "TP-Link", "001E58": "D-Link", "00265A": "D-Link",
+    "001132": "Synology", "0011D8": "ASUSTek", "2C56DC": "ASUSTek", "001372": "Dell", "F8BC12": "Dell",
+    "3417EB": "Dell", "001B78": "HP", "3C4A92": "HP", "001E0B": "HP", "D8D385": "HP", "00215A": "HP",
+    "001CBF": "Intel", "3C970E": "Intel", "A0369F": "Intel", "0024D7": "Intel", "00E04C": "Realtek",
+    "001E06": "Wibrain", "34E6D7": "Dell", "000D93": "Apple", "00163E": "Xensource", "001F3B": "Intel",
+    "5CA6E6": "TP-Link", "F09FC2": "Ubiquiti", "24A43C": "Ubiquiti", "788A20": "Ubiquiti", "FCECDA": "Ubiquiti",
+    "0017C8": "Kyocera", "00807F": "Dayna", "0000AA": "Xerox", "00206B": "Konica Minolta", "001599": "Samsung",
+    "5CF370": "CC&C", "8C8590": "Apple", "E0D55E": "Giga-Byte", "18C04D": "Giga-Byte", "40B076": "ASUSTek",
+    "001EC9": "Dell", "002590": "Super Micro", "0CC47A": "Super Micro", "AC1F6B": "Super Micro",
+    "00A0C9": "Intel", "001517": "Intel", "E4B97A": "Dell", "B8AC6F": "Dell", "F48E38": "Dell",
+    "C8D3FF": "HP", "9457A5": "HP", "70106F": "HP", "B05ADA": "HP", "0050B6": "Good Way",
+    "44D9E7": "Ubiquiti", "74DA38": "Edimax", "801F02": "Edimax", "00E018": "ASUSTek", "D850E6": "ASUSTek",
+    "B0BE76": "TP-Link", "98DAC4": "TP-Link", "60E327": "TP-Link", "30B5C2": "TP-Link",
+    "FCFBFB": "Cisco", "0026CB": "Cisco", "B4A4E3": "Cisco", "70B3D5": "IEEE Registration Authority",
+    "D0034B": "Apple", "BC926B": "Apple", "A860B6": "Apple", "1C1AC0": "Apple",
+    "00259C": "Cisco-Linksys", "001A70": "Cisco-Linksys", "000E08": "Cisco-Linksys",
+    "B0C420": "Nmap (test)", "00113D": "KN Soltec",
+}
+
+
+def _oui_sources() -> list[Path]:
+    return [
+        _data_dir() / "oui.txt",
+        Path("/usr/share/ieee-data/oui.txt"),
+        Path("/usr/share/nmap/nmap-mac-prefixes"),
+        Path("/usr/local/share/nmap/nmap-mac-prefixes"),
+        Path("/opt/homebrew/share/nmap/nmap-mac-prefixes"),
+        Path("/usr/share/arp-scan/ieee-oui.txt"),
+        Path("/usr/share/wireshark/manuf"),
+        Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "Nmap" / "nmap-mac-prefixes",
+        Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "Wireshark" / "manuf",
+    ]
+
+
+def _parse_oui_file(path: Path) -> dict[str, str]:
+    table: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return table
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        match = (
+            re.match(r"^([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})\s+\(hex\)\s+(.+)$", line)   # IEEE
+            or re.match(r"^([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2})\s+\S+\s+(.+)$", line)     # Wireshark
+        )
+        if match:
+            table["".join(match.groups()[:3]).upper()] = match.group(4).strip()
+            continue
+        match = re.match(r"^([0-9A-Fa-f]{6})\s+(?:\(base 16\)\s+)?(.+)$", line)  # nmap, arp-scan, IEEE base-16 rows
+        if match:
+            table[match.group(1).upper()] = match.group(2).strip()
+    return table
+
+
+def _load_oui_table() -> dict[str, str]:
+    global _OUI_TABLE
+    with _OUI_LOCK:
+        if _OUI_TABLE is None:
+            table: dict[str, str] = dict(_BUILTIN_OUI)
+            for source in reversed(_oui_sources()):  # earlier sources win
+                if source.is_file():
+                    table.update(_parse_oui_file(source))
+            _OUI_TABLE = table
+        return _OUI_TABLE
+
+
+def mac_vendor(mac: str) -> str:
+    """Manufacturer for a MAC address, "Private (randomized MAC)", or ""."""
+    digits = re.sub(r"[^0-9A-Fa-f]", "", _normalise_mac(mac)).upper()
+    if len(digits) != 12:
+        return ""
+    if digits == "000000000000" or digits == "FFFFFFFFFFFF":
+        return ""
+    if digits.startswith("0242"):
+        return "Docker (virtual)"
+    if int(digits[:2], 16) & 0x02:
+        return "Private (randomized MAC)"
+    vendor = _load_oui_table().get(digits[:6], "")
+    return re.sub(r",?\s+(Inc|Ltd|Co|Corp|Corporation|LLC|GmbH|AG|S\.A)\.?$", "", vendor)
+
+
+def update_oui_database() -> int:
+    """Download the IEEE OUI registry into the data directory (explicit --update-oui only)."""
+    import urllib.request
+    destination = _data_dir() / "oui.txt"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(OUI_URL, headers={"User-Agent": f"PingMe/{VERSION}"})
+    print(f"  {C.CYAN}Downloading {OUI_URL} ...{C.RESET}", flush=True)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = response.read()
+    except OSError as exc:
+        print(C.err(f"  ✗ Download failed: {exc}"), file=sys.stderr)
+        return EXIT_ENVIRONMENT
+    temporary = destination.with_suffix(".tmp")
+    temporary.write_bytes(data)
+    entries = len(_parse_oui_file(temporary))
+    if entries < 1000:
+        temporary.unlink()
+        print(C.err("  ✗ The download did not look like the IEEE OUI registry; keeping the old one."), file=sys.stderr)
+        return EXIT_ENVIRONMENT
+    os.replace(temporary, destination)
+    print(C.ok(f"  ✔  Saved {entries:,} vendor prefixes to {destination}"))
+    return EXIT_OK
 
 
 def discover_ipv6_neighbors(interfaces: list[str], timeout: float = 1.0) -> dict[str, str]:
@@ -1641,6 +2291,7 @@ def run_scan(
     tcp_timeout:  float       = 2,
     min_replies:  int         = 2,
     resumable:    bool        = True,
+    neighbors:    Optional["NeighborEvidence"] = None,
 ) -> list[dict]:
     """
     Scan all IPs. Returns list of result dicts.
@@ -1690,15 +2341,23 @@ def run_scan(
     _STOP_EVENT.clear()
     t_start   = time.time()
     interrupted = False
+    use_native = _use_native()
     use_fping = _use_fping()
+    batch_mode = use_native or use_fping
     required = max(1, min_replies)
+    wait = timeout if timeout is not None else ADAPTIVE_TIMEOUT_CAP
 
     waves = (total + max(threads, 1) - 1) // max(threads, 1)
-    confirm_est = max(count, required) * timeout
-    if use_fping:
+    confirm_est = max(count, required) * wait
+    if use_native:
+        # Requests are paced from one socket; silent hosts cost a single timeout.
+        interval = 1.0 / rate if rate > 0 else NATIVE_DEFAULT_INTERVAL
+        icmp_est = total * interval + max(count, required) * wait
+        waves = 1
+    elif use_fping:
         # Alive mode makes at most ``count`` attempts; positives then receive
         # independent integrity confirmations through system ping.
-        icmp_est = count * timeout + confirm_est
+        icmp_est = count * wait + confirm_est
     else:
         icmp_est = confirm_est
     tcp_est = tcp_timeout if tcp_ports else 0
@@ -1711,7 +2370,8 @@ def run_scan(
         print(
             f"\n  {C.CYAN}⠿ Scanning {C.BOLD}{total:,}{C.RESET}{C.CYAN} hosts"
             f"  │  threads={C.BOLD}{threads}{C.RESET}{C.CYAN}"
-            f"  timeout={_format_seconds(timeout)}s  pkt/host={count}  replies≥{required}"
+            f"  engine={_PING_TOOL}  timeout={'auto' if timeout is None else _format_seconds(timeout) + 's'}"
+            f"  pkt/host={count}  replies≥{required}"
             f"{retry_str}{rate_str}{dns_str}{tcp_str}"
             f"  est≤{est_sec:.0f}s{C.RESET}\n"
         )
@@ -1719,7 +2379,9 @@ def run_scan(
     counts = {"alive": 0, "no_response": 0, "errors": 0}
 
     def _report(result: dict, done: int) -> None:
-        """Print one finished target and advance the progress bar in O(1)."""
+        """Enrich one finished target, print it, and advance the progress bar in O(1)."""
+        if neighbors is not None:
+            neighbors.enrich(result)
         if result["alive"]:
             counts["alive"] += 1
         elif result.get("status") == "PROBE ERROR":
@@ -1732,7 +2394,8 @@ def run_scan(
         if result["alive"]:
             os_g = result["os_guess"]
             ttl_s = f"TTL={result['ttl']}" if result["ttl"] else "TTL=?"
-            reach_s = "ICMP" if result["icmp_alive"] else f"TCP:{','.join(str(port) for port in result['tcp_open'])}"
+            reach_s = "ICMP" if result["icmp_alive"] else (
+                f"TCP:{','.join(str(port) for port in result['tcp_open'])}" if result["tcp_open"] else "ARP/ND")
             rtt_s = f"{result['rtt_avg']}ms" if result.get("rtt_avg") is not None else ""
             dns_s = f"  {C.DIM}{result['hostname'][:28]}{C.RESET}" if result["hostname"] else ""
             sys.stdout.write(
@@ -1748,8 +2411,8 @@ def run_scan(
                 f"  {C.YELLOW}{'PROBE ERROR':<12}{C.RESET}"
                 f"  {C.DIM}{result.get('probe_error', '')[:44]}{C.RESET}\n"
             )
-        elif not use_fping:
-            # fping mode lists only positives; a /16 of silent hosts would flood the terminal.
+        elif not batch_mode:
+            # Batch modes list only positives; a /16 of silent hosts would flood the terminal.
             sys.stdout.write(
                 f"{_line_start()}  {C.RED}✘ {ip:<18}{C.RESET}"
                 f"  {C.DIM}{'NO RESPONSE':<12} {'TTL=?':<8}{C.RESET}"
@@ -1775,7 +2438,7 @@ def run_scan(
         old_handler = None
 
     try:
-        if use_fping:
+        if batch_mode:
             chunk_size = _fping_chunk_size(total)
             for start in range(0, total, chunk_size):
                 if interrupted:
@@ -1783,15 +2446,21 @@ def run_scan(
                 chunk = ip_list[start:start + chunk_size]
                 if not quiet and total > chunk_size and sys.stdout.isatty():
                     sys.stdout.write(
-                        f"{_line_start()}  {C.DIM}Discovering {start + 1:,}–{start + len(chunk):,} of {total:,} with fping...{C.RESET}   "
+                        f"{_line_start()}  {C.DIM}Discovering {start + 1:,}–{start + len(chunk):,} of {total:,} with {_PING_TOOL}...{C.RESET}   "
                     )
                     sys.stdout.flush()
                 base = len(results)
-                chunk_results = _scan_fping_batch(
-                    chunk, timeout, count, retry, rate, do_dns, tcp_ports, tcp_timeout,
-                    lambda result, completed, _total, base=base: _report(result, base + completed),
-                    threads=threads, min_replies=required, rate_limiter=rl,
-                )
+                report = (lambda result, completed, _total, base=base: _report(result, base + completed))
+                if use_native:
+                    chunk_results = _scan_native_batch(
+                        chunk, timeout, count, retry, rate, do_dns, tcp_ports, tcp_timeout,
+                        report, threads=threads, min_replies=required,
+                    )
+                else:
+                    chunk_results = _scan_fping_batch(
+                        chunk, wait, count, retry, rate, do_dns, tcp_ports, tcp_timeout,
+                        report, threads=threads, min_replies=required, rate_limiter=rl,
+                    )
                 if interrupted:
                     # The signal also reached fping and ping children, so this
                     # chunk's evidence is incomplete. It will be rescanned.
@@ -1802,7 +2471,7 @@ def run_scan(
             try:
                 futures = {
                     pool.submit(
-                        _probe_with_retry, ip, timeout, count, retry, rl,
+                        _probe_with_retry, ip, wait, count, retry, rl,
                         do_dns, tcp_ports, tcp_timeout, required,
                     ): ip
                     for ip in ip_list
@@ -1820,8 +2489,8 @@ def run_scan(
                     if interrupted:
                         # The result may come from a ping the signal cut short.
                         break
+                    _report(res, len(results) + 1)
                     results.append(res)
-                    _report(res, len(results))
             finally:
                 pool.shutdown(wait=True, cancel_futures=True)
     finally:
@@ -1888,7 +2557,7 @@ def write_results(
     elif out_format == "csv":
         fields = [
             "ip", "status", "alive", "evidence", "probe_error", "icmp_alive", "tcp_open",
-            "ttl", "rtt_min", "rtt_avg", "loss_pct", "os_guess", "hostname", "scope", "rfc",
+            "ttl", "rtt_min", "rtt_avg", "loss_pct", "os_guess", "hostname", "mac", "vendor", "scope", "rfc",
         ]
         for path, rows in ((alive_path, alive), (dead_path, dead), (error_path, errors)):
             with path.open("w", newline="", encoding="utf-8") as output:
@@ -2397,7 +3066,7 @@ def build_file_status_records(rows: list[dict], results: list[dict]) -> list[dic
         row_type = str(row.get("type", "DNS"))
         excluded = bool(row.get("excluded"))
         rtt = loss = "-"
-        name = ""
+        name = mac = vendor = ""
 
         if row_type == "UNRESOLVED" or ip_value == "UNRESOLVED":
             status = "UNRESOLVED"
@@ -2422,6 +3091,8 @@ def build_file_status_records(rows: list[dict], results: list[dict]) -> list[dic
                     method = "ICMP"
                 elif result.get("tcp_open"):
                     method = "TCP:" + ",".join(str(port) for port in result.get("tcp_open", []))
+                elif result.get("arp"):
+                    method = "ARP/ND"
                 elif status == "PROBE ERROR":
                     method = "ERROR"
                 else:
@@ -2434,6 +3105,8 @@ def build_file_status_records(rows: list[dict], results: list[dict]) -> list[dic
                 if result.get("loss_pct") is not None:
                     loss = f"{result['loss_pct']}%"
                 name = str(result.get("hostname") or "")
+                mac = str(result.get("mac") or "")
+                vendor = str(result.get("vendor") or "")
 
         records.append({
             "host": host,
@@ -2445,6 +3118,9 @@ def build_file_status_records(rows: list[dict], results: list[dict]) -> list[dic
             "loss": loss,
             "os_guess": os_guess,
             "name": name,
+            "mac": mac,
+            "vendor": vendor,
+            "tags": " ".join(row.get("tags") or []),
         })
 
     return records
@@ -2470,7 +3146,10 @@ _STATUS_COLUMNS = [
     ("RTT ms", "rtt", 6, 9),
     ("LOSS", "loss", 4, 5),
     ("OS GUESS", "os_guess", 8, 24),
-    ("REVERSE DNS", "name", 11, 48),
+    ("REVERSE DNS", "name", 11, 40),
+    ("MAC", "mac", 17, 17),
+    ("VENDOR", "vendor", 6, 24),
+    ("TAGS", "tags", 4, 24),
 ]
 
 
@@ -2480,7 +3159,7 @@ def _status_columns(
     """Choose visible columns and widths; reverse DNS appears only when some name is known."""
     columns: list[tuple[str, str, int]] = []
     for header, key, minimum, maximum in _STATUS_COLUMNS:
-        if key == "name" and not any(record.get("name") for record in records):
+        if key in {"name", "mac", "vendor", "tags"} and not any(record.get(key) for record in records):
             continue
         if key == "host" and hide_host:
             continue
@@ -2577,6 +3256,23 @@ def _ip_change_table(title: str, changes: list[dict]) -> list[str]:
     return lines
 
 
+def _value_change_table(title: str, changes: list[dict], old_label: str, new_label: str) -> list[str]:
+    widths = [
+        min(40, max([12] + [len(str(c["host"])) for c in changes])),
+        min(48, max([15] + [len(str(c["ip"])) for c in changes])),
+        min(40, max([len(old_label)] + [len(str(c["old"])) for c in changes])),
+        min(40, max([len(new_label)] + [len(str(c["new"])) for c in changes])),
+    ]
+    line = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    headers = ["HOST", "IP ADDRESS", old_label, new_label]
+    lines = [title, line, "| " + " | ".join(f"{h:<{w}}" for h, w in zip(headers, widths)) + " |", line]
+    for change in changes:
+        values = [change["host"], change["ip"], change["old"], change["new"]]
+        lines.append("| " + " | ".join(f"{str(v)[:w]:<{w}}" for v, w in zip(values, widths)) + " |")
+    lines.append(line)
+    return lines
+
+
 def _pair_ip_changes(groups: dict[str, list[dict]]) -> None:
     """Turn a removed (host, old IP) plus an added (host, new IP) into one IP change.
 
@@ -2629,6 +3325,8 @@ def create_changes_report(
         "still_offline": [],
         "indeterminate": [],
         "ip_changed": [],
+        "name_changed": [],
+        "mac_changed": [],
     }
 
     if not previous:
@@ -2661,6 +3359,10 @@ def create_changes_report(
         if old is None:
             groups["new_targets"].append(current)
             continue
+        for field, group in (("name", "name_changed"), ("mac", "mac_changed")):
+            before, after = str(old.get(field) or ""), str(current.get(field) or "")
+            if before and after and before != after:
+                groups[group].append({**current, "old": before, "new": after})
         old_status = old.get("status")
         now_status = current.get("status")
         if old_status == "NO RESPONSE" and now_status == "REACHABLE":
@@ -2691,6 +3393,7 @@ def create_changes_report(
     important = (
         groups["newly_online"] or groups["went_offline"] or groups["new_targets"]
         or groups["removed_targets"] or groups["ip_changed"]
+        or groups["name_changed"] or groups["mac_changed"]
     )
     if not important:
         lines.extend([
@@ -2713,6 +3416,13 @@ def create_changes_report(
         if groups["ip_changed"]:
             lines.extend(_ip_change_table("IP ADDRESS CHANGED", groups["ip_changed"]))
             lines.append("")
+        for group, title, old_label, new_label in (
+            ("mac_changed", "MAC ADDRESS CHANGED (device replaced or IP conflict?)", "OLD MAC", "NEW MAC"),
+            ("name_changed", "REVERSE DNS NAME CHANGED", "OLD NAME", "NEW NAME"),
+        ):
+            if groups[group]:
+                lines.extend(_value_change_table(title, groups[group], old_label, new_label))
+                lines.append("")
         if groups["new_targets"]:
             lines.extend(_compact_host_table("NEW TARGETS ADDED TO FILE", groups["new_targets"]))
             lines.append("")
@@ -2729,6 +3439,8 @@ def create_changes_report(
         f"Still offline: {len(groups['still_offline'])}",
         f"Indeterminate: {len(groups['indeterminate'])}",
         f"IP changed   : {len(groups['ip_changed'])}",
+        f"MAC changed  : {len(groups['mac_changed'])}",
+        f"Name changed : {len(groups['name_changed'])}",
         f"New targets  : {len(groups['new_targets'])}",
         f"Removed      : {len(groups['removed_targets'])}",
         f"Unresolved   : {current_counts['unresolved']}",
@@ -2744,24 +3456,25 @@ def write_changes_report(
     source: str,
     output_file: str = "changes.txt",
     display: str = "full",
-) -> Path:
+) -> dict[str, list[dict]]:
     """Save the change report; ``display`` is "full", "summary" (one line), or "none"."""
     report, groups = create_changes_report(previous, current_records, source)
     destination = Path(output_file).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(report, encoding="utf-8")
     if display == "none":
-        return destination
+        return groups
     if display == "summary":
         if previous:
             print(
                 f"Changes: newly_online={len(groups['newly_online'])} went_offline={len(groups['went_offline'])} "
-                f"ip_changed={len(groups['ip_changed'])} new={len(groups['new_targets'])} "
+                f"ip_changed={len(groups['ip_changed'])} mac_changed={len(groups['mac_changed'])} "
+                f"name_changed={len(groups['name_changed'])} new={len(groups['new_targets'])} "
                 f"removed={len(groups['removed_targets'])} → {destination}"
             )
         else:
             print(f"Changes: baseline saved → {destination}")
-        return destination
+        return groups
 
     # Keep the terminal output easy to understand while the saved report stays plain.
     print(f"\n  {C.BOLD}{C.MAGENTA}{report.splitlines()[0]}{C.RESET}\n")
@@ -2770,12 +3483,13 @@ def write_changes_report(
             print(f"  {C.GREEN}{C.BOLD}{line}{C.RESET}")
         elif line == "WENT OFFLINE":
             print(f"  {C.RED}{C.BOLD}{line}{C.RESET}")
-        elif line in {"NEW TARGETS ADDED TO FILE", "TARGETS REMOVED FROM FILE", "IP ADDRESS CHANGED", "SUMMARY"}:
+        elif line in {"NEW TARGETS ADDED TO FILE", "TARGETS REMOVED FROM FILE", "IP ADDRESS CHANGED",
+                      "REVERSE DNS NAME CHANGED", "SUMMARY"} or line.startswith("MAC ADDRESS CHANGED"):
             print(f"  {C.YELLOW}{C.BOLD}{line}{C.RESET}")
         else:
             print(f"  {line}")
     print(f"\n  {C.CYAN}[report] changes → {destination}{C.RESET}\n")
-    return destination
+    return groups
 
 
 _STATUS_COLORS = {
@@ -2822,8 +3536,10 @@ def show_file_scan_status(
                 color = C.YELLOW
             elif key == "os_guess":
                 color = ttl_color(value) if value not in {"-", "Unknown"} else C.DIM
-            elif key == "name":
+            elif key in {"name", "vendor"}:
                 color = C.TEAL
+            elif key == "mac":
+                color = C.DIM + C.WHITE
             elif key in {"rtt", "loss"}:
                 color = C.DIM if value == "-" else C.WHITE
             else:
@@ -2845,13 +3561,43 @@ def show_file_scan_status(
     return records
 
 
+RESOLVE_WORKERS = 16
+
+
+def _target_file_entries(path: str, text: str, column: Optional[str]) -> list[str]:
+    """Turn a target file into entry lines: plain lists, CSV columns, or nmap XML."""
+    stripped = text.lstrip()
+    if Path(path).suffix.lower() == ".xml" or stripped.startswith(("<?xml", "<nmaprun")):
+        try:
+            pairs = read_nmap_xml_targets(text)
+        except Exception as exc:
+            print(C.err(f"  ✗ Cannot read nmap XML {path}: {exc}"), file=sys.stderr); sys.exit(EXIT_USAGE)
+        return [address if name == address else f"{address} {name}" for name, address in pairs]
+    if column:
+        reader = csv.DictReader(text.splitlines())
+        headers = {name.strip().lower(): name for name in (reader.fieldnames or [])}
+        if column.lower() not in headers:
+            available = ", ".join(reader.fieldnames or []) or "no header row"
+            print(C.err(f"  ✗ Column '{column}' not found in {path} (columns: {available})"), file=sys.stderr)
+            sys.exit(EXIT_USAGE)
+        key = headers[column.lower()]
+        return [str(row.get(key) or "").strip() for row in reader]
+    return text.splitlines()
+
+
 def read_target_file(
     path: str,
     hostnames_out: str = "hostnames.txt",
     quiet: bool = False,
     progress: bool = True,
+    column: Optional[str] = None,
+    only_tags: Optional[set[str]] = None,
 ) -> tuple[list[str], list[dict]]:
-    """Read and resolve a target file. ``quiet`` hides warnings; ``progress`` hides status lines."""
+    """Read and resolve a target file. ``quiet`` hides warnings; ``progress`` hides status lines.
+
+    Lines may carry ``@tags`` (``web01 @prod @web``); ``only_tags`` keeps lines
+    with at least one of them. Hostnames are resolved in parallel.
+    """
     p = Path(path)
     if not p.exists():
         print(C.err(f"  ✗ File not found: {path}")); sys.exit(1)
@@ -2859,9 +3605,10 @@ def read_target_file(
         print(C.err(f"  ✗ Target path is not a file: {path}")); sys.exit(1)
 
     try:
-        lines = p.read_text(encoding="utf-8-sig").splitlines()
+        text = p.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as exc:
         print(C.err(f"  ✗ Cannot read target file {path}: {exc}")); sys.exit(1)
+    lines = _target_file_entries(path, text, column)
 
     targets: list[str] = []
     mappings: list[dict] = []
@@ -2870,9 +3617,21 @@ def read_target_file(
         print(f"  {C.DIM}Resolving targets from {path} (deadline: 4s per hostname)...{C.RESET}", flush=True)
     unsafe: list[str] = []
 
+    def _field_ip(value: str) -> Optional[str]:
+        try:
+            return _normalise_probe_address(value)
+        except ValueError:
+            return None
+
+    # First pass: parse every line; names are collected for parallel resolution.
+    parsed: list[tuple[str, object, list[str]]] = []
     for raw_line in lines:
         entry = raw_line.split("#", 1)[0].strip()
+        tags = re.findall(r"(?<!\S)@([\w.\-]+)", entry)
+        entry = re.sub(r"(?<!\S)@[\w.\-]+", "", entry).strip()
         if not entry:
+            continue
+        if only_tags and not (set(tag.lower() for tag in tags) & only_tags):
             continue
 
         # Portable explicit mappings avoid relying on OS-specific short-name
@@ -2882,13 +3641,6 @@ def read_target_file(
             [field.strip().strip('"').strip("'") for field in next(csv.reader([entry]))]
             if "," in entry else entry.split()
         )
-
-        def _field_ip(value: str) -> Optional[str]:
-            try:
-                return _normalise_probe_address(value)
-            except ValueError:
-                return None
-
         explicit_rows: list[tuple[str, str]] = []
         if len(fields) >= 2:
             first_ip = _field_ip(fields[0])
@@ -2900,11 +3652,8 @@ def read_target_file(
                 ]
             elif second_ip and fields[0]:
                 explicit_rows = [(fields[0], second_ip)]
-
         if explicit_rows:
-            for hostname, address in explicit_rows:
-                targets.append(address)
-                mappings.append({"host": hostname, "ip": address, "type": "FILE MAP"})
+            parsed.append(("map", explicit_rows, tags))
             continue
 
         # Accept simple CSV input by using the first column as the hostname/IP.
@@ -2913,27 +3662,41 @@ def read_target_file(
         entry = entry.strip('"').strip("'").strip()
         if not entry:
             continue
-
-        try:
-            address = _normalise_probe_address(entry)
-            if address is None:
-                raise ValueError("not a unicast host address")
-            targets.append(address)
-            mappings.append({"host": entry, "ip": address, "type": "DIRECT IP"})
-            continue
-        except ValueError:
-            pass
-
-        if not is_safe_hostname(entry):
-            unsafe.append(entry)
-        resolved = resolve_hostname(entry)
-        if resolved:
-            for address in resolved:
-                targets.append(address)
-                mappings.append({"host": entry, "ip": address, "type": "DNS"})
+        address = _field_ip(entry)
+        if address is not None:
+            parsed.append(("ip", (entry, address), tags))
         else:
-            bad.append(entry)
-            mappings.append({"host": entry, "ip": "UNRESOLVED", "type": "UNRESOLVED"})
+            if not is_safe_hostname(entry):
+                unsafe.append(entry)
+            parsed.append(("name", entry, tags))
+
+    names = list(dict.fromkeys(str(item) for kind, item, _tags in parsed if kind == "name"))
+    resolved_names: dict[str, list[str]] = {}
+    if names:
+        with ThreadPoolExecutor(max_workers=min(RESOLVE_WORKERS, len(names))) as pool:
+            resolved_names = dict(zip(names, pool.map(resolve_hostname, names)))
+
+    # Second pass: build rows in file order.
+    for kind, item, tags in parsed:
+        extra = {"tags": tags} if tags else {}
+        if kind == "map":
+            for hostname, address in item:  # type: ignore[union-attr]
+                targets.append(address)
+                mappings.append({"host": hostname, "ip": address, "type": "FILE MAP", **extra})
+        elif kind == "ip":
+            entry, address = item  # type: ignore[misc]
+            targets.append(address)
+            mappings.append({"host": entry, "ip": address, "type": "DIRECT IP", **extra})
+        else:
+            entry = str(item)
+            resolved = resolved_names.get(entry, [])
+            if resolved:
+                for address in resolved:
+                    targets.append(address)
+                    mappings.append({"host": entry, "ip": address, "type": "DNS", **extra})
+            else:
+                bad.append(entry)
+                mappings.append({"host": entry, "ip": "UNRESOLVED", "type": "UNRESOLVED", **extra})
 
     # Remove duplicate host/IP rows and duplicate scan targets while preserving order.
     unique_rows: list[dict] = []
@@ -2997,27 +3760,34 @@ def resolve_host_arguments(hostnames: list[str], quiet: bool = False) -> tuple[l
 # ─────────────────────────────────────────────────────────────────
 # CHECK DEPENDENCIES + TOOL SELECTION  (FIX 5)
 # ─────────────────────────────────────────────────────────────────
+def _native_auto_platform() -> bool:
+    """Platforms where auto mode picks the native engine (verified in CI)."""
+    return sys.platform.startswith("linux")
+
+
 def check_deps(
     ping_tool: str = "auto", verbose: bool = False, interactive: bool = False
 ) -> str:
     """
-    Detect available ping tools, honour --ping-tool flag, and
-    optionally ask an interactive user to choose the backend.
-    Returns the resolved tool name: "fping" | "ping".
+    Detect available ICMP engines, honour --ping-tool, and optionally ask an
+    interactive user to choose. Returns "native" | "fping" | "ping".
+
+    auto prefers the native engine (one ICMP socket, no process per host) on
+    platforms where it is verified, then fping, then the system ping.
     """
     global _PING_TOOL, _FPING_PATH, _PING_PATH, _PING6_PATH
 
     has_fping = _FPING_PATH is not None
     has_ping  = _PING_PATH is not None or _PING6_PATH is not None
+    has_native = native_engine_available()
 
-    # ── Print availability ──────────────────────────────────────
     if verbose:
         print(f"\n  {C.CYAN}[tools]{C.RESET}")
-        print(f"  fping: {_FPING_PATH or 'not found'}")
-        print(f"  ping:  {_PING_PATH or _PING6_PATH or 'not found'}")
+        print(f"  native: {'available (ICMP socket)' if has_native else 'unavailable'}")
+        print(f"  fping:  {_FPING_PATH or 'not found'}")
+        print(f"  ping:   {_PING_PATH or _PING6_PATH or 'not found'}")
 
-    # No ICMP backend is a hard failure unless TCP-only scanning is used.
-    if not has_fping and not has_ping:
+    if not has_fping and not has_ping and not has_native:
         print(f"\n  {C.RED}✗ No ping tool found on PATH.{C.RESET}")
         print(f"  {C.YELLOW}Install one of:{C.RESET}")
         print(f"  {C.DIM}  sudo apt install fping   # Debian/Ubuntu/Kali")
@@ -3025,36 +3795,42 @@ def check_deps(
         print(f"       brew install fping       # macOS{C.RESET}")
         sys.exit(3)
 
-    # ── Honour --ping-tool flag ─────────────────────────────────
-    if ping_tool == "fping":
-        if not has_fping:
-            print(f"  {C.RED}✗ --ping-tool=fping requested but fping not found.{C.RESET}")
+    requirements = {"native": has_native, "fping": has_fping, "ping": has_ping}
+    if ping_tool in requirements:
+        if not requirements[ping_tool]:
+            reason = "ICMP sockets are not permitted for this user" if ping_tool == "native" else f"{ping_tool} not found"
+            print(f"  {C.RED}✗ --ping-tool={ping_tool} requested but {reason}.{C.RESET}")
             sys.exit(3)
-        _PING_TOOL = "fping"
-    elif ping_tool == "ping":
-        if not has_ping:
-            print(f"  {C.RED}✗ --ping-tool=ping requested but ping not found.{C.RESET}")
-            sys.exit(3)
-        _PING_TOOL = "ping"
+        _PING_TOOL = ping_tool
     else:
-        if has_fping and has_ping and interactive and sys.stdin.isatty():
+        choices = [name for name in ("native", "fping", "ping") if requirements[name]]
+        if interactive and len(choices) > 1 and sys.stdin.isatty():
+            descriptions = {
+                "native": "built-in ICMP socket, fastest",
+                "fping": "batch discovery + strict ping confirmation",
+                "ping": "system ping only",
+            }
             print(f"\n  {C.BOLD}{C.CYAN}Select ping backend:{C.RESET}")
-            print(f"  {C.GREEN}[1]{C.RESET} fping  {C.DIM}(batch discovery + strict ping confirmation){C.RESET}")
-            print(f"  {C.YELLOW}[2]{C.RESET} ping   {C.DIM}(system ping only){C.RESET}")
+            for index, name in enumerate(choices, 1):
+                print(f"  {C.GREEN}[{index}]{C.RESET} {name:<6} {C.DIM}({descriptions[name]}){C.RESET}")
             try:
-                choice = input(f"  {C.BOLD}Choice [1/2, default=1]:{C.RESET} ").strip()
+                choice = input(f"  {C.BOLD}Choice [1-{len(choices)}, default=1]:{C.RESET} ").strip()
             except (EOFError, KeyboardInterrupt):
                 choice = ""
-            _PING_TOOL = "ping" if choice == "2" else "fping"
+            index = int(choice) - 1 if choice.isdigit() and 1 <= int(choice) <= len(choices) else 0
+            _PING_TOOL = choices[index]
+        elif has_native and _native_auto_platform():
+            _PING_TOOL = "native"
         elif has_fping:
             _PING_TOOL = "fping"
-        else:
+        elif has_ping:
             _PING_TOOL = "ping"
+        else:
+            _PING_TOOL = "native"
 
-    # Print resolved selection
     if verbose:
-        tool_label = f"{C.GREEN}fping{C.RESET}" if _PING_TOOL == "fping" else f"{C.YELLOW}ping{C.RESET}"
-        print(f"  {C.DIM}Backend:{C.RESET}  {tool_label}")
+        colour = {"native": C.LIME, "fping": C.GREEN, "ping": C.YELLOW}[_PING_TOOL]
+        print(f"  {C.DIM}Backend:{C.RESET}  {colour}{_PING_TOOL}{C.RESET}")
 
     return _PING_TOOL
 
@@ -3101,6 +3877,614 @@ def clear_history(label: str):
 
 
 # ─────────────────────────────────────────────────────────────────
+# TCP PORT PRESETS
+# ─────────────────────────────────────────────────────────────────
+TCP_PORT_PRESETS: dict[str, str] = {
+    "web": "80,443,8080,8443",
+    "windows": "135,139,445,3389,5985",
+    "linux": "22,111,2049",
+    "mail": "25,110,143,465,587,993,995",
+    "db": "1433,1521,3306,5432,6379,27017",
+    "printers": "515,631,9100",
+    "network": "22,23,53,80,443,8291",
+    "common": "21,22,23,25,53,80,110,135,139,143,443,445,993,995,1723,3306,3389,5900,8080,8443",
+}
+
+
+def expand_port_presets(value: str) -> str:
+    """Replace preset names such as 'web' or 'windows' with their port lists."""
+    items = []
+    for item in value.split(","):
+        name = item.strip().lower()
+        if name and not name[0].isdigit():
+            if name not in TCP_PORT_PRESETS:
+                raise ValueError(f"unknown port preset '{item.strip()}' (presets: {', '.join(TCP_PORT_PRESETS)})")
+            items.append(TCP_PORT_PRESETS[name])
+        else:
+            items.append(item)
+    return ",".join(items)
+
+
+# ─────────────────────────────────────────────────────────────────
+# NOTIFICATIONS
+# ─────────────────────────────────────────────────────────────────
+def build_notification(title: str, events: dict[str, list[dict]]) -> str:
+    """Plain-text summary of status changes for chat and e-mail notifications."""
+    labels = {
+        "went_offline": "🔴 Went offline", "newly_online": "🟢 Came online",
+        "down": "🔴 Not responding", "ip_changed": "🔁 IP changed",
+        "mac_changed": "⚠️ MAC changed", "unresolved": "❓ Unresolved",
+    }
+    lines = [title]
+    for key, label in labels.items():
+        items = events.get(key) or []
+        if not items:
+            continue
+        lines.append(f"{label} ({len(items)}):")
+        for item in items[:25]:
+            host = item.get("host") or item.get("hostname") or ""
+            ip = item.get("ip", "")
+            extra = f" ({item['old_ip']} → {ip})" if key == "ip_changed" else ""
+            lines.append(f"  • {host + ' ' if host and host != ip else ''}{ip}{extra}")
+        if len(items) > 25:
+            lines.append(f"  … and {len(items) - 25} more")
+    return "\n".join(lines)
+
+
+def _post_json(url: str, payload: dict, timeout: float = 10) -> None:
+    import urllib.request
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": f"PingMe/{VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response.read()
+
+
+def _send_email(recipients: str, subject: str, body: str) -> None:
+    import smtplib
+    from email.message import EmailMessage
+    host = os.environ.get("PINGME_SMTP_HOST", "localhost")
+    port = int(os.environ.get("PINGME_SMTP_PORT", "587" if os.environ.get("PINGME_SMTP_USER") else "25"))
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = os.environ.get("PINGME_SMTP_FROM", f"pingme@{socket.gethostname()}")
+    message["To"] = recipients
+    message.set_content(body)
+    with smtplib.SMTP(host, port, timeout=15) as smtp:
+        if os.environ.get("PINGME_SMTP_STARTTLS", "1" if port == 587 else "0") == "1":
+            smtp.starttls()
+        if os.environ.get("PINGME_SMTP_USER"):
+            smtp.login(os.environ["PINGME_SMTP_USER"], os.environ.get("PINGME_SMTP_PASSWORD", ""))
+        smtp.send_message(message)
+
+
+def send_notification(target: str, title: str, text: str, events: dict[str, list[dict]]) -> None:
+    """Deliver one notification. The URL decides the format:
+
+    Slack/Teams webhooks get {"text"}, Discord {"content"}, telegram://TOKEN@CHAT
+    uses the Bot API, mailto:a@b,c@d sends e-mail (PINGME_SMTP_* settings), and
+    any other http(s) URL receives the full JSON event payload.
+    """
+    lowered = target.lower()
+    if lowered.startswith("mailto:"):
+        _send_email(target[len("mailto:"):], title, text)
+    elif lowered.startswith("telegram://"):
+        token, _at, chat = target[len("telegram://"):].partition("@")
+        if not token or not chat:
+            raise ValueError("use telegram://BOT_TOKEN@CHAT_ID")
+        _post_json(f"https://api.telegram.org/bot{token}/sendMessage", {"chat_id": chat, "text": text})
+    elif "hooks.slack.com" in lowered or "webhook.office.com" in lowered or "logic.azure.com" in lowered:
+        _post_json(target, {"text": text})
+    elif "discord.com/api/webhooks" in lowered or "discordapp.com/api/webhooks" in lowered:
+        _post_json(target, {"content": text[:1900]})
+    elif lowered.startswith(("http://", "https://")):
+        _post_json(target, {
+            "source": "pingme", "version": VERSION, "title": title, "text": text,
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "events": {key: [{k: v for k, v in item.items() if not isinstance(v, (list, dict))} for item in items]
+                       for key, items in events.items() if items},
+        })
+    else:
+        raise ValueError(f"unsupported notification target: {target}")
+
+
+def notify_all(targets: list[str], title: str, events: dict[str, list[dict]], quiet: bool = False) -> int:
+    """Send to every target; failures are reported but never abort the scan. Returns failures."""
+    if not targets or not any(events.values()):
+        return 0
+    text = build_notification(title, events)
+    failures = 0
+    for target in targets:
+        shown = re.sub(r"(telegram://)[^@]+", r"\1***", target)
+        shown = re.sub(r"(/webhooks?/|/services/).*", r"\1***", shown)
+        try:
+            send_notification(target, title, text, events)
+            if not quiet:
+                print(f"  {C.DIM}[notify] sent → {shown}{C.RESET}")
+        except Exception as exc:
+            failures += 1
+            print(C.warn(f"  ⚠  Notification to {shown} failed: {exc}"), file=sys.stderr)
+    return failures
+
+
+# ─────────────────────────────────────────────────────────────────
+# UPTIME FROM HISTORY
+# ─────────────────────────────────────────────────────────────────
+def compute_uptime(history: list[dict]) -> list[dict]:
+    """Per-address availability across stored scans (probe errors are not counted as down)."""
+    stats: dict[str, dict] = {}
+    for scan in history:
+        timestamp = str(scan.get("timestamp", ""))[:19]
+        names = {r.get("ip"): r.get("hostname") or "" for r in scan.get("results", []) if isinstance(r, dict)}
+        for status, addresses in (("up", scan.get("alive", [])), ("down", scan.get("dead", [])),
+                                  ("error", scan.get("errors", []))):
+            for ip in addresses:
+                entry = stats.setdefault(ip, {"ip": ip, "name": "", "up": 0, "down": 0, "error": 0,
+                                              "last_up": "", "last_status": "", "streak": 0, "changes": 0})
+                entry[status] += 1
+                entry["name"] = names.get(ip) or entry["name"]
+                if status == "up":
+                    entry["last_up"] = timestamp
+                if status != "error":
+                    if entry["last_status"] and entry["last_status"] != status:
+                        entry["changes"] += 1
+                        entry["streak"] = 0
+                    entry["streak"] += 1
+                    entry["last_status"] = status
+    rows = []
+    for entry in stats.values():
+        tested = entry["up"] + entry["down"]
+        entry["availability"] = round(entry["up"] / tested * 100, 1) if tested else None
+        rows.append(entry)
+    return sorted(rows, key=lambda row: (row["availability"] if row["availability"] is not None else 101, ip_sort_key(row["ip"])))
+
+
+def show_uptime(label: str) -> int:
+    history = load_history(label)
+    if not history:
+        print(C.warn(f"  ⚠  No history for '{label}'. Run a scan first (without --no-history)."))
+        return EXIT_NOT_ALL_UP
+    rows = compute_uptime(history)
+    first, last = str(history[0].get("timestamp", ""))[:16], str(history[-1].get("timestamp", ""))[:16]
+    print(f"\n  {C.BOLD}{C.MAGENTA}UPTIME · {label}{C.RESET}  {C.DIM}{len(history)} scans, {first} → {last}{C.RESET}")
+    ip_w = max([15] + [len(r["ip"]) for r in rows])
+    name_w = min(32, max([8] + [len(r["name"]) for r in rows]))
+    header = f"  {'IP ADDRESS':<{ip_w}}  {'NAME':<{name_w}}  {'UPTIME':>7}  {'UP':>4}  {'DOWN':>4}  {'FLAPS':>5}  {'NOW':<10}  LAST SEEN UP"
+    print(f"{C.BOLD}{header}{C.RESET}")
+    for row in rows:
+        availability = row["availability"]
+        colour = C.GREEN if availability is not None and availability >= 99 else (
+            C.YELLOW if availability is not None and availability >= 90 else C.RED)
+        shown = "n/a" if availability is None else f"{availability:.1f}%"
+        now = f"{row['last_status'] or 'error'} ×{row['streak']}" if row["last_status"] else "error"
+        print(f"  {row['ip']:<{ip_w}}  {row['name'][:name_w]:<{name_w}}  {colour}{shown:>7}{C.RESET}  "
+              f"{row['up']:>4}  {row['down']:>4}  {row['changes']:>5}  {now:<10}  {row['last_up'] or '-'}")
+    print()
+    return EXIT_OK
+
+
+# ─────────────────────────────────────────────────────────────────
+# TRACEROUTE FOR DOWN HOSTS
+# ─────────────────────────────────────────────────────────────────
+TRACE_MAX_HOPS = 15
+TRACE_LIMIT = 10
+
+
+def _trace_command(ip: str) -> Optional[list[str]]:
+    base = ip.split("%", 1)[0]
+    ipv6 = ipaddress.ip_address(base).version == 6
+    if sys.platform == "win32":
+        tracert = shutil.which("tracert.exe") or shutil.which("tracert")
+        return [tracert, "-d", "-h", str(TRACE_MAX_HOPS), "-w", "1000", *(["-6"] if ipv6 else []), ip] if tracert else None
+    traceroute = shutil.which("traceroute6" if ipv6 and _is_bsd_ping() else "traceroute")
+    if traceroute:
+        family = ["-6"] if ipv6 and not traceroute.endswith("6") else []
+        return [traceroute, *family, "-n", "-q", "1", "-w", "1", "-m", str(TRACE_MAX_HOPS), ip]
+    tracepath = shutil.which("tracepath")
+    if tracepath:
+        return [tracepath, *(["-6"] if ipv6 else []), "-n", "-m", str(TRACE_MAX_HOPS), ip]
+    return None
+
+
+def parse_trace_output(ip: str, output: str) -> dict:
+    """Summarise traceroute/tracert/tracepath output: last answering hop and whether the target replied."""
+    hops: list[tuple[int, str]] = []
+    for line in output.splitlines():
+        match = re.match(r"^\s*(\d+)[:?]?\s+(.*)$", line)
+        if not match:
+            continue
+        number = int(match.group(1))
+        addresses = [a for a in _extract_ip_addresses(match.group(2)) if a != "0.0.0.0"]
+        if addresses:
+            hops.append((number, addresses[0]))
+    reached = any(_same_ip(address, ip) for _number, address in hops)
+    if not hops:
+        verdict = "no hop answered (local firewall, no route, or traceroute blocked)"
+        return {"last_hop": "", "hop": 0, "reached": False, "verdict": verdict}
+    number, address = hops[-1]
+    if reached:
+        verdict = "path is fine; the host itself ignores ping (try --tcp-ports)"
+    else:
+        verdict = f"path stops after {address} (hop {number})"
+    return {"last_hop": address, "hop": number, "reached": reached, "verdict": verdict}
+
+
+def trace_down_hosts(results: list[dict], quiet: bool = False) -> list[dict]:
+    """Run a traceroute to up to TRACE_LIMIT down hosts to show where the path breaks."""
+    down = [r for r in results if r.get("status") == "NO RESPONSE"][:TRACE_LIMIT]
+    if not down:
+        return []
+    if _trace_command(down[0]["ip"]) is None:
+        print(C.warn("  ⚠  --trace-down needs traceroute, tracepath, or tracert."), file=sys.stderr)
+        return []
+    if not quiet:
+        print(f"  {C.DIM}Tracing the path to {len(down)} down host(s)...{C.RESET}", flush=True)
+
+    def _trace(result: dict) -> dict:
+        command = _trace_command(result["ip"])
+        output = _run_resolution_command(command, timeout=TRACE_MAX_HOPS * 3 + 5, accepted_returncodes=(0, 1, 2)) if command else ""
+        return {"ip": result["ip"], **parse_trace_output(result["ip"], output)}
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        traces = list(pool.map(_trace, down))
+    # An on-link host that never answered ARP/ND needs no router to explain it.
+    unanswered = {
+        _normalise_probe_address(address) if family == 4 else _with_zone(address, zone)
+        for family in (4, 6) for address, zone, _mac, state in read_neighbor_entries(family)
+        if state in {"FAILED", "INCOMPLETE"}
+    }
+    for trace in traces:
+        if trace["ip"] in unanswered and not trace["reached"]:
+            trace["verdict"] = "on your local network but silent at layer 2: powered off, unplugged, or moved to another IP"
+    for trace in traces:
+        for result in results:
+            if result["ip"] == trace["ip"]:
+                result["trace"] = trace["verdict"]
+    if not quiet:
+        ip_w = max([15] + [len(t["ip"]) for t in traces])
+        print(f"\n  {C.BOLD}{C.MAGENTA}PATH TO DOWN HOSTS{C.RESET}")
+        for trace in traces:
+            colour = C.YELLOW if trace["reached"] else C.RED
+            print(f"  {C.WHITE}{trace['ip']:<{ip_w}}{C.RESET}  {colour}{trace['verdict']}{C.RESET}")
+        print()
+    return traces
+
+
+# ─────────────────────────────────────────────────────────────────
+# WAKE-ON-LAN
+# ─────────────────────────────────────────────────────────────────
+def magic_packet(mac: str) -> bytes:
+    digits = re.sub(r"[^0-9A-Fa-f]", "", _normalise_mac(mac))
+    if len(digits) != 12:
+        raise ValueError(f"invalid MAC address: {mac}")
+    return b"\xff" * 6 + bytes.fromhex(digits) * 16
+
+
+def send_wake_on_lan(macs: list[str], broadcast: str = "255.255.255.255") -> list[str]:
+    """Send magic packets to UDP ports 9 and 7; returns the MACs that were sent."""
+    sent = []
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for mac in macs:
+            packet = magic_packet(mac)
+            for port in (9, 7):
+                sock.sendto(packet, (broadcast, port))
+            sent.append(_normalise_mac(mac))
+    return sent
+
+
+def known_macs(label: str, addresses: set[str]) -> dict[str, str]:
+    """MAC addresses remembered for these IPs in history, newest first, plus the live neighbor table."""
+    found: dict[str, str] = {}
+    for scan in reversed(load_history(label)):
+        for result in scan.get("results", []):
+            if isinstance(result, dict) and result.get("ip") in addresses and result.get("mac"):
+                found.setdefault(result["ip"], result["mac"])
+    for family in (4, 6):
+        for address, _zone, mac, _state in read_neighbor_entries(family):
+            normalized = _normalise_probe_address(address)
+            if normalized in addresses and mac:
+                found.setdefault(normalized, _normalise_mac(mac))
+    return found
+
+
+# ─────────────────────────────────────────────────────────────────
+# NMAP XML EXPORT / IMPORT
+# ─────────────────────────────────────────────────────────────────
+def write_nmap_xml(results: list[dict], path: str, command: str, started: float) -> Path:
+    """Write results as nmap-compatible XML (-oX), readable by tools that import nmap scans."""
+    from xml.sax.saxutils import quoteattr
+    destination = Path(path).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    finished = time.time()
+    up = sum(1 for r in results if r["alive"])
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<nmaprun scanner="pingme" args={quoteattr(command)} start="{int(started)}" version="{VERSION}" xmloutputversion="1.05">',
+    ]
+    for result in results:
+        base = result["ip"].split("%", 1)[0]
+        family = "ipv6" if ipaddress.ip_address(base).version == 6 else "ipv4"
+        state = "up" if result["alive"] else "down"
+        reason = "echo-reply" if result.get("icmp_alive") else ("syn-ack" if result.get("tcp_open") else (
+            "arp-response" if result.get("arp") else "no-response"))
+        lines.append(f'<host><status state="{state}" reason="{reason}"/>')
+        lines.append(f'<address addr={quoteattr(base)} addrtype="{family}"/>')
+        if result.get("mac"):
+            vendor = f" vendor={quoteattr(result['vendor'])}" if result.get("vendor") else ""
+            lines.append(f'<address addr={quoteattr(result["mac"].upper())} addrtype="mac"{vendor}/>')
+        if result.get("hostname"):
+            lines.append(f'<hostnames><hostname name={quoteattr(result["hostname"])} type="PTR"/></hostnames>')
+        if result.get("tcp_open"):
+            lines.append("<ports>" + "".join(
+                f'<port protocol="tcp" portid="{port}"><state state="open" reason="syn-ack"/></port>'
+                for port in result["tcp_open"]) + "</ports>")
+        if result.get("rtt_avg") is not None:
+            lines.append(f'<times srtt="{int(result["rtt_avg"] * 1000)}" rttvar="0" to="0"/>')
+        lines.append("</host>")
+    lines.append(f'<runstats><finished time="{int(finished)}" elapsed="{finished - started:.2f}"/>'
+                 f'<hosts up="{up}" down="{len(results) - up}" total="{len(results)}"/></runstats>')
+    lines.append("</nmaprun>")
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return destination
+
+
+def read_nmap_xml_targets(text: str) -> list[tuple[str, str]]:
+    """(hostname, address) pairs from an nmap -oX file; hosts nmap saw as down are kept too."""
+    import xml.etree.ElementTree as ElementTree
+    # nmap writes a bare <!DOCTYPE nmaprun>. Entity declarations or an internal DTD
+    # subset could expand maliciously, so those are refused.
+    if "<!ENTITY" in text or re.search(r"<!DOCTYPE[^>]*\[", text):
+        raise ValueError("XML with entity declarations or an internal DTD is not accepted")
+    text = re.sub(r"<!DOCTYPE[^>]*>", "", text, count=1)
+    root = ElementTree.fromstring(text)
+    pairs: list[tuple[str, str]] = []
+    for host in root.iter("host"):
+        address = next((a.get("addr", "") for a in host.iter("address") if a.get("addrtype") in {"ipv4", "ipv6"}), "")
+        name = next((h.get("name", "") for h in host.iter("hostname")), "")
+        if address:
+            pairs.append((name or address, address))
+    return pairs
+
+
+# ─────────────────────────────────────────────────────────────────
+# HTML REPORT
+# ─────────────────────────────────────────────────────────────────
+_HTML_STYLE = """
+:root{--bg:#f7f8fa;--card:#fff;--text:#1d2330;--muted:#687083;--line:#e3e6ec;--up:#1f9d55;--down:#d64545;
+--warn:#c98a00;--other:#8a93a6;--accent:#5b5bd6}
+@media (prefers-color-scheme:dark){:root{--bg:#12151c;--card:#1a1f29;--text:#e6e9ef;--muted:#9aa3b5;--line:#2a3140;
+--up:#3ccf7e;--down:#ff6b6b;--warn:#f0b429;--other:#8a93a6;--accent:#8b8bff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:1200px;margin:0 auto;padding:24px 16px 48px}h1{margin:0 0 4px;font-size:22px}h2{font-size:16px;margin:32px 0 12px}
+.meta{color:var(--muted);font-size:13px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:20px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}.card b{display:block;font-size:26px;font-variant-numeric:tabular-nums}
+.card span{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--line);margin:4px 0 20px}
+.bar i{display:block;height:100%}.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+.controls input{flex:1;min-width:180px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}
+.chip{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:6px 12px;cursor:pointer;font:inherit}
+.chip[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{position:sticky;top:0;background:var(--card);cursor:pointer;user-select:none;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+tr:last-child td{border-bottom:0}.s{font-weight:600}.REACHABLE{color:var(--up)}.NO.RESPONSE,.NO_RESPONSE{color:var(--down)}
+.PROBE_ERROR,.UNRESOLVED{color:var(--warn)}.EXCLUDED,.NOT_SCANNED{color:var(--other)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+footer{margin-top:32px;color:var(--muted);font-size:12px}
+"""
+
+_HTML_SCRIPT = """
+const rows=[...document.querySelectorAll('#t tbody tr')];let filter='all';
+function apply(){const q=document.getElementById('q').value.toLowerCase();
+rows.forEach(r=>{const okS=filter==='all'||r.dataset.status===filter;const okQ=!q||r.textContent.toLowerCase().includes(q);r.hidden=!(okS&&okQ);});}
+document.getElementById('q').addEventListener('input',apply);
+document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',()=>{filter=c.dataset.f;
+document.querySelectorAll('.chip').forEach(x=>x.setAttribute('aria-pressed',x===c));apply();}));
+document.querySelectorAll('#t th').forEach((th,i)=>th.addEventListener('click',()=>{const asc=th.dataset.asc!=='1';th.dataset.asc=asc?'1':'0';
+const key=r=>{const v=r.children[i].dataset.v??r.children[i].textContent;const n=parseFloat(v);return isNaN(n)?v:n;};
+rows.sort((a,b)=>{const x=key(a),y=key(b);return (x>y?1:x<y?-1:0)*(asc?1:-1);});const tb=document.querySelector('#t tbody');rows.forEach(r=>tb.appendChild(r));}));
+"""
+
+
+def render_html_report(title: str, records: list[dict], uptime: Optional[list[dict]] = None, meta: str = "") -> str:
+    """A self-contained HTML report (no external files) with filters and sortable columns."""
+    from html import escape
+    counts = _status_counts(records)
+    total = len(records) or 1
+    columns = [c for c in _STATUS_COLUMNS
+               if c[1] not in {"mac", "vendor", "name", "tags"} or any(r.get(c[1]) for r in records)]
+    uptime_by_ip = {row["ip"]: row for row in (uptime or [])}
+    if uptime_by_ip:
+        columns.append(("UPTIME", "uptime", 0, 0))
+
+    def cell(record: dict, key: str) -> str:
+        if key == "uptime":
+            row = uptime_by_ip.get(record.get("ip", ""))
+            value = "" if not row or row["availability"] is None else f"{row['availability']:.1f}%"
+            return f'<td data-v="{escape(value.rstrip("%") or "-1")}">{escape(value)}</td>'
+        value = record.get(key, "")
+        value = " ".join(value) if isinstance(value, list) else str(value)
+        css = f' class="s {escape(value.replace(" ", "_"))}"' if key == "status" else (
+            ' class="mono"' if key in {"ip", "mac"} else "")
+        sort_value = ""
+        if key == "ip":
+            base = value.split("%", 1)[0]
+            try:
+                sort_value = f' data-v="{ipaddress.ip_address(base).version}{int(ipaddress.ip_address(base)):040d}"'
+            except ValueError:
+                sort_value = ""
+        return f"<td{css}{sort_value}>{escape(value)}</td>"
+
+    head = "".join(f"<th>{escape(header)}</th>" for header, _key, *_ in columns)
+    body = "\n".join(
+        f'<tr data-status="{escape(r.get("status", ""))}">' + "".join(cell(r, key) for _h, key, *_ in columns) + "</tr>"
+        for r in records
+    )
+    segments = [("REACHABLE", counts["reachable"], "var(--up)"), ("NO RESPONSE", counts["no_response"], "var(--down)"),
+                ("PROBE ERROR", counts["probe_error"], "var(--warn)"), ("UNRESOLVED", counts["unresolved"], "var(--warn)"),
+                ("OTHER", counts["other"], "var(--other)")]
+    bar = "".join(f'<i style="width:{n / total * 100:.2f}%;background:{colour}" title="{label}: {n}"></i>'
+                  for label, n, colour in segments if n)
+    cards = "".join(f'<div class="card"><b>{n}</b><span>{label}</span></div>'
+                    for label, n in (("Targets", len(records)), ("Reachable", counts["reachable"]),
+                                     ("No response", counts["no_response"]), ("Probe errors", counts["probe_error"]),
+                                     ("Unresolved", counts["unresolved"])))
+    chips = "".join(f'<button class="chip" data-f="{value}" aria-pressed="{str(value == "all").lower()}">{label}</button>'
+                    for value, label in (("all", "All"), ("REACHABLE", "Reachable"), ("NO RESPONSE", "No response"),
+                                         ("PROBE ERROR", "Errors"), ("UNRESOLVED", "Unresolved")))
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{escape(title)}</title><style>{_HTML_STYLE}</style></head>
+<body><main>
+<h1>{escape(title)}</h1><div class="meta">{escape(meta)}</div>
+<div class="cards">{cards}</div><div class="bar">{bar}</div>
+<h2>Targets</h2>
+<div class="controls"><input id="q" type="search" placeholder="Filter by name, IP, MAC, vendor…" aria-label="Filter">{chips}</div>
+<div class="wrap"><table id="t"><thead><tr>{head}</tr></thead><tbody>
+{body}
+</tbody></table></div>
+<footer>Generated by PingMe {VERSION} · {escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))} · click a column to sort</footer>
+</main><script>{_HTML_SCRIPT}</script></body></html>
+"""
+
+
+def write_html_report(path: str, title: str, records: list[dict], uptime: Optional[list[dict]], meta: str) -> Path:
+    destination = Path(path).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(render_html_report(title, records, uptime, meta), encoding="utf-8")
+    return destination
+
+
+def records_for_results(results: list[dict], rows: list[dict]) -> list[dict]:
+    """Status records for every scanned target: the given host/file rows plus bare IP rows for the rest."""
+    covered = {str(row.get("ip")) for row in rows}
+    extra = [{"host": r.get("hostname") or r["ip"], "ip": r["ip"], "type": "DIRECT IP"}
+             for r in results if r["ip"] not in covered]
+    return build_file_status_records(rows + extra, results)
+
+
+# ─────────────────────────────────────────────────────────────────
+# SERVE: PROMETHEUS METRICS AND JSON API
+# ─────────────────────────────────────────────────────────────────
+def _prom_label(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def render_metrics(results: list[dict], names: dict[str, str], duration: float, finished_at: float) -> str:
+    """Prometheus text exposition for the latest scan."""
+    lines = [
+        "# HELP pingme_up 1 if the target answered (ICMP, TCP, or ARP/ND), else 0.",
+        "# TYPE pingme_up gauge",
+    ]
+    for r in results:
+        labels = f'ip="{_prom_label(r["ip"])}",host="{_prom_label(names.get(r["ip"]) or r.get("hostname") or "")}"'
+        lines.append(f"pingme_up{{{labels}}} {1 if r['alive'] else 0}")
+    lines += ["# HELP pingme_rtt_milliseconds Average echo round-trip time.", "# TYPE pingme_rtt_milliseconds gauge"]
+    lines += [f'pingme_rtt_milliseconds{{ip="{_prom_label(r["ip"])}"}} {r["rtt_avg"]}' for r in results if r.get("rtt_avg") is not None]
+    lines += ["# HELP pingme_packet_loss_ratio Share of echo requests without a reply.", "# TYPE pingme_packet_loss_ratio gauge"]
+    lines += [f'pingme_packet_loss_ratio{{ip="{_prom_label(r["ip"])}"}} {r["loss_pct"] / 100:.4f}'
+              for r in results if r.get("loss_pct") is not None]
+    lines += ["# HELP pingme_probe_error 1 if the probe itself failed.", "# TYPE pingme_probe_error gauge"]
+    lines += [f'pingme_probe_error{{ip="{_prom_label(r["ip"])}"}} 1' for r in results if r.get("status") == "PROBE ERROR"]
+    lines += [
+        "# HELP pingme_targets Targets by status in the latest scan.", "# TYPE pingme_targets gauge",
+        *(f'pingme_targets{{status="{status}"}} {sum(1 for r in results if r.get("status") == status)}'
+          for status in ("REACHABLE", "NO RESPONSE", "PROBE ERROR")),
+        "# HELP pingme_scan_duration_seconds Duration of the latest scan.", "# TYPE pingme_scan_duration_seconds gauge",
+        f"pingme_scan_duration_seconds {duration:.3f}",
+        "# HELP pingme_last_scan_timestamp_seconds Unix time the latest scan finished.",
+        "# TYPE pingme_last_scan_timestamp_seconds gauge",
+        f"pingme_last_scan_timestamp_seconds {finished_at:.0f}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def serve_scans(bind: str, interval: float, run_once: Callable[[], list[dict]], names: dict[str, str],
+                rows: list[dict], title: str) -> int:
+    """Rescan every ``interval`` seconds and serve /metrics, /api/results, and an HTML page."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    host, _sep, port_text = bind.rpartition(":")
+    host = (host or "127.0.0.1").strip("[]")
+    try:
+        port = int(port_text)
+    except ValueError:
+        print(C.err(f"  ✗ --serve expects [HOST:]PORT, got '{bind}'"), file=sys.stderr)
+        return EXIT_USAGE
+    state = {"results": [], "duration": 0.0, "finished": 0.0}
+    state_lock = threading.Lock()
+    stop = threading.Event()
+
+    def _loop() -> None:
+        while not stop.is_set():
+            started = time.time()
+            try:
+                results = run_once()
+            except Exception as exc:  # keep serving the last good scan
+                print(C.warn(f"  ⚠  Scan failed: {exc}"), file=sys.stderr)
+                results = None
+            if results is not None:
+                with state_lock:
+                    state.update(results=results, duration=time.time() - started, finished=time.time())
+            stop.wait(interval)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args) -> None:
+            pass
+
+        def _send(self, body: str, content_type: str, status: int = 200) -> None:
+            data = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self) -> None:
+            with state_lock:
+                results, duration, finished = list(state["results"]), state["duration"], state["finished"]
+            path = self.path.split("?", 1)[0]
+            if path == "/metrics":
+                self._send(render_metrics(results, names, duration, finished), "text/plain; version=0.0.4; charset=utf-8")
+            elif path == "/api/results":
+                self._send(json.dumps({"finished": finished, "duration": duration, "results": results}, indent=1),
+                           "application/json")
+            elif path in {"/", "/index.html"}:
+                records = records_for_results(results, rows)
+                meta = (f"Last scan {datetime.fromtimestamp(finished).strftime('%H:%M:%S')} · refreshes every "
+                        f"{_format_seconds(interval)} s") if finished else "First scan in progress…"
+                page = render_html_report(title, records, None, meta).replace(
+                    "<head>", f'<head><meta http-equiv="refresh" content="{max(5, int(interval))}">', 1)
+                self._send(page, "text/html; charset=utf-8")
+            elif path == "/healthz":
+                self._send("ok\n" if finished else "starting\n", "text/plain", 200 if finished else 503)
+            else:
+                self._send("not found\n", "text/plain", 404)
+
+    try:
+        server = ThreadingHTTPServer((host, port), Handler)
+    except OSError as exc:
+        print(C.err(f"  ✗ Cannot listen on {host}:{port}: {exc}"), file=sys.stderr)
+        return EXIT_ENVIRONMENT
+    worker = threading.Thread(target=_loop, daemon=True)
+    worker.start()
+    shown = f"[{host}]" if ":" in host else host
+    print(f"  {C.CYAN}Serving on http://{shown}:{port}/  (metrics: /metrics, JSON: /api/results) — "
+          f"rescanning every {_format_seconds(interval)} s. Ctrl+C stops.{C.RESET}")
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        print(C.warn("  ⚠  Listening beyond localhost: anyone who can reach this port can read the scan results."))
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        server.server_close()
+    print(f"\n  {C.DIM}Server stopped.{C.RESET}")
+    return EXIT_OK
+
+
+# ─────────────────────────────────────────────────────────────────
 # CONFIG FILE
 # ─────────────────────────────────────────────────────────────────
 CONFIG_TYPES: dict[str, type] = {
@@ -3121,6 +4505,9 @@ CONFIG_TYPES: dict[str, type] = {
     "max_hosts": int,
     "no_banner": bool,
     "exit_zero": bool,
+    "notify": list,
+    "notify_on": str,
+    "arp": bool,
 }
 
 CONFIG_TEMPLATE = """\
@@ -3144,6 +4531,9 @@ CONFIG_TEMPLATE = """\
 # max_hosts = 65536
 # no_banner = false
 # exit_zero = false
+# arp = true            # count ARP/ND replies as reachability evidence
+# notify = ["https://hooks.slack.com/services/XXX", "mailto:ops@example.com"]
+# notify_on = "changes" # changes | down | always
 """
 
 
@@ -3229,8 +4619,19 @@ def load_config(path: Path) -> dict:
             close = difflib.get_close_matches(dest, CONFIG_TYPES, n=1)
             hint = f" (did you mean '{close[0]}'?)" if close else ""
             raise ValueError(f"unknown setting '{key}'{hint}")
+        if dest == "notify" and isinstance(value, str):
+            value = [value]
+        if dest == "notify" and isinstance(value, list) and not all(isinstance(item, str) for item in value):
+            raise ValueError("'notify' must be a string or a list of strings")
         if dest == "tcp_ports" and isinstance(value, (list, int)) and not isinstance(value, bool):
             value = ",".join(str(item) for item in value) if isinstance(value, list) else str(value)
+        if dest == "timeout" and isinstance(value, str):
+            try:
+                value = _timeout_argument(value)
+            except argparse.ArgumentTypeError as exc:
+                raise ValueError(f"'{key}': {exc}") from None
+            config[dest] = value
+            continue
         if expected is float and isinstance(value, int) and not isinstance(value, bool):
             value = float(value)
         if not isinstance(value, expected) or (expected is not bool and isinstance(value, bool)):
@@ -3243,7 +4644,7 @@ def load_config(path: Path) -> dict:
 # CLI HELP / ARGUMENT PARSER
 # ─────────────────────────────────────────────────────────────────
 HELP_TOPICS = (
-    "targets", "scan", "discovery", "output", "history", "config",
+    "targets", "scan", "discovery", "output", "history", "alerts", "config",
     "exitcodes", "advanced", "examples",
 )
 
@@ -3266,7 +4667,7 @@ class ColorArgumentParser(argparse.ArgumentParser):
             return text
 
         text = re.sub(
-            r"(?m)^(usage:|Targets:|Discovery:|Scan Control:|Output:|History:|Advanced:|Help:|options:|positional arguments:)$",
+            r"(?m)^(usage:|Targets:|Discovery:|Scan Control:|Output:|History:|Alerts and Integrations:|Advanced:|Help:|options:|positional arguments:)$",
             lambda m: f"{C.BOLD}{C.MAGENTA}{m.group(1)}{C.RESET}",
             text,
         )
@@ -3337,6 +4738,8 @@ def print_quick_help() -> None:
     line("pingme --reverse 10.0.0.0/28", "look up hostnames for IPs, no ping")
     line("pingme 10.0.0.0/24 --watch 60", "rescan every minute and report changes")
     line("pingme --discover6", "find IPv6 hosts on your local networks")
+    line("pingme hosts.txt --html report.html", "shareable HTML report")
+    line("pingme hosts.txt --watch 60 --notify URL", "alert Slack/Teams/Discord/e-mail on changes")
     line("pingme --sub 10.0.0.0/22", "subnet calculator only")
 
     section("COMMON OPTIONS")
@@ -3385,6 +4788,9 @@ def print_topic_help(topic: str) -> int:
             ("--discover6 [IFACE ...]", "Find IPv6 hosts on local links (multicast + neighbor cache)."),
             ("-4 / -6", "Use only IPv4 or only IPv6 addresses (resolution and scanning)."),
             ("IPv6 forms", "2001:db8::10, [2001:db8::10], fe80::1%eth0, 2001:db8::/120."),
+            ("@tags / --tag TAG", "Tag file lines (web01 @prod) and scan only matching ones."),
+            ("--column NAME", "Take targets from one column of a CSV file with headers."),
+            ("scan.xml", "nmap -oX output files are read directly as target lists."),
             ("File lines", "'host', 'IP', 'IP host', 'host,IP', or 'IP,host'."),
         ]
     elif topic == "scan":
@@ -3400,7 +4806,8 @@ def print_topic_help(topic: str) -> int:
             ("--fast", "100 threads, 1 s timeout, 1 attempt (positives are still confirmed)."),
             ("--resume", "Continue a scan interrupted with Ctrl+C."),
             ("--watch SEC", "Rescan every SEC seconds and print only changes."),
-            ("--ping-tool MODE", "auto | fping | ping | ask (ask = choose interactively)."),
+            ("--ping-tool MODE", "auto | native | fping | ping | ask (ask = choose interactively)."),
+            ("--timeout auto", "Adapt the wait to measured round-trip times (native engine)."),
         ]
     elif topic == "discovery":
         _topic_header("DISCOVERY FEATURES", "Names, ports, and classification on top of ICMP.")
@@ -3408,7 +4815,10 @@ def print_topic_help(topic: str) -> int:
             ("--dns", "Resolve every scanned IP to a hostname (DNS, hosts, mDNS, NetBIOS)."),
             ("--no-dns", f"Skip name lookups (auto mode resolves up to {DNS_AUTO_LIMIT:,} targets)."),
             ("-r, --reverse IP/CIDR ...", "Only look up hostnames for addresses; no ping."),
-            ("--tcp-ports PORTS", "Also try ports like 22,80,443 or 8000-8010."),
+            ("--tcp-ports PORTS", "Also try ports: 22,443 or 8000-8010 or presets " + "|".join(TCP_PORT_PRESETS) + "."),
+            ("--no-arp", "Do not count ARP/ND replies as evidence (on by default for LAN hosts)."),
+            ("--trace-down", f"Traceroute up to {TRACE_LIMIT} down hosts to show where the path breaks."),
+            ("--update-oui", "Download the IEEE MAC vendor list (otherwise nmap/IEEE files are used)."),
             ("--tcp-timeout SEC", "TCP connect timeout (default 2); ports are tried in parallel."),
             ("--ipinfo IP ...", "Classify addresses as public, private, or special-use."),
         ]
@@ -3424,6 +4834,8 @@ def print_topic_help(topic: str) -> int:
             ("-q, --quiet", "Write files only; no terminal output."),
             ("--compact", "Summary line and file paths only."),
             ("--verbose", "Full interface even when output is redirected."),
+            ("--html FILE", "Self-contained HTML report with filters, sorting, and uptime."),
+            ("--nmap-xml FILE", "nmap-compatible XML for tools that import nmap scans."),
             ("--color MODE", "auto | always | never (NO_COLOR is honoured)."),
             ("--no-banner", "Hide the startup banner."),
         ]
@@ -3436,9 +4848,21 @@ def print_topic_help(topic: str) -> int:
             ("--history", "List stored scan histories."),
             ("--clear-history NAME|FILE", "Delete stored data for a label or target file."),
             ("--no-history", "Do not save this scan."),
+            ("--uptime LABEL|FILE", "Availability %, flaps, and last-seen per host from history."),
             ("--keep N", f"History entries kept per label (default {DEFAULT_HISTORY_KEEP}; 0 = all)."),
             ("--label NAME", "Stable name for history/resume data."),
             ("--data-dir DIR", f"Where state lives (default {_default_data_dir()})."),
+        ]
+    elif topic == "alerts":
+        _topic_header("ALERTS AND INTEGRATIONS", "Get told when something changes, or feed dashboards.")
+        rows = [
+            ("--notify URL", "Slack/Teams/Discord webhook, any https:// JSON endpoint (repeatable)."),
+            ("--notify telegram://T@C", "Telegram bot token T and chat id C."),
+            ("--notify mailto:a@b.c", "E-mail via PINGME_SMTP_HOST/PORT/USER/PASSWORD/FROM."),
+            ("--notify-on MODE", "changes (default) | down | always. --watch alerts on changes."),
+            ("--serve [HOST:]PORT", "Rescan every --watch SEC (default 60); /metrics, /api/results, /."),
+            ("--wake", "Wake-on-LAN for down hosts whose MAC was seen before."),
+            ("--wol MAC ...", "Send magic packets now (--wol-broadcast to pick the subnet)."),
         ]
     elif topic == "config":
         _topic_header("CONFIGURATION FILE", "Save your preferred defaults once.")
@@ -3464,9 +4888,11 @@ def print_topic_help(topic: str) -> int:
     elif topic == "advanced":
         _topic_header("ADVANCED NOTES", "Operational behavior and safety controls.")
         rows = [
-            ("Fail closed", "Reachable only with direct echo replies or an accepted TCP connection."),
+            ("Fail closed", "Reachable only with direct echo replies, an accepted TCP connection,"
+                            " or a fresh (REACHABLE) ARP/ND entry for an on-link host."),
             ("Confirmation", "Replies must come from separate ping processes (--min-replies)."),
-            ("fping", "Used for fast discovery; every positive is re-confirmed with ping."),
+            ("native", "Built-in ICMP socket: exact payload/source matching, no process per host."),
+            ("fping", "Batch discovery; every positive is re-confirmed with the system ping."),
             ("TTL hint", "OS-family guesses are heuristic, never definitive."),
             ("IPv6", "Hosts, files, CIDRs up to --max-hosts, and --discover6 for /64 LANs."),
             ("Link-local", "fe80:: addresses need a zone: fe80::1%eth0 (Windows: %12)."),
@@ -3489,6 +4915,12 @@ def print_topic_help(topic: str) -> int:
             ("pingme --sub 10.0.0.0/22", "subnet calculator"),
             ("pingme --ipinfo 8.8.8.8 192.168.1.1", "classify addresses"),
             ("pingme --diff alive_old.txt alive_new.txt", "compare two result files"),
+            ("pingme hosts.txt --changes --notify https://hooks.slack.com/…", "Slack alert on changes"),
+            ("pingme hosts.txt --html report.html", "shareable HTML report"),
+            ("pingme --uptime hosts.txt", "availability from history"),
+            ("pingme 10.0.0.0/24 --serve 9109", "Prometheus metrics + live page"),
+            ("pingme web01 --tcp-ports web,windows", "port presets"),
+            ("pingme --wol aa:bb:cc:dd:ee:ff", "wake a machine"),
             ("pingme --init-config", "create a config file for your defaults"),
         ]
         width = max(len(command) for command, _ in examples)
@@ -3536,6 +4968,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip one or more IP addresses or CIDRs")
     tg.add_argument("--max-hosts", type=int, default=65536, metavar="N",
                     help="Maximum subnet targets to expand (default: 65536)")
+    tg.add_argument("--tag", metavar="TAG", action="append",
+                    help="Only file lines tagged @TAG (repeatable)")
+    tg.add_argument("--column", metavar="NAME",
+                    help="Read targets from this column of a CSV file with a header row")
     tg.add_argument("--discover6", nargs="*", metavar="IFACE",
                     help="Find IPv6 hosts on local links (all interfaces if none given)")
     family = tg.add_mutually_exclusive_group()
@@ -3553,18 +4989,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip IP → hostname lookups")
     dg.add_argument("-r", "--reverse", metavar="IP/CIDR", nargs="+",
                     help="Only look up hostnames for addresses (no ping)")
+    dg.add_argument("--no-arp", dest="arp", action="store_false", default=True,
+                    help="Do not count ARP/ND replies as reachability evidence")
+    dg.add_argument("--update-oui", action="store_true",
+                    help="Download the IEEE MAC vendor database")
     dg.add_argument("--tcp-ports", metavar="PORTS",
                     help="TCP checks, e.g. 22,80,443 or 8000-8010")
     dg.add_argument("--tcp-timeout", type=float, default=2, metavar="SEC",
                     help="TCP connect timeout (default: 2)")
+    dg.add_argument("--trace-down", action="store_true",
+                    help=f"Traceroute up to {TRACE_LIMIT} down hosts to show where the path breaks")
     dg.add_argument("--ipinfo", metavar="IP", nargs="+",
                     help="Classify IP addresses as public/private/special")
 
     sg = p.add_argument_group("Scan Control")
     sg.add_argument("-t", "--threads", type=int, default=20, metavar="N",
                     help="Concurrent workers (default: 20)")
-    sg.add_argument("--timeout", type=float, default=2, metavar="SEC",
-                    help="Wait per ping in seconds, fractions allowed (default: 2)")
+    sg.add_argument("--timeout", type=_timeout_argument, default=2, metavar="SEC",
+                    help="Wait per ping in seconds, fractions allowed, or 'auto' (default: 2)")
     sg.add_argument("--count", type=int, default=2, metavar="N",
                     help="Ping attempts per host (default: 2)")
     sg.add_argument("--min-replies", type=int, default=2, metavar="N",
@@ -3573,7 +5015,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Extra rounds for non-responsive hosts (default: 0)")
     sg.add_argument("--rate", type=int, default=0, metavar="PPS",
                     help="Maximum packets/sec; 0 = unlimited")
-    sg.add_argument("--ping-tool", default="auto", choices=["auto", "fping", "ping", "ask"],
+    sg.add_argument("--ping-tool", default="auto", choices=["auto", "native", "fping", "ping", "ask"],
                     help="ICMP backend (default: auto)")
     sg.add_argument("--fast", action="store_true",
                     help="100 threads, 1s timeout, 1 attempt")
@@ -3595,6 +5037,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Change report written by --changes (default: changes.txt)")
     og.add_argument("--out-format", default="txt", choices=["txt", "csv", "json"],
                     help="Output format (default: txt)")
+    og.add_argument("--html", metavar="FILE",
+                    help="Write a self-contained HTML report")
+    og.add_argument("--nmap-xml", metavar="FILE",
+                    help="Write results as nmap-compatible XML")
     og.add_argument("--label", metavar="NAME",
                     help="History/resume label (default: derived from targets)")
     og.add_argument("-q", "--quiet", action="store_true",
@@ -3623,10 +5069,26 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Delete stored data for a label or target file")
     hg.add_argument("--no-history", action="store_true",
                     help="Do not save this scan to history")
+    hg.add_argument("--uptime", nargs="?", const=True, metavar="LABEL|FILE",
+                    help="Availability per host from stored history")
     hg.add_argument("--keep", type=int, default=DEFAULT_HISTORY_KEEP, metavar="N",
                     help=f"History entries kept per label (default: {DEFAULT_HISTORY_KEEP}; 0 = all)")
     hg.add_argument("--data-dir", metavar="DIR",
                     help="State directory (default: per-user data directory)")
+
+    ng = p.add_argument_group("Alerts and Integrations")
+    ng.add_argument("--notify", metavar="TARGET", action="append",
+                    help="Alert via Slack/Teams/Discord webhook, telegram://TOKEN@CHAT, mailto:, or any URL")
+    ng.add_argument("--notify-on", choices=["changes", "down", "always"], default="changes",
+                    help="When to alert (default: changes)")
+    ng.add_argument("--serve", metavar="[HOST:]PORT",
+                    help="Keep scanning and serve /metrics (Prometheus), /api/results, and a live page")
+    ng.add_argument("--wake", action="store_true",
+                    help="Send Wake-on-LAN to down hosts whose MAC is known")
+    ng.add_argument("--wol", metavar="MAC", nargs="+",
+                    help="Send Wake-on-LAN magic packets to MAC addresses and exit")
+    ng.add_argument("--wol-broadcast", metavar="IP", default="255.255.255.255",
+                    help="Broadcast address for Wake-on-LAN (default: 255.255.255.255)")
 
     ag = p.add_argument_group("Advanced")
     ag.add_argument("--config", metavar="FILE",
@@ -3648,6 +5110,16 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Show PingMe version and build")
 
     return p
+
+
+def _timeout_argument(value: str) -> Optional[float]:
+    """--timeout accepts seconds or 'auto' (adapt to measured round-trip times)."""
+    if str(value).strip().lower() == "auto":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected seconds or 'auto', got '{value}'") from None
 
 
 def _preparse(argv: list[str]) -> argparse.Namespace:
@@ -3764,8 +5236,20 @@ def _live_rows(results: list[dict]) -> list[dict]:
     ]
 
 
-def watch_scans(args: argparse.Namespace, ip_list: list[str], label: str, scan_kwargs: dict, first: list[dict]) -> int:
-    """Rescan on an interval and print one line per status change until Ctrl+C."""
+def watch_scans(
+    args: argparse.Namespace,
+    ip_list: list[str],
+    label: str,
+    scan_kwargs: dict,
+    first: list[dict],
+    status_rows: Optional[list[dict]] = None,
+) -> int:
+    """Rescan on an interval and print one line per status change until Ctrl+C.
+
+    Each round's changes are also sent to --notify targets, and --html is refreshed.
+    """
+    status_rows = status_rows or []
+    names = {str(row["ip"]): str(row["host"]) for row in status_rows}
     interval = args.watch
     previous = {result["ip"]: result for result in first}
     print(f"  {C.CYAN}👁  Watching {len(ip_list):,} targets every {_format_seconds(interval)}s — "
@@ -3780,6 +5264,7 @@ def watch_scans(args: argparse.Namespace, ip_list: list[str], label: str, scan_k
             rounds += 1
             stamp = datetime.now().strftime("%H:%M:%S")
             changes = 0
+            events: dict[str, list[dict]] = {"went_offline": [], "newly_online": []}
             for result in results:
                 before = previous.get(result["ip"])
                 old_status = before.get("status") if before else None
@@ -3789,6 +5274,11 @@ def watch_scans(args: argparse.Namespace, ip_list: list[str], label: str, scan_k
                 if changes == 1:
                     sys.stdout.write(_line_start())
                 name = f"  {C.DIM}{result['hostname']}{C.RESET}" if result.get("hostname") else ""
+                event = {"ip": result["ip"], "host": names.get(result["ip"]) or result.get("hostname", "")}
+                if result["alive"]:
+                    events["newly_online"].append(event)
+                elif result["status"] == "NO RESPONSE" and old_status == "REACHABLE":
+                    events["went_offline"].append(event)
                 if result["alive"]:
                     rtt = f"  {result['rtt_avg']}ms" if result.get("rtt_avg") is not None else ""
                     print(f"  {C.DIM}{stamp}{C.RESET}  {C.GREEN}▲ UP     {result['ip']:<18}{C.RESET}{rtt}{name}")
@@ -3806,6 +5296,12 @@ def watch_scans(args: argparse.Namespace, ip_list: list[str], label: str, scan_k
                 results, alive_file=args.alive_out, dead_file=args.dead_out,
                 error_file=args.error_out, out_format=args.out_format, quiet=True,
             )
+            # Watch mode alerts on transitions only; a repeating "still down" alert every round is noise.
+            if args.notify and any(events.values()):
+                notify_all(args.notify, f"PingMe watch · {stamp}", events, quiet=True)
+            if args.html:
+                write_html_report(args.html, f"PingMe watch · {label}", records_for_results(results, status_rows),
+                                  None, f"Round {rounds} · {stamp}")
     except KeyboardInterrupt:
         pass
     print(f"\n  {C.DIM}Watch stopped after {rounds} round(s).{C.RESET}\n")
@@ -3830,10 +5326,43 @@ def _configure_streams() -> None:
         pass
 
 
+def scan_events(
+    mode: str,
+    results: list[dict],
+    status_rows: list[dict],
+    change_groups: Optional[dict[str, list[dict]]],
+    previous_scan: Optional[dict],
+) -> dict[str, list[dict]]:
+    """Choose what a notification reports for --notify-on changes|down|always."""
+    names = {str(row["ip"]): str(row["host"]) for row in status_rows}
+    by_ip = {r["ip"]: {"ip": r["ip"], "host": names.get(r["ip"]) or r.get("hostname", "")} for r in results}
+    # Only targets someone listed (files, --host) are expected to be up; empty subnet
+    # addresses are not outages.
+    expected = {str(row["ip"]) for row in status_rows if not row.get("excluded")}
+    down = [by_ip[r["ip"]] for r in results if r.get("status") == "NO RESPONSE" and r["ip"] in expected]
+    unresolved = [{"host": row["host"], "ip": ""} for row in status_rows if row.get("ip") == "UNRESOLVED"]
+    if mode == "down":
+        return {"down": down, "unresolved": unresolved}
+    if mode == "always":
+        return {"down": down, "unresolved": unresolved,
+                "newly_online": [by_ip[r["ip"]] for r in results if r["alive"]]}
+    if change_groups is not None:
+        return {key: change_groups.get(key, []) for key in ("went_offline", "newly_online", "ip_changed", "mac_changed")}
+    if not previous_scan:
+        return {}
+    changes = history_changes(
+        previous_scan,
+        [r["ip"] for r in results if r["alive"]],
+        [r["ip"] for r in results if r.get("status") == "NO RESPONSE"],
+        [r["ip"] for r in results if r.get("status") == "PROBE ERROR"],
+    )
+    return {"went_offline": [by_ip[ip] for ip in changes["newly_down"] if ip in by_ip],
+            "newly_online": [by_ip[ip] for ip in changes["newly_up"] if ip in by_ip]}
+
+
 def _validate_ranges(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     checks = [
         ("--threads", args.threads, 1, 1000),
-        ("--timeout", args.timeout, 0.1, 30),
         ("--count", args.count, 1, 20),
         ("--min-replies", args.min_replies, 1, 20),
         ("--retry", args.retry, 0, 5),
@@ -3845,12 +5374,15 @@ def _validate_ranges(parser: argparse.ArgumentParser, args: argparse.Namespace) 
     for name, value, low, high in checks:
         if not low <= value <= high:
             parser.error(f"{name} must be between {low:g} and {high:,} (got {value:g})")
+    if args.timeout is not None and not 0.1 <= args.timeout <= 30:
+        parser.error(f"--timeout must be between 0.1 and 30 or 'auto' (got {args.timeout:g})")
     if args.watch is not None and args.watch < 1:
         parser.error("--watch must be at least 1 second")
     for name, value, choices in (
-        ("ping_tool", args.ping_tool, ("auto", "fping", "ping", "ask")),
+        ("ping_tool", args.ping_tool, ("auto", "native", "fping", "ping", "ask")),
         ("out_format", args.out_format, ("txt", "csv", "json")),
         ("color", args.color, ("auto", "always", "never")),
+        ("notify_on", args.notify_on, ("changes", "down", "always")),
     ):
         if value not in choices:
             parser.error(f"{name} must be one of {', '.join(choices)} (got '{value}')")
@@ -3910,7 +5442,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     _ADDRESS_FAMILY = args.family
     if args.tcp_ports:
         try:
-            args.tcp_ports = parse_tcp_ports(args.tcp_ports)
+            args.tcp_ports = parse_tcp_ports(expand_port_presets(args.tcp_ports))
         except ValueError as exc:
             parser.error(str(exc))
 
@@ -3937,6 +5469,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--watch needs scan targets (for example: pingme 10.0.0.0/24 --watch 60)")
     if args.watch and args.resume:
         parser.error("--watch and --resume cannot be combined")
+    if (args.tag or args.column) and not target_file:
+        parser.error("--tag and --column filter a target file (for example: pingme hosts.txt --tag prod)")
+    if args.serve and not args.scan:
+        parser.error("--serve needs scan targets (for example: pingme 10.0.0.0/24 --serve 9109)")
     hostnames_out = args.hostnames_out or ("hostnames.txt" if target_file else None)
     output_options = {
         "--alive-out": args.alive_out,
@@ -3979,6 +5515,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.reverse:
         return show_reverse_lookups(args.reverse, args.threads, args.max_hosts)
 
+    if args.update_oui:
+        return update_oui_database()
+
+    if args.wol:
+        try:
+            sent = send_wake_on_lan(args.wol, args.wol_broadcast)
+        except (ValueError, OSError) as exc:
+            print(C.err(f"  ✗ Wake-on-LAN failed: {exc}"), file=sys.stderr)
+            return EXIT_USAGE
+        print(C.ok(f"  ✔  Magic packet sent to {', '.join(sent)} via {args.wol_broadcast}"))
+        return EXIT_OK
+
+    if args.uptime is not None and not (args.targets or args.sub or args.file or args.host):
+        if args.uptime is True:
+            parser.error("--uptime needs a label or target file (see: pingme --history)")
+        uptime_label = args.uptime
+        if Path(uptime_label).expanduser().is_file():
+            uptime_label = _file_label(uptime_label)
+            _LEGACY_LABELS[uptime_label] = Path(args.uptime).stem
+        return show_uptime(uptime_label)
+
     if args.diff:
         diff_files(args.diff[0], args.diff[1]); return EXIT_OK
 
@@ -4017,7 +5574,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if target_file:
         file_targets, file_mappings = read_target_file(
-            target_file, hostnames_out or "hostnames.txt", args.quiet, progress=rich_output
+            target_file, hostnames_out or "hostnames.txt", args.quiet, progress=rich_output,
+            column=args.column, only_tags={tag.lower().lstrip("@") for tag in args.tag} if args.tag else None,
         )
         # Always show the original hostname-to-IP mapping before scanning.
         if rich_output:
@@ -4026,6 +5584,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not label:
             label = _file_label(target_file)
             _LEGACY_LABELS[label] = Path(target_file).stem
+            if args.tag or args.column:
+                # A filtered view needs its own baseline, or every skipped line looks "removed".
+                label += "-" + _safe_label("+".join(sorted(args.tag or [])) + (f"@{args.column}" if args.column else ""))
 
     neighbor_rows: list[dict] = []
     if args.discover6 is not None:
@@ -4040,7 +5601,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not args.quiet:
             shown = ", ".join(interfaces[:8]) + (f" (+{len(interfaces) - 8} more)" if len(interfaces) > 8 else "")
             print(f"  {C.CYAN}Discovering IPv6 neighbors on {shown}...{C.RESET}", flush=True)
-        neighbors = discover_ipv6_neighbors(interfaces, min(args.timeout, 2))
+        neighbors = discover_ipv6_neighbors(interfaces, min(args.timeout or 2, 2))
         for address, mac in neighbors.items():
             neighbor_rows.append({"host": mac or "-", "ip": address, "type": "IPv6 ND"})
         ip_list.extend(neighbors)
@@ -4132,7 +5693,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         tcp_ports = args.tcp_ports,
         tcp_timeout = args.tcp_timeout,
         min_replies = args.min_replies,
+        neighbors = NeighborEvidence(use_as_evidence=args.arp),
     )
+    status_rows = file_mappings + host_rows
+    if args.serve:
+        names = {str(row["ip"]): str(row["host"]) for row in status_rows if row.get("ip") != row.get("host")}
+        return serve_scans(
+            args.serve, args.watch or 60,
+            lambda: run_scan(ip_list, label=label, quiet=True, resumable=False, **scan_kwargs),
+            names, status_rows, f"PingMe · {target_file or ', '.join(subnets + hosts) or 'scan'}",
+        )
+
+    started_at = time.time()
+    previous_scan = (load_history(label) or [None])[-1]
     results = run_scan(ip_list, label=label, quiet=not rich_output, resume=args.resume, **scan_kwargs)
     interrupted = _STOP_EVENT.is_set()
 
@@ -4140,7 +5713,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     dead  = [r["ip"] for r in results if r.get("status") == "NO RESPONSE"]
     errors = [r["ip"] for r in results if r.get("status") == "PROBE ERROR"]
 
-    status_rows = file_mappings + host_rows
+    change_groups: Optional[dict[str, list[dict]]] = None
     if status_rows:
         source = target_file or "command line"
         title = "FILE SCAN STATUS" if target_file else "SCAN STATUS"
@@ -4153,7 +5726,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if args.changes and not interrupted:
             previous_changes = load_changes_state(label)
-            write_changes_report(
+            change_groups = write_changes_report(
                 previous_changes, status_records, target_file, args.changes_out,
                 display="none" if args.quiet else ("full" if rich_output else "summary"),
             )
@@ -4179,8 +5752,48 @@ def main(argv: Optional[list[str]] = None) -> int:
         verbose=rich_output,
     )
 
+    if args.trace_down and not interrupted:
+        trace_down_hosts(results, quiet=args.quiet)
+
+    if args.wake and not interrupted:
+        down = {r["ip"] for r in results if not r["alive"]}
+        macs = known_macs(label, down)
+        if macs:
+            try:
+                send_wake_on_lan(list(macs.values()), args.wol_broadcast)
+                if not args.quiet:
+                    print(C.ok(f"  ✔  Wake-on-LAN sent to {len(macs)} down host(s): "
+                               + ", ".join(f"{ip} ({mac})" for ip, mac in macs.items())))
+            except OSError as exc:
+                print(C.warn(f"  ⚠  Wake-on-LAN failed: {exc}"), file=sys.stderr)
+        elif down and not args.quiet:
+            print(C.warn("  ⚠  --wake: no MAC address is known for the down hosts yet "
+                         "(PingMe learns MACs from earlier scans on the same LAN)."))
+
+    if args.nmap_xml:
+        destination = write_nmap_xml(results, args.nmap_xml, " ".join(["pingme", *argv]), started_at)
+        if rich_output:
+            print(f"  {C.CYAN}[report] nmap XML → {destination}{C.RESET}")
+
     if not args.no_history and not interrupted:
         save_scan(label, results, announce=rich_output, keep=args.keep)
+
+    if args.uptime is not None and not interrupted:
+        show_uptime(label)
+
+    if args.html:
+        records = records_for_results(results, status_rows)
+        uptime_rows = compute_uptime(load_history(label)) if not args.no_history else None
+        meta = (f"{datetime.now().strftime('%Y-%m-%d %H:%M')} · engine {_PING_TOOL} · "
+                f"{len(results)} addresses · {time.time() - started_at:.1f} s")
+        destination = write_html_report(args.html, f"PingMe · {target_file or ', '.join(subnets + hosts) or label}",
+                                        records, uptime_rows, meta)
+        if not args.quiet:
+            print(f"  {C.CYAN}[report] HTML → {destination}{C.RESET}")
+
+    if args.notify and not interrupted:
+        events = scan_events(args.notify_on, results, status_rows, change_groups, previous_scan)
+        notify_all(args.notify, f"PingMe · {target_file or ', '.join(subnets + hosts) or label}", events, args.quiet)
 
     if args.compare:
         compare_history(label, alive, dead, errors, saved_current=not args.no_history and not interrupted)
@@ -4189,7 +5802,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return EXIT_INTERRUPTED
 
     if args.watch:
-        watch_scans(args, ip_list, label, scan_kwargs, results)
+        watch_scans(args, ip_list, label, scan_kwargs, results, status_rows)
 
     if rich_output:
         print()
@@ -4201,8 +5814,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     return scan_exit_code(results, monitored, unresolved)
 
 
+def _terminate(_signum, _frame) -> None:
+    """Treat SIGTERM (systemd, Docker, kill) like Ctrl+C so watch/serve shut down cleanly."""
+    raise KeyboardInterrupt
+
+
 def entrypoint() -> None:
     """Console entry point: maps interrupts and closed pipes to clean exits."""
+    try:
+        signal.signal(signal.SIGTERM, _terminate)
+    except (ValueError, OSError, AttributeError):
+        pass
     try:
         code = main()
     except KeyboardInterrupt:

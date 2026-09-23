@@ -1,0 +1,16 @@
+# Long-running scanner with Prometheus metrics on http://127.0.0.1:9109/metrics
+[Unit]
+Description=PingMe metrics exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+DynamicUser=yes
+StateDirectory=pingme
+Environment=PINGME_DATA_DIR=/var/lib/pingme
+ExecStart=/usr/local/bin/pingme /etc/pingme/targets.txt --serve 127.0.0.1:9109 --watch 60
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
