@@ -3811,7 +3811,7 @@ def read_target_file(
     """
     p = Path(path)
     if not p.exists():
-        print(C.err(f"  ✗ File not found: {path}")); sys.exit(1)
+        print(C.err(f"  ✗ File not found: {path}"), file=sys.stderr); sys.exit(EXIT_USAGE)
     if not p.is_file():
         print(C.err(f"  ✗ Target path is not a file: {path}")); sys.exit(1)
 
@@ -5291,7 +5291,7 @@ def build_parser() -> argparse.ArgumentParser:
     hg.add_argument("--keep", type=int, default=DEFAULT_HISTORY_KEEP, metavar="N",
                     help=f"History entries kept per label (default: {DEFAULT_HISTORY_KEEP}; 0 = all)")
     hg.add_argument("--data-dir", metavar="DIR",
-                    help="State directory (default: per-user data directory)")
+                    help="State directory (default: ./data)")
 
     ng = p.add_argument_group("Alerts and Integrations")
     ng.add_argument("--notify", metavar="TARGET", action="append",
