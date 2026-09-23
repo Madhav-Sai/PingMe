@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pingme-scanner"
+version = "3.3.0"
+description = "Fast, fail-closed ICMP/TCP host discovery with hostnames, change tracking, and subnet tools"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Madhav Sai" }]
+keywords = ["ping", "network", "scanner", "discovery", "fping", "sysadmin"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking :: Monitoring",
+]
+
+[project.scripts]
+pingme = "pingme:entrypoint"
+
+[tool.setuptools]
+py-modules = ["pingme"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 140
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

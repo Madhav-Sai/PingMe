@@ -21,8 +21,9 @@ SCRIPT = "pingme.py"
 MARKER_START = "# >>> pingme completion >>>"
 MARKER_END = "# <<< pingme completion <<<"
 
-PING_TOOLS = ["auto", "fping", "ping"]
+PING_TOOLS = ["auto", "fping", "ping", "ask"]
 OUTPUT_FORMATS = ["txt", "csv", "json"]
+COLOR_MODES = ["auto", "always", "never"]
 
 OPTIONS = [
     "-h", "--help", "--version", "help", "--help-topic", "--help-all",
@@ -30,11 +31,17 @@ OPTIONS = [
     "--scan", "--dns", "--tcp-ports", "--tcp-timeout", "--ipinfo",
     "-t", "--threads", "--timeout", "--count", "--retry", "--rate",
     "--ping-tool", "--fast", "--resume", "--alive-out", "--dead-out", "--error-out",
-    "--hostnames-out", "--changes-out", "--out-format", "--label", "--quiet", "--compact", "--verbose",
+    "--hostnames-out", "--changes-out", "--out-format", "--label", "-q", "--quiet", "--compact", "--verbose",
     "--no-banner", "--history", "--changes", "--compare", "--diff",
     "--clear-history", "--no-history",
+    "--no-dns", "-r", "--reverse", "--min-replies", "--watch", "--color", "--exit-zero",
+    "--keep", "--data-dir", "--config", "--no-config", "--init-config",
+    "--discover6", "-4", "--ipv4-only", "-6", "--ipv6-only",
 ]
-HELP_TOPICS = ["targets", "scan", "discovery", "output", "history", "advanced", "examples"]
+HELP_TOPICS = [
+    "targets", "scan", "discovery", "output", "history", "config",
+    "exitcodes", "advanced", "examples",
+]
 
 
 def color(code: str, text: str) -> str:
@@ -255,6 +262,8 @@ def install_windows_launcher(source: Path) -> Path:
 def zsh_completion() -> str:
     ping_tools = " ".join(PING_TOOLS)
     formats = " ".join(OUTPUT_FORMATS)
+    colors = " ".join(COLOR_MODES)
+    topics = " ".join(HELP_TOPICS)
 
     return f'''#compdef pingme
 
@@ -270,7 +279,25 @@ _pingme() {{
     '--scan[run host discovery scan]' \\
     '(-t --threads)'{{-t,--threads}}'[concurrent threads]:threads:' \\
     '--timeout[per-packet timeout in seconds]:seconds:' \\
-    '--count[packets per host]:count:' \\
+    '--count[ping attempts per host]:count:' \\
+    '--min-replies[replies required for reachable]:count:' \\
+    '--watch[rescan every N seconds]:seconds:' \\
+    '--no-dns[skip IP to hostname lookups]' \\
+    '--discover6[find IPv6 hosts on local links]:interface: ' \\
+    '(-4 --ipv4-only -6 --ipv6-only)'{{-4,--ipv4-only}}'[IPv4 addresses only]' \\
+    '(-4 --ipv4-only -6 --ipv6-only)'{{-6,--ipv6-only}}'[IPv6 addresses only]' \\
+    '(-r --reverse)'{{-r,--reverse}}'[look up hostnames for IPs or CIDRs]:IP or CIDR: ' \\
+    '--color[colored output]:mode:({colors})' \\
+    '--exit-zero[always exit 0 after a scan]' \\
+    '--keep[history entries kept per label]:count:' \\
+    '--data-dir[state directory]:directory:_files -/' \\
+    '--config[config file]:file:_files' \\
+    '--no-config[ignore the config file]' \\
+    '--init-config[create a config template]' \\
+    '--help-all[show every option]' \\
+    '--help-topic[focused help]:topic:({topics})' \\
+    '--version[show version]' \\
+    '*:target:_files' \\
     '--tcp-ports[TCP ports or ranges]:ports:' \\
     '--tcp-timeout[TCP connect timeout]:seconds:' \\
     '--max-hosts[maximum expanded CIDR hosts]:count:' \\
@@ -284,7 +311,9 @@ _pingme() {{
     '--no-history[do not save scan history]' \\
     '--changes[show simple hostname-aware changes]' \\
     '--compare[legacy IP-only comparison]' \\
-    '--quiet[suppress per-host output]' \\
+    '(-q --quiet)'{{-q,--quiet}}'[write files only]' \\
+    '--compact[summary and file paths only]' \\
+    '--verbose[full interface when redirected]' \\
     '--alive-out[alive hosts output file]:file:_files' \\
     '--dead-out[no-response hosts output file]:file:_files' \\
     '--error-out[probe errors output file]:file:_files' \\
@@ -304,6 +333,8 @@ def bash_completion() -> str:
     options = " ".join(OPTIONS)
     ping_tools = " ".join(PING_TOOLS)
     formats = " ".join(OUTPUT_FORMATS)
+    colors = " ".join(COLOR_MODES)
+    topics = " ".join(HELP_TOPICS)
 
     return f'''_pingme_completion() {{
     local cur prev
@@ -320,7 +351,19 @@ def bash_completion() -> str:
             COMPREPLY=( $(compgen -W "{formats}" -- "$cur") )
             return
             ;;
-        -f|--file|--alive-out|--dead-out|--error-out|--hostnames-out|--changes-out)
+        --color)
+            COMPREPLY=( $(compgen -W "{colors}" -- "$cur") )
+            return
+            ;;
+        help|--help-topic)
+            COMPREPLY=( $(compgen -W "{topics}" -- "$cur") )
+            return
+            ;;
+        --data-dir)
+            COMPREPLY=( $(compgen -d -- "$cur") )
+            return
+            ;;
+        -f|--file|--alive-out|--dead-out|--error-out|--hostnames-out|--changes-out|--config)
             COMPREPLY=( $(compgen -f -- "$cur") )
             return
             ;;
@@ -330,7 +373,11 @@ def bash_completion() -> str:
             ;;
     esac
 
-    COMPREPLY=( $(compgen -W "{options}" -- "$cur") )
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "{options}" -- "$cur") )
+    else
+        COMPREPLY=( $(compgen -f -- "$cur") $(compgen -W "help" -- "$cur") )
+    fi
 }}
 complete -F _pingme_completion pingme
 '''
@@ -369,6 +416,25 @@ def fish_completion() -> str:
         "out-format": "Output format",
         "label": "Custom history label",
         "no-banner": "Hide ASCII banner",
+        "no-dns": "Skip hostname lookups",
+        "discover6": "Find IPv6 hosts on local links",
+        "ipv4-only": "IPv4 addresses only",
+        "ipv6-only": "IPv6 addresses only",
+        "reverse": "Look up hostnames for IPs",
+        "min-replies": "Replies required for reachable",
+        "watch": "Rescan every N seconds",
+        "color": "Colored output",
+        "exit-zero": "Always exit 0 after a scan",
+        "keep": "History entries kept",
+        "data-dir": "State directory",
+        "config": "Config file",
+        "no-config": "Ignore the config file",
+        "init-config": "Create a config template",
+        "compact": "Summary only",
+        "verbose": "Full interface",
+        "changes": "Report changes since last scan",
+        "hostnames-out": "Full status report file",
+        "changes-out": "Changes report file",
     }
 
     lines = ["complete -c pingme -f"]
@@ -384,6 +450,7 @@ def fish_completion() -> str:
         [
             f"complete -c pingme -n '__fish_seen_argument -l ping-tool' -a '{' '.join(PING_TOOLS)}'",
             f"complete -c pingme -n '__fish_seen_argument -l out-format' -a '{' '.join(OUTPUT_FORMATS)}'",
+            f"complete -c pingme -n '__fish_seen_argument -l color' -a '{' '.join(COLOR_MODES)}'",
             "complete -c pingme -n '__fish_seen_argument -s f -l file -l alive-out -l dead-out -l error-out -l diff' -a '(__fish_complete_path)'",
         ]
     )
@@ -392,7 +459,7 @@ def fish_completion() -> str:
 
 
 def powershell_completion() -> str:
-    all_words = OPTIONS + PING_TOOLS + OUTPUT_FORMATS + HELP_TOPICS
+    all_words = OPTIONS + PING_TOOLS + OUTPUT_FORMATS + COLOR_MODES + HELP_TOPICS
     words = ",".join(repr(item) for item in all_words)
 
     return (

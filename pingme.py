@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              PingMe — Advanced Ping Scanner v3.2.3 by Madhav       ║
+║              PingMe — Advanced Ping Scanner v3.3.0 by Madhav       ║
 ║   Subnet Info · Ping Scan · TTL Fingerprint · Reverse DNS        ║
 ║   History · Diff · IP Classify · Retry · Resume · Rate-Limit     ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
 import argparse
+import asyncio
 import csv
+import difflib
+import hashlib
 import ipaddress
+import math
 import json
 import os
 import re
@@ -28,8 +32,8 @@ from typing import Callable, Optional, Union
 
 
 APP_NAME = "PingMe"
-VERSION = "3.2.3"
-BUILD = "bounded-linux-resolution"
+VERSION = "3.3.0"
+BUILD = "reliable-cross-platform"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -70,23 +74,146 @@ class C:
     def hi(text):   return f"{C.MAGENTA}{C.BOLD}{text}{C.RESET}"
 
 
+_COLOR_ENABLED = True
+
+
+def disable_colors() -> None:
+    """Blank every palette entry so output contains no ANSI escape sequences."""
+    global _COLOR_ENABLED
+    _COLOR_ENABLED = False
+    for attr in dir(C):
+        if not attr.startswith("_") and isinstance(getattr(C, attr), str):
+            setattr(C, attr, "")
+
+
+def colors_wanted(mode: Optional[str]) -> bool:
+    """Resolve --color auto|always|never, honouring the NO_COLOR convention."""
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
 # ─────────────────────────────────────────────────────────────────
 # HISTORY / PERSISTENCE
 # ─────────────────────────────────────────────────────────────────
+_DATA_DIR_OVERRIDE: Optional[Path] = None
+
+# Maps a current state label to the label a pre-3.3 release used for the same
+# targets, so existing baselines in ./data keep working after an upgrade.
+_LEGACY_LABELS: dict[str, str] = {}
+
+DEFAULT_HISTORY_KEEP = 50
+
+
+def _default_data_dir() -> Path:
+    """Per-user state directory, independent of the current working directory."""
+    override = os.environ.get("PINGME_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        return (Path(base) if base else Path.home() / "AppData" / "Local") / "PingMe"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "PingMe"
+    base = os.environ.get("XDG_DATA_HOME")
+    return (Path(base) if base else Path.home() / ".local" / "share") / "pingme"
+
+
 def _data_dir() -> Path:
-    """Always resolves to ./data relative to the CURRENT working directory."""
-    return Path(os.getcwd()) / "data"
+    return _DATA_DIR_OVERRIDE or _default_data_dir()
+
+
+def _legacy_data_dir() -> Path:
+    """Releases before 3.3 stored state in ./data under the working directory."""
+    return Path.cwd() / "data"
+
+
+_MAX_LABEL_LENGTH = 80
+
+
+def _safe_label(label: str) -> str:
+    """Filesystem-safe label; long ones are shortened with a hash so they stay unique.
+
+    Labels built from many hosts, subnets, or interfaces would otherwise exceed
+    the 255-byte filename limit once state-file prefixes are added.
+    """
+    safe = re.sub(r"[^\w.\-]", "_", label)
+    if len(safe) > _MAX_LABEL_LENGTH:
+        digest = hashlib.sha1(safe.encode("utf-8")).hexdigest()[:10]
+        safe = f"{safe[:_MAX_LABEL_LENGTH - 11]}-{digest}"
+    return safe
+
+
+def _state_name(kind: str, label: str) -> str:
+    safe = _safe_label(label)
+    return {
+        "history": f"{safe}.json",
+        "resume": f".resume_{safe}.json",
+        "changes": f".{safe}_changes.json",
+    }[kind]
+
+
+def _state_path(kind: str, label: str, create: bool = True) -> Path:
+    directory = _data_dir()
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    return directory / _state_name(kind, label)
+
+
+def _legacy_state_path(kind: str, label: str) -> Path:
+    return _legacy_data_dir() / _state_name(kind, _LEGACY_LABELS.get(label, label))
+
+
+def _read_state(kind: str, label: str) -> object:
+    """Read a JSON state file, falling back to the pre-3.3 ./data location."""
+    candidates = [_state_path(kind, label, create=False)]
+    legacy = _legacy_state_path(kind, label)
+    if legacy.resolve() != candidates[0].resolve():
+        candidates.append(legacy)
+    for path in candidates:
+        if path.is_file():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+    return None
+
+
+def _write_json_atomic(path: Path, data: object) -> None:
+    """Write JSON through a temporary file so an interrupted write never corrupts state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _remove_state(kind: str, label: str) -> bool:
+    removed = False
+    for path in (_state_path(kind, label, create=False), _legacy_state_path(kind, label)):
+        if path.is_file():
+            path.unlink()
+            removed = True
+    return removed
 
 
 def history_file(label: str) -> Path:
-    d = _data_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^\w.\-]", "_", label)
-    return d / f"{safe}.json"
+    return _state_path("history", label)
 
 
-def save_scan(label: str, results: list[dict], announce: bool = True):
-    """Save a scan. results = list of {ip, alive, ttl, os_guess, hostname, scope}"""
+def save_scan(label: str, results: list[dict], announce: bool = True, keep: int = DEFAULT_HISTORY_KEEP):
+    """Append a scan to the label's history, keeping only the newest ``keep`` entries (0 = all)."""
     alive = sorted(r["ip"] for r in results if r["alive"])
     dead  = sorted(r["ip"] for r in results if r.get("status") == "NO RESPONSE")
     errors = sorted(r["ip"] for r in results if r.get("status") == "PROBE ERROR")
@@ -98,66 +225,40 @@ def save_scan(label: str, results: list[dict], announce: bool = True):
         "errors":    errors,
         "results":   results,
     }
-    hf = history_file(label)
-    existing: list = []
-    if hf.exists():
-        try:
-            existing = json.loads(hf.read_text())
-        except Exception:
-            existing = []
-    if not isinstance(existing, list):
-        existing = []
+    existing = load_history(label)
     existing.append(data)
-    hf.write_text(json.dumps(existing, indent=2))
+    if keep > 0:
+        existing = existing[-keep:]
+    hf = history_file(label)
+    _write_json_atomic(hf, existing)
     if announce:
         print(f"  {C.DIM}[data] saved → {hf}{C.RESET}")
 
 
 def load_history(label: str) -> list[dict]:
-    hf = history_file(label)
-    if not hf.exists():
-        return []
-    try:
-        data = json.loads(hf.read_text())
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    data = _read_state("history", label)
+    return data if isinstance(data, list) else []
 
 
 # ─────────────────────────────────────────────────────────────────
 # RESUME / PARTIAL SAVE
 # ─────────────────────────────────────────────────────────────────
-def _resume_file(label: str) -> Path:
-    d = _data_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^\w.\-]", "_", label)
-    return d / f".resume_{safe}.json"
-
-
 def save_partial(label: str, done_results: list[dict], remaining: list[str]):
-    rf = _resume_file(label)
-    rf.write_text(json.dumps({
+    _write_json_atomic(_state_path("resume", label), {
         "label":     label,
         "timestamp": datetime.now().isoformat(),
         "done":      done_results,
         "remaining": remaining,
-    }, indent=2))
+    })
 
 
 def load_partial(label: str) -> Optional[dict]:
-    rf = _resume_file(label)
-    if not rf.exists():
-        return None
-    try:
-        return json.loads(rf.read_text())
-    except Exception:
-        return None
+    data = _read_state("resume", label)
+    return data if isinstance(data, dict) and isinstance(data.get("done"), list) else None
 
 
 def clear_partial(label: str):
-    rf = _resume_file(label)
-    if rf.exists():
-        rf.unlink()
+    _remove_state("resume", label)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -191,19 +292,32 @@ def ttl_color(os_guess: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────
-# REVERSE DNS
+# REVERSE DNS  (IP → hostname)
 # ─────────────────────────────────────────────────────────────────
-_dns_cache: dict[str, str] = {}
+_dns_cache: dict[tuple[str, bool], tuple[str, str]] = {}
 _dns_lock  = threading.Lock()
 
 
-def reverse_dns(ip: str, timeout: float = 1.5) -> str:
-    """Non-blocking reverse DNS with per-IP cache and timeout."""
-    with _dns_lock:
-        if ip in _dns_cache:
-            return _dns_cache[ip]
+def _clean_reverse_name(name: str, ip: str) -> str:
+    name = name.strip().rstrip(".")
+    if not name or _same_ip(name, ip) or not is_safe_hostname(name):
+        return ""
+    return name
+
+
+def _reverse_with_system(ip: str, timeout: float) -> str:
+    """Ask the OS resolver (DNS PTR, hosts file, and NSS providers) with a deadline."""
+    getent = shutil.which("getent") if sys.platform.startswith("linux") else None
+    if getent:
+        output = _run_resolution_command([getent, "hosts", ip], timeout=max(1, math.ceil(timeout)))
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and _same_ip(fields[0], ip):
+                return _clean_reverse_name(fields[1], ip)
+        return ""
 
     result = ""
+
     def _lookup():
         nonlocal result
         try:
@@ -211,36 +325,136 @@ def reverse_dns(ip: str, timeout: float = 1.5) -> str:
         except Exception:
             result = ""
 
-    t = threading.Thread(target=_lookup, daemon=True)
-    t.start()
-    t.join(timeout)
-    hostname = result if result and result != ip else ""
+    worker = threading.Thread(target=_lookup, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return _clean_reverse_name(result, ip)
 
+
+def _reverse_with_mdns(ip: str) -> str:
+    """Resolve a LAN device's .local name through Avahi when it is installed."""
+    avahi = shutil.which("avahi-resolve-address")
+    if not avahi:
+        return ""
+    output = _run_resolution_command([avahi, ip], timeout=2)
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and _same_ip(fields[0], ip):
+            return _clean_reverse_name(fields[1], ip)
+    return ""
+
+
+def _reverse_with_netbios(ip: str) -> str:
+    """Read a Windows computer name through NetBIOS (nbtstat or Samba's nmblookup)."""
+    if sys.platform == "win32":
+        nbtstat = shutil.which("nbtstat.exe") or shutil.which("nbtstat")
+        if not nbtstat:
+            return ""
+        output = _run_resolution_command([nbtstat, "-A", ip], timeout=3)
+        match = re.search(r"^\s*([^\s<]+)\s*<00>\s+UNIQUE", output, re.IGNORECASE | re.MULTILINE)
+        return _clean_reverse_name(match.group(1), ip) if match else ""
+    nmblookup = shutil.which("nmblookup")
+    if not nmblookup:
+        return ""
+    output = _run_resolution_command([nmblookup, "-A", ip], timeout=3)
+    for line in output.splitlines():
+        match = re.match(r"^\s*(\S+)\s+<00>\s+-\s+(?!<GROUP>)\S", line)
+        if match:
+            return _clean_reverse_name(match.group(1), ip)
+    return ""
+
+
+def reverse_lookup(ip: str, timeout: float = 1.5, deep: bool = False) -> tuple[str, str]:
+    """Resolve an IP to a hostname, returning ``(name, source)``.
+
+    The system resolver is always tried. With ``deep`` (used for hosts that
+    answered), private and link-local addresses also try mDNS and NetBIOS,
+    which name many LAN devices that have no DNS PTR record. Every step is
+    bounded, and results are cached per address.
+    """
+    key = (ip, deep)
     with _dns_lock:
-        _dns_cache[ip] = hostname
-    return hostname
+        if key in _dns_cache:
+            return _dns_cache[key]
+
+    address = ip.split("%", 1)[0]
+    lookups: list[tuple[str, Callable[[str], str]]] = [("dns", lambda value: _reverse_with_system(value, timeout))]
+    if deep and ip_classify(address)["scope"] in {"Private", "Link-Local"}:
+        lookups += [("mdns", _reverse_with_mdns), ("netbios", _reverse_with_netbios)]
+    found = ("", "")
+    for source, lookup in lookups:
+        name = lookup(address)
+        if name:
+            found = (name, source)
+            break
+    with _dns_lock:
+        _dns_cache[key] = found
+    return found
+
+
+def reverse_dns(ip: str, timeout: float = 1.5, deep: bool = False) -> str:
+    """Hostname for an IP, or an empty string when none is known."""
+    return reverse_lookup(ip, timeout, deep)[0]
 
 
 # ─────────────────────────────────────────────────────────────────
 # IP CLASSIFIER
 # ─────────────────────────────────────────────────────────────────
+_IPV6_SPECIAL: list[tuple[str, str, str, str, str]] = [
+    # (network, scope, rfc, description, colour attribute)
+    ("::ffff:0:0/96", "IPv4-mapped", "RFC 4291", "IPv4-mapped IPv6 address", "CYAN"),
+    ("64:ff9b::/96", "NAT64", "RFC 6052", "NAT64 well-known prefix", "CYAN"),
+    ("64:ff9b:1::/48", "NAT64", "RFC 8215", "Local-use NAT64 prefix", "CYAN"),
+    ("100::/64", "Reserved", "RFC 6666", "Discard-only prefix", "PURPLE"),
+    ("2001:db8::/32", "Documentation", "RFC 3849", "Documentation/example (2001:db8::/32)", "DIM"),
+    ("3fff::/20", "Documentation", "RFC 9637", "Documentation/example (3fff::/20)", "DIM"),
+    ("2001:2::/48", "Reserved", "RFC 5180", "Benchmarking (2001:2::/48)", "PURPLE"),
+    ("2001:20::/28", "Reserved", "RFC 7343", "ORCHIDv2 identifiers", "PURPLE"),
+    ("2001::/32", "Teredo", "RFC 4380", "Teredo tunnel", "ORANGE"),
+    ("2002::/16", "6to4", "RFC 3056", "6to4 tunnel", "ORANGE"),
+    ("fc00::/7", "Private", "RFC 4193", "IPv6 unique local address (fc00::/7)", "CYAN"),
+    ("fec0::/10", "Reserved", "RFC 3879", "Deprecated site-local address", "PURPLE"),
+]
+
+
+def ipv6_embedded_ipv4(address: ipaddress.IPv6Address) -> Optional[ipaddress.IPv4Address]:
+    """Return the IPv4 address carried by a mapped, NAT64, 6to4, or Teredo address."""
+    if address.ipv4_mapped:
+        return address.ipv4_mapped
+    if address.sixtofour:
+        return address.sixtofour
+    if address.teredo:
+        return address.teredo[1]  # the client's public address
+    if address in ipaddress.ip_network("64:ff9b::/96"):
+        return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    return None
+
+
+def ipv6_interface_id(address: ipaddress.IPv6Address) -> str:
+    """Describe the last 64 bits: an EUI-64 ID reveals the interface's MAC address."""
+    raw = address.packed
+    if raw[11] == 0xFF and raw[12] == 0xFE:
+        mac = bytes([raw[8] ^ 0x02]) + raw[9:11] + raw[13:16]
+        return "EUI-64 · MAC " + ":".join(f"{byte:02x}" for byte in mac)
+    if int(address) & 0xFFFFFFFFFFFFFFFF < 0x10000:
+        return "Manually assigned (low value)"
+    return "Random / privacy (no MAC exposed)"
+
+
 def ip_classify(ip_str: str) -> dict:
     try:
-        ip = ipaddress.ip_address(ip_str)
+        ip = ipaddress.ip_address(str(ip_str).strip().strip("[]").split("%", 1)[0])
     except ValueError:
         return {"scope": "Invalid", "color": C.RED, "rfc": "", "description": "Not a valid IP"}
 
+    if ip.version == 6:
+        return _classify_ipv6(ip)
+
     if ip.is_loopback:
-        if ip.version == 6:
-            return {"scope": "Loopback", "color": C.DIM, "rfc": "RFC 4291", "description": "IPv6 loopback (::1/128)"}
         return {"scope": "Loopback", "color": C.DIM, "rfc": "RFC 5735", "description": "Loopback (127.0.0.0/8)"}
     if ip.is_link_local:
-        if ip.version == 6:
-            return {"scope": "Link-Local", "color": C.YELLOW, "rfc": "RFC 4291", "description": "IPv6 link-local (fe80::/10)"}
         return {"scope": "Link-Local",     "color": C.YELLOW, "rfc": "RFC 3927", "description": "Link-local (169.254.0.0/16) — APIPA"}
     if ip.is_multicast:
-        if ip.version == 6:
-            return {"scope": "Multicast", "color": C.ORANGE, "rfc": "RFC 4291", "description": "IPv6 multicast (ff00::/8)"}
         return {"scope": "Multicast",      "color": C.ORANGE, "rfc": "RFC 5771", "description": "Multicast (224.0.0.0/4)"}
     if ip.is_reserved:
         return {"scope": "Reserved",       "color": C.PURPLE, "rfc": "RFC 1112", "description": "Reserved / future use"}
@@ -257,10 +471,6 @@ def ip_classify(ip_str: str) -> dict:
                 "description": "Shared address space / CGNAT (100.64.0.0/10)"}
 
     if ip.is_private:
-        if ip.version == 6:
-            if ip in ipaddress.ip_network("fc00::/7"):
-                return {"scope": "Private", "color": C.CYAN, "rfc": "RFC 4193", "description": "IPv6 unique local address (fc00::/7)"}
-            return {"scope": "Private", "color": C.CYAN, "rfc": "IANA", "description": "IPv6 special-purpose address"}
         for net, rfc, desc in [
             (ipaddress.ip_network("10.0.0.0/8"),     "RFC 1918", "Class A private (10.0.0.0/8)"),
             (ipaddress.ip_network("172.16.0.0/12"),  "RFC 1918", "Class B private (172.16.0.0/12)"),
@@ -273,8 +483,42 @@ def ip_classify(ip_str: str) -> dict:
     return {"scope": "Public", "color": C.LIME, "rfc": "IANA", "description": "Publicly routable address"}
 
 
+def _classify_ipv6(ip: ipaddress.IPv6Address) -> dict:
+    details: dict[str, str] = {}
+    embedded = ipv6_embedded_ipv4(ip)
+    if embedded is not None:
+        inner = ip_classify(str(embedded))
+        details["Embedded IPv4"] = f"{embedded} ({inner['scope']})"
+
+    if ip.is_loopback:
+        info = {"scope": "Loopback", "color": C.DIM, "rfc": "RFC 4291", "description": "IPv6 loopback (::1/128)"}
+    elif ip.is_unspecified:
+        info = {"scope": "Reserved", "color": C.PURPLE, "rfc": "RFC 4291", "description": "Unspecified address (::)"}
+    elif ip.is_link_local:
+        info = {"scope": "Link-Local", "color": C.YELLOW, "rfc": "RFC 4291", "description": "IPv6 link-local (fe80::/10)"}
+    elif ip.is_multicast:
+        info = {"scope": "Multicast", "color": C.ORANGE, "rfc": "RFC 4291", "description": "IPv6 multicast (ff00::/8)"}
+    else:
+        info = None
+        for network, scope, rfc, description, colour in _IPV6_SPECIAL:
+            if ip in ipaddress.ip_network(network):
+                info = {"scope": scope, "color": getattr(C, colour), "rfc": rfc, "description": description}
+                break
+        if info is None:
+            if ip in ipaddress.ip_network("2000::/3"):
+                info = {"scope": "Public", "color": C.LIME, "rfc": "RFC 4291", "description": "Global unicast address"}
+            else:
+                info = {"scope": "Reserved", "color": C.PURPLE, "rfc": "IANA", "description": "Unallocated / reserved IPv6 space"}
+
+    if not (ip.is_loopback or ip.is_unspecified or ip.is_multicast or embedded is not None):
+        details["Interface ID"] = ipv6_interface_id(ip)
+    if details:
+        info["details"] = details
+    return info
+
+
 def show_ipinfo(targets: list[str]):
-    LABEL_W, VALUE_W = 18, 36
+    LABEL_W, VALUE_W = 18, 44
     BW = LABEL_W + VALUE_W + 3
 
     def _border(l, r):
@@ -296,9 +540,16 @@ def show_ipinfo(targets: list[str]):
         info = ip_classify(ip_str)
         print(_border("├", "┤"))
         print(row("IP Address",   ip_str,               C.WHITE))
+        if info["scope"] != "Invalid":
+            parsed = ipaddress.ip_address(ip_str.strip().strip("[]").split("%", 1)[0])
+            print(row("Version",  f"IPv{parsed.version}", C.WHITE))
+            if parsed.version == 6:
+                print(row("Expanded", parsed.exploded, C.DIM + C.WHITE))
         print(row("Scope",        info["scope"],         info["color"] + C.BOLD))
         print(row("RFC / Auth",   info["rfc"],           C.DIM + C.WHITE))
         print(row("Description",  info["description"],   C.WHITE))
+        for label, value in info.get("details", {}).items():
+            print(row(label, value, C.TEAL))
 
     print(_border("└", "┘"))
     print()
@@ -336,8 +587,8 @@ def show_subnet_info(
     try:
         net = ipaddress.ip_network(cidr, strict=False)
     except ValueError as e:
-        print(C.err(f"\n  ✗ Invalid CIDR: {e}"))
-        sys.exit(1)
+        print(C.err(f"\n  ✗ Invalid CIDR: {e}"), file=sys.stderr)
+        sys.exit(EXIT_USAGE)
 
     if not display:
         return net
@@ -459,19 +710,27 @@ class RateLimiter:
         self._lock     = threading.Lock()
 
     def acquire(self, n: int = 1):
-        """Block until n tokens are available."""
+        """Block until n tokens are available.
+
+        A request larger than the bucket (n > rate) waits for a full bucket and
+        then borrows the rest, so later callers repay the debt. Waiting for n
+        tokens directly would never succeed because the bucket caps at rate.
+        """
         if self.rate <= 0:
             return
+        n = max(1, n)
+        needed = min(n, self.rate)
         while True:
             with self._lock:
                 now    = time.monotonic()
                 delta  = now - self.last_time
                 self.tokens    = min(self.rate, self.tokens + delta * self.rate)
                 self.last_time = now
-                if self.tokens >= n:
+                if self.tokens >= needed:
                     self.tokens -= n
                     return
-            time.sleep(0.01)
+                wait = (needed - self.tokens) / self.rate
+            time.sleep(min(max(wait, 0.001), 0.05))
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -483,6 +742,9 @@ _PING6_PATH: Optional[str] = shutil.which("ping6")
 
 # User-selected tool: "auto" | "fping" | "ping"
 _PING_TOOL: str = "auto"
+
+# Set on Ctrl+C so workers stop starting new probes while the scan winds down.
+_STOP_EVENT = threading.Event()
 
 
 def _use_fping() -> bool:
@@ -500,7 +762,14 @@ def _is_ipv6(ip: str) -> bool:
 
 
 def _normalise_probe_address(value: str) -> Optional[str]:
-    """Return a safe unicast probe address, or None for non-host destinations."""
+    """Return a safe unicast probe address, or None for non-host destinations.
+
+    Accepts the bracketed IPv6 form used in URLs (``[2001:db8::1]``) and keeps
+    an IPv6 zone (``fe80::1%eth0``), which link-local addresses need.
+    """
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
     base, separator, scope = value.partition("%")
     try:
         parsed = ipaddress.ip_address(base)
@@ -518,19 +787,53 @@ class ProbeExecutionError(RuntimeError):
     """The probe command could not complete normally or returned unusable output."""
 
 
+class EchoResult(tuple):
+    """An ``(alive, ttl)`` pair that also carries round-trip and loss evidence.
+
+    It compares equal to a plain tuple, so callers that only need the verdict
+    can keep unpacking two values.
+    """
+
+    rtts: list[float]
+    sent: int
+    received: int
+
+    def __new__(
+        cls,
+        alive: bool,
+        ttl: Optional[int],
+        rtts: Optional[list[float]] = None,
+        sent: int = 0,
+        received: int = 0,
+    ):
+        obj = super().__new__(cls, (alive, ttl))
+        obj.rtts = list(rtts or [])
+        obj.sent = sent
+        obj.received = received
+        return obj
+
+
 def _decode_probe_output(raw: object) -> str:
-    """Decode probe output without depending on translated human-readable text."""
+    """Decode command output without depending on translated human-readable text."""
     if isinstance(raw, str):
         return raw
     if not isinstance(raw, (bytes, bytearray)):
         return ""
-    for encoding in ("utf-8", "mbcs", "cp437", "cp1252"):
+    data = bytes(raw)
+    # UTF-16 is only plausible with a BOM or a high share of NUL bytes. Trying it
+    # unconditionally "succeeds" on most even-length byte strings and yields garbage.
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")) or (data and data.count(b"\x00") * 4 >= len(data)):
         try:
-            return bytes(raw).decode(encoding)
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    for encoding in ("utf-8", "mbcs", "cp437"):
+        try:
+            return data.decode(encoding)
         except (UnicodeDecodeError, LookupError):
             continue
     # IP addresses, TTL, and millisecond values are ASCII even in localized output.
-    return bytes(raw).decode("ascii", errors="ignore")
+    return data.decode("ascii", errors="ignore")
 
 
 def _same_ip(candidate: str, target: str) -> bool:
@@ -566,18 +869,25 @@ def _ping_integrity_error(stdout_text: str, stderr_text: str) -> Optional[str]:
     return None
 
 
-def _parse_system_ping_output(ip: str, stdout_text: str, windows: bool) -> tuple[bool, Optional[int]]:
-    """Accept only a direct echo-reply line whose source is the requested target.
+_RTT_RE = re.compile(r"\btime\s*[=<]\s*(\d+(?:[.,]\d+)?)\s*ms\b", re.IGNORECASE)
+
+
+def _parse_system_ping_output(ip: str, stdout_text: str, windows: bool) -> EchoResult:
+    """Accept only direct echo-reply lines whose source is the requested target.
 
     Packet summaries are intentionally ignored. In particular, Windows counts
     ICMP errors such as ``Destination host unreachable`` as received packets.
     """
     ipv6 = _is_ipv6(ip)
+    ttl: Optional[int] = None
+    rtts: list[float] = []
+    replies = 0
     for line in stdout_text.splitlines():
         if not _line_mentions_target(line, ip):
             continue
 
-        ttl_match = re.search(r"\bttl\s*[=:]\s*(\d+)\b", line, re.IGNORECASE)
+        # IPv4 reports TTL; IPv6 reports the hop limit ("ttl=" on Linux, "hlim=" on BSD/macOS).
+        ttl_match = re.search(r"\b(?:ttl|hlim)\s*[=:]\s*(\d+)\b", line, re.IGNORECASE)
         if windows:
             # Windows IPv4 echo replies include TTL. Its IPv6 replies omit TTL,
             # so require a target-sourced line containing an RTT in milliseconds.
@@ -590,11 +900,18 @@ def _parse_system_ping_output(ip: str, stdout_text: str, windows: bool) -> tuple
             direct_reply = bool(re.search(r"\b\d+\s+bytes\s+from\s+", line, re.IGNORECASE))
 
         if direct_reply:
-            return True, int(ttl_match.group(1)) if ttl_match else None
-    return False, None
+            replies += 1
+            if ttl is None and ttl_match:
+                ttl = int(ttl_match.group(1))
+            rtt_match = _RTT_RE.search(line)
+            if rtt_match:
+                rtts.append(float(rtt_match.group(1).replace(",", ".")))
+    if replies:
+        return EchoResult(True, ttl, rtts, received=replies)
+    return EchoResult(False, None)
 
 
-def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, Optional[int]]:
+def _ping_via_fping(ip: str, timeout: float, count: int) -> tuple[bool, Optional[int]]:
     """
     Use fping's script-oriented alive mode, matching ``fping -a`` control runs.
 
@@ -616,7 +933,7 @@ def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, Optional[i
             "-a",
             "-r", str(max(count - 1, 0)),
             "-B", "1.0",
-            "-t", str(timeout * 1000),
+            "-t", str(_timeout_ms(timeout)),
             ip,
         ])
         r = subprocess.run(
@@ -642,40 +959,75 @@ def _ping_via_fping(ip: str, timeout: int, count: int) -> tuple[bool, Optional[i
     return False, None
 
 
-def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, Optional[int]]:
+def _timeout_ms(timeout: float) -> int:
+    return max(1, int(round(timeout * 1000)))
+
+
+def _format_seconds(timeout: float) -> str:
+    """Render a timeout without a trailing .0 so integer-only pings accept it."""
+    return str(int(timeout)) if float(timeout).is_integer() else f"{timeout:g}"
+
+
+def _is_bsd_ping() -> bool:
+    """macOS and the BSDs share a ping whose -W is in milliseconds and exits 2 on no reply."""
+    return sys.platform == "darwin" or "bsd" in sys.platform
+
+
+def _system_ping_commands(ip: str, timeout: float, count: int) -> tuple[list[list[str]], float, tuple[int, ...], bool]:
+    """Build platform-specific ping commands.
+
+    Returns the command variants to try in order, the process deadline, the exit
+    codes that mean "completed with no reply", and whether a process deadline
+    should also be read as "no reply" (for pings without a per-reply timeout).
     """
-    OS ping confirmed behaviour on Kali (from debug output):
-      - Everything goes to STDOUT
-      - Dead:  "3 packets transmitted, 0 received, 100% packet loss"
-      - Alive: "3 packets transmitted, 3 received, 0% packet loss"
-      - TTL in per-packet lines: "64 bytes from ip: icmp_seq=1 ttl=128 time=22ms"
+    ipv6 = _is_ipv6(ip)
+    if sys.platform == "win32":
+        command = [_PING_PATH or "ping", "-n", str(count), "-w", str(_timeout_ms(timeout)), ip]
+        return [command], (count * timeout) + 5, (1,), False
+
+    if _is_bsd_ping():
+        if ipv6:
+            # BSD/macOS ping6 has no per-reply timeout option, so the process
+            # deadline bounds the wait and expiry means no reply was printed.
+            binary = _PING6_PATH or _PING_PATH or "ping6"
+            flag = [] if _PING6_PATH else ["-6"]
+            return [[binary, *flag, "-c", str(count), ip]], (count * timeout) + 1, (2,), True
+        binary = _PING_PATH or "ping"
+        return [
+            # -W is milliseconds here; a value in seconds would drop real replies.
+            [binary, "-c", str(count), "-W", str(_timeout_ms(timeout)), ip],
+            [binary, "-c", str(count), ip],
+        ], (count * timeout) + 10, (2,), False
+
+    if ipv6:
+        binary = _PING6_PATH or _PING_PATH or "ping"
+        flag = [] if _PING6_PATH else ["-6"]
+    else:
+        binary = _PING_PATH or "ping"
+        flag = []
+    interval = ["-i", "0.2"] if count > 1 else []
+    return [
+        [binary, *flag, "-c", str(count), "-W", _format_seconds(timeout), *interval, ip],
+        # Older or BusyBox pings reject fractional -W and sub-second intervals.
+        [binary, *flag, "-c", str(count), "-W", str(max(1, math.ceil(timeout))), ip],
+    ], (count * timeout) + 10, (1,), False
+
+
+def _ping_via_system(ip: str, timeout: float, count: int) -> EchoResult:
+    """
+    Run the OS ping and accept only direct echo-reply lines from the target.
 
     Rules:
       - Require a direct echo-reply line from the exact requested target
       - Ignore summary receive counts, which can include ICMP error packets
-      - Try with -i 0.5 first, fall back without it on command errors
+      - Treat the platform's documented "no reply" exit status as NO RESPONSE
+      - Try a compatible command variant when the first one is rejected
     """
-    if sys.platform == "win32":
-        cmds         = [[_PING_PATH or "ping", "-n", str(count), "-w", str(timeout * 1000), ip]]
-        proc_timeout = (count * timeout) + 5
-    else:
-        if _is_ipv6(ip):
-            ping_binary = _PING6_PATH or _PING_PATH or "ping"
-            ipv6_flag = [] if _PING6_PATH else ["-6"]
-            cmds = [
-                [ping_binary, *ipv6_flag, "-c", str(count), "-W", str(timeout), "-i", "0.5", ip],
-                [ping_binary, *ipv6_flag, "-c", str(count), "-W", str(timeout), ip],
-            ]
-            proc_timeout = (count * timeout) + 10
-        else:
-            cmds = [
-                [_PING_PATH or "ping", "-c", str(count), "-W", str(timeout), "-i", "0.5", ip],
-                [_PING_PATH or "ping", "-c", str(count), "-W", str(timeout), ip],
-            ]
-            proc_timeout = (count * timeout) + 10
+    commands, proc_timeout, no_reply_codes, deadline_is_no_reply = _system_ping_commands(ip, timeout, count)
+    windows = sys.platform == "win32"
 
     command_errors: list[str] = []
-    for cmd in cmds:
+    for cmd in commands:
         try:
             r = subprocess.run(
                 cmd,
@@ -684,6 +1036,9 @@ def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, Optional[
                 timeout=proc_timeout,
             )
         except subprocess.TimeoutExpired as exc:
+            if deadline_is_no_reply:
+                partial = _parse_system_ping_output(ip, _decode_probe_output(exc.stdout), windows)
+                return EchoResult(partial[0], partial[1], partial.rtts, count, partial.received)
             command_errors.append(f"process deadline exceeded: {exc}")
             continue
         except OSError as exc:
@@ -695,11 +1050,11 @@ def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, Optional[
         integrity_error = _ping_integrity_error(stdout_text, stderr_text)
         if integrity_error:
             raise ProbeExecutionError(f"invalid ICMP reply for {ip}: {integrity_error}")
-        alive, ttl = _parse_system_ping_output(ip, stdout_text, sys.platform == "win32")
-        if alive and r.returncode == 0:
-            return True, ttl
-        if r.returncode in (0, 1):
-            return False, None
+        parsed = _parse_system_ping_output(ip, stdout_text, windows)
+        if parsed[0] and r.returncode == 0:
+            return EchoResult(True, parsed[1], parsed.rtts, count, min(parsed.received, count))
+        if r.returncode == 0 or r.returncode in no_reply_codes:
+            return EchoResult(False, None, [], count, 0)
 
         detail = (stderr_text or stdout_text).strip().splitlines()
         command_errors.append(detail[-1] if detail else f"exit code {r.returncode}")
@@ -710,21 +1065,41 @@ def _ping_via_system(ip: str, timeout: int, count: int) -> tuple[bool, Optional[
 
 
 def _confirm_direct_echo(
-    ip: str, timeout: int, confirmations: int = 2
-) -> tuple[bool, Optional[int]]:
-    """Require independent successful ping processes for a positive result.
+    ip: str,
+    timeout: float,
+    attempts: int = 2,
+    min_replies: int = 2,
+    rate_limiter: Optional[RateLimiter] = None,
+) -> EchoResult:
+    """Require ``min_replies`` independent ping processes to see a direct reply.
 
-    Separate processes use separate ICMP request state and prevent one stray,
-    duplicated, or stale reply from satisfying the positive decision.
+    Up to ``attempts`` single-packet processes are run, so a lossy host can
+    still qualify (for example 2 replies out of 5 attempts). Separate processes
+    use separate ICMP request state and prevent one stray, duplicated, or stale
+    reply from satisfying the positive decision. Integrity errors abort at once.
     """
+    required = max(1, min_replies)
+    attempts = max(attempts, required)
     ttl: Optional[int] = None
-    for _ in range(max(2, confirmations)):
-        alive, observed_ttl = _ping_via_system(ip, timeout, 1)
-        if not alive:
-            return False, None
-        if observed_ttl is not None:
-            ttl = observed_ttl
-    return True, ttl
+    rtts: list[float] = []
+    sent = replies = 0
+    for attempt in range(attempts):
+        if replies + (attempts - attempt) < required or _STOP_EVENT.is_set():
+            break
+        if rate_limiter:
+            rate_limiter.acquire(1)
+        outcome = _ping_via_system(ip, timeout, 1)
+        sent += 1
+        if outcome[0]:
+            replies += 1
+            if outcome[1] is not None:
+                ttl = outcome[1]
+            rtts.extend(getattr(outcome, "rtts", []))
+            if replies >= required:
+                break
+    if replies >= required:
+        return EchoResult(True, ttl, rtts, sent, replies)
+    return EchoResult(False, None, [], sent, replies)
 
 
 def parse_tcp_ports(value: str) -> list[int]:
@@ -750,15 +1125,31 @@ def parse_tcp_ports(value: str) -> list[int]:
     return ports
 
 
-def tcp_open_ports(ip: str, ports: list[int], timeout: int) -> list[int]:
-    open_ports: list[int] = []
-    for port in ports:
+TCP_CONCURRENCY = 64
+
+
+async def _tcp_port_accepts(ip: str, port: int, timeout: float, gate: asyncio.Semaphore) -> Optional[int]:
+    async with gate:
         try:
-            with socket.create_connection((ip, port), timeout=timeout):
-                open_ports.append(port)
-        except OSError:
-            continue
-    return open_ports
+            _reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+        except (OSError, asyncio.TimeoutError, ValueError):
+            return None
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), 1)
+        except (OSError, asyncio.TimeoutError):
+            pass
+        return port
+
+
+def tcp_open_ports(ip: str, ports: list[int], timeout: float) -> list[int]:
+    """Try every port concurrently so one host costs about one timeout, not one per port."""
+    async def _check_all() -> list[int]:
+        gate = asyncio.Semaphore(TCP_CONCURRENCY)
+        found = await asyncio.gather(*(_tcp_port_accepts(ip, port, timeout, gate) for port in ports))
+        return [port for port in found if port is not None]
+
+    return asyncio.run(_check_all())
 
 
 def _build_probe_result(
@@ -768,6 +1159,7 @@ def _build_probe_result(
     open_tcp_ports: list[int],
     probe_error: str = "",
     do_dns: bool = False,
+    echo: Optional[EchoResult] = None,
 ) -> dict:
     """Build one normalized tri-state result from validated evidence."""
     alive = icmp_alive or bool(open_tcp_ports)
@@ -780,6 +1172,9 @@ def _build_probe_result(
     else:
         status = "NO RESPONSE"
         evidence = ""
+    rtts = list(getattr(echo, "rtts", []) or [])
+    sent = int(getattr(echo, "sent", 0) or 0)
+    received = int(getattr(echo, "received", 0) or 0)
     classify = ip_classify(ip)
     return {
         "ip": ip,
@@ -790,8 +1185,13 @@ def _build_probe_result(
         "icmp_alive": icmp_alive,
         "tcp_open": open_tcp_ports,
         "ttl": ttl,
+        "rtt_min": round(min(rtts), 2) if rtts else None,
+        "rtt_avg": round(sum(rtts) / len(rtts), 2) if rtts else None,
+        "loss_pct": round((sent - received) / sent * 100) if sent and not probe_error else None,
         "os_guess": ttl_to_os(ttl) if icmp_alive else "",
-        "hostname": reverse_dns(ip) if (alive and do_dns) else "",
+        # Every scanned address gets a PTR/hosts lookup; LAN-only mDNS and
+        # NetBIOS queries are reserved for hosts that answered.
+        "hostname": reverse_dns(ip, deep=alive) if do_dns else "",
         "scope": classify["scope"],
         "rfc": classify["rfc"],
     }
@@ -799,7 +1199,7 @@ def _build_probe_result(
 
 def _fping_batch_alive(
     ip_list: list[str],
-    timeout: int,
+    timeout: float,
     attempts: int,
     rate: int = 0,
 ) -> set[str]:
@@ -811,7 +1211,7 @@ def _fping_batch_alive(
         "-a",
         "-r", str(max(attempts - 1, 0)),
         "-B", "1.0",
-        "-t", str(timeout * 1000),
+        "-t", str(_timeout_ms(timeout)),
     ]
     if rate > 0:
         interval_ms = max(1, (1000 + rate - 1) // rate)
@@ -850,46 +1250,64 @@ def _fping_batch_alive(
 
 def _scan_fping_batch(
     ip_list: list[str],
-    timeout: int,
+    timeout: float,
     count: int,
     retry: int,
     rate: int,
     do_dns: bool,
     tcp_ports: Optional[list[int]],
-    tcp_timeout: int,
+    tcp_timeout: float,
     progress_callback: Optional[Callable[[dict, int, int], None]] = None,
+    threads: int = 20,
+    min_replies: int = 2,
+    rate_limiter: Optional[RateLimiter] = None,
 ) -> list[dict]:
-    """Batch discovery followed by serialized validation of positives."""
+    """Batch discovery followed by parallel validation of positives and TCP checks."""
     attempts = count * (retry + 1)
     try:
         candidates = _fping_batch_alive(ip_list, timeout, attempts, rate)
     except Exception as exc:
-        return [
+        failed = [
             _build_probe_result(ip, False, None, [], f"fping batch failed: {exc}", do_dns)
             for ip in ip_list
         ]
+        if progress_callback:
+            for index, result in enumerate(failed, 1):
+                progress_callback(result, index, len(ip_list))
+        return failed
 
-    results: list[dict] = []
-    for ip in ip_list:
+    def _validate(ip: str) -> dict:
         icmp_alive = False
         ttl = None
         probe_error = ""
+        echo: Optional[EchoResult] = None
         if _normalise_probe_address(ip) in candidates:
             if _PING_PATH is None and _PING6_PATH is None:
                 probe_error = "fping positive could not be integrity-confirmed: system ping unavailable"
             else:
                 try:
-                    icmp_alive, ttl = _confirm_direct_echo(ip, timeout, count)
+                    echo = _confirm_direct_echo(ip, timeout, count, min_replies, rate_limiter)
+                    icmp_alive, ttl = echo[0], echo[1]
                 except Exception as exc:
                     probe_error = f"invalid ICMP confirmation: {exc}"
                 if not icmp_alive and not probe_error:
                     probe_error = "fping positive was not confirmed by a valid echo reply"
         open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
-        result = _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns)
-        results.append(result)
-        if progress_callback:
-            progress_callback(result, len(results), len(ip_list))
-    return results
+        return _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns, echo)
+
+    by_ip: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+        futures = {pool.submit(_validate, ip): ip for ip in ip_list}
+        for future in as_completed(futures):
+            ip = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = _build_probe_result(ip, False, None, [], f"validation failed: {exc}", do_dns)
+            by_ip[ip] = result
+            if progress_callback:
+                progress_callback(result, len(by_ip), len(ip_list))
+    return [by_ip[ip] for ip in ip_list]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -897,26 +1315,27 @@ def _scan_fping_batch(
 # ─────────────────────────────────────────────────────────────────
 def _ping_one(
     ip:           str,
-    timeout:      int              = 2,
+    timeout:      float            = 2,
     count:        int              = 3,
     rate_limiter: Optional[RateLimiter] = None,
     do_dns:       bool             = False,
     tcp_ports:    Optional[list[int]] = None,
-    tcp_timeout:  int              = 2,
+    tcp_timeout:  float            = 2,
+    min_replies:  int              = 2,
 ) -> dict:
     """
     Ping one IP. Cleanly separated fping / OS-ping backends.
-    Reachability is fail-closed: ``alive`` is true only with a direct ICMP
-    echo reply from this target or a successful TCP connection to this target.
+    Reachability is fail-closed: ``alive`` is true only with direct ICMP
+    echo replies from this target or a successful TCP connection to this target.
     """
-    if rate_limiter:
-        rate_limiter.acquire(count)
-
     icmp_alive: bool = False
     ttl:   Optional[int] = None
     probe_error = ""
+    echo: Optional[EchoResult] = None
 
     if _use_fping():
+        if rate_limiter:
+            rate_limiter.acquire(count)
         try:
             icmp_alive, ttl = _ping_via_fping(ip, timeout, count)
             if icmp_alive:
@@ -925,13 +1344,13 @@ def _ping_one(
                     probe_error = "fping reply could not be integrity-confirmed because system ping is unavailable"
                 else:
                     try:
-                        confirmed, confirmed_ttl = _confirm_direct_echo(ip, timeout, count)
+                        echo = _confirm_direct_echo(ip, timeout, count, min_replies, rate_limiter)
                     except Exception as confirmation_error:
                         icmp_alive = False
                         probe_error = f"fping reply failed integrity confirmation: {confirmation_error}"
                     else:
-                        if confirmed:
-                            ttl = confirmed_ttl
+                        if echo[0]:
+                            ttl = echo[1]
                         else:
                             icmp_alive = False
                             probe_error = "fping reported alive but system ping did not confirm a valid echo reply"
@@ -939,7 +1358,8 @@ def _ping_one(
             # A broken fping invocation falls back to system ping. It becomes a
             # probe error only when that independent backend also fails.
             try:
-                icmp_alive, ttl = _confirm_direct_echo(ip, timeout, count)
+                echo = _confirm_direct_echo(ip, timeout, count, min_replies, rate_limiter)
+                icmp_alive, ttl = echo[0], echo[1]
             except Exception as system_error:
                 icmp_alive, ttl = False, None
                 probe_error = f"fping: {fping_error}; ping: {system_error}"
@@ -950,24 +1370,244 @@ def _ping_one(
                 probe_error = "no ICMP probe tool is available"
         else:
             try:
-                icmp_alive, ttl = _confirm_direct_echo(ip, timeout, count)
+                echo = _confirm_direct_echo(ip, timeout, count, min_replies, rate_limiter)
+                icmp_alive, ttl = echo[0], echo[1]
             except Exception as exc:
                 icmp_alive, ttl = False, None
                 probe_error = str(exc)
 
     open_ports = tcp_open_ports(ip, tcp_ports, tcp_timeout) if tcp_ports else []
-    return _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns)
+    return _build_probe_result(ip, icmp_alive, ttl, open_ports, probe_error, do_dns, echo)
+
+
+def _probe_with_retry(
+    ip: str,
+    timeout: float,
+    count: int,
+    retry: int,
+    rate_limiter: Optional[RateLimiter],
+    do_dns: bool,
+    tcp_ports: Optional[list[int]],
+    tcp_timeout: float,
+    min_replies: int,
+) -> dict:
+    """Probe one target and retry it inside the worker until it answers or retries run out."""
+    result = _ping_one(ip, timeout, count, rate_limiter, do_dns, tcp_ports, tcp_timeout, min_replies)
+    for _ in range(retry):
+        if result["alive"] or _STOP_EVENT.is_set():
+            break
+        again = _ping_one(ip, timeout, count, rate_limiter, do_dns, tcp_ports, tcp_timeout, min_replies)
+        if again["alive"] or (result.get("status") == "PROBE ERROR" and again.get("status") == "NO RESPONSE"):
+            result = again
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# IPv6 HELPERS AND NEIGHBOR DISCOVERY
+# ─────────────────────────────────────────────────────────────────
+# Restricts hostname resolution and scanning to one family: None, 4, or 6.
+_ADDRESS_FAMILY: Optional[int] = None
+
+
+def address_family(ip: str) -> int:
+    return ipaddress.ip_address(ip.split("%", 1)[0]).version
+
+
+def ip_sort_key(ip: str) -> tuple[int, int, str]:
+    """Order IPv4 before IPv6 and numerically within each; string sort mixes them up."""
+    base, _separator, zone = ip.partition("%")
+    try:
+        parsed = ipaddress.ip_address(base)
+    except ValueError:
+        return (9, 0, ip)
+    return (parsed.version, int(parsed), zone)
+
+
+def link_local_needs_zone(ip: str) -> bool:
+    """An IPv6 link-local address without %interface is ambiguous outside Windows."""
+    if sys.platform == "win32" or "%" in ip:
+        return False
+    try:
+        parsed = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return parsed.version == 6 and parsed.is_link_local
+
+
+def ipv6_interfaces() -> list[str]:
+    """Names (Windows: indexes) of active non-loopback interfaces with IPv6 link-local addresses."""
+    names: list[str] = []
+    if sys.platform.startswith("linux") and shutil.which("ip"):
+        output = _run_resolution_command(["ip", "-6", "-o", "addr", "show", "scope", "link"], timeout=4)
+        for line in output.splitlines():
+            match = re.match(r"^\d+:\s+([^\s@:]+)", line)
+            if not match:
+                continue
+            name = match.group(1)
+            try:
+                state = Path(f"/sys/class/net/{name}/operstate").read_text().strip()
+            except OSError:
+                state = "unknown"
+            # veth* are container-side ends; their bridge already reaches the same hosts.
+            if state in {"up", "unknown"} and name not in names and not name.startswith("veth"):
+                names.append(name)
+        return names
+    if sys.platform == "win32":
+        netsh = shutil.which("netsh.exe") or shutil.which("netsh")
+        if netsh:
+            output = _run_resolution_command([netsh, "interface", "ipv6", "show", "interfaces"], timeout=6)
+            for line in output.splitlines():
+                fields = line.split()
+                if len(fields) >= 5 and fields[0].isdigit() and fields[3].lower() == "connected" \
+                        and "loopback" not in line.lower():
+                    names.append(fields[0])
+        return names
+    try:
+        interfaces = [name for _index, name in socket.if_nameindex()]
+    except (OSError, AttributeError):
+        return []
+    return [name for name in interfaces if not name.startswith(("lo", "gif", "stf", "awdl", "llw", "anpi", "ap"))]
+
+
+def interface_exists(name: str) -> bool:
+    """True for a known interface name (or a Windows interface index)."""
+    if sys.platform == "win32" and name.isdigit():
+        return True
+    try:
+        socket.if_nametoindex(name)
+    except (OSError, AttributeError):
+        return False
+    return True
+
+
+def _with_zone(address: str, zone: str) -> Optional[str]:
+    normalized = _normalise_probe_address(address)
+    if normalized is None or "%" in normalized:
+        return normalized
+    return f"{normalized}%{zone}" if ipaddress.ip_address(normalized).is_link_local else normalized
+
+
+def _multicast_echo_replies(interface: str, timeout: float) -> set[str]:
+    """Ping all-nodes and all-routers multicast; every host that answers is a candidate."""
+    found: set[str] = set()
+    if sys.platform == "win32":
+        return found  # Windows ping reports only one multicast responder; the neighbor cache is used instead.
+    binary = _PING6_PATH or _PING_PATH or "ping"
+    flag = [] if (_PING6_PATH and _is_bsd_ping()) else ["-6"]
+    for group in ("ff02::1", "ff02::2"):
+        command = [binary, *flag, "-c", "2", f"{group}%{interface}"]
+        if not _is_bsd_ping():
+            command[-1:-1] = ["-W", _format_seconds(timeout)]
+        try:
+            proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout + 4)
+            output = _decode_probe_output(proc.stdout)
+        except subprocess.TimeoutExpired as exc:
+            output = _decode_probe_output(exc.stdout)
+        except OSError:
+            continue
+        for match in re.finditer(r"bytes from \[?([0-9A-Fa-f:.]+)(?:%[\w.\-]+)?\]?", output):
+            address = _with_zone(match.group(1), interface)
+            if address:
+                found.add(address)
+    return found
+
+
+def ipv6_neighbor_cache(interfaces: Optional[list[str]] = None) -> dict[str, str]:
+    """Read the OS IPv6 neighbor cache as {address: MAC}, skipping failed entries."""
+    wanted = set(interfaces or [])
+    neighbors: dict[str, str] = {}
+
+    def add(address: str, zone: str, mac: str) -> None:
+        if wanted and zone not in wanted:
+            return
+        normalized = _with_zone(address, zone)
+        if normalized:
+            neighbors[normalized] = mac.lower().replace("-", ":")
+
+    if sys.platform.startswith("linux") and shutil.which("ip"):
+        output = _run_resolution_command(["ip", "-6", "neigh", "show"], timeout=4)
+        for line in output.splitlines():
+            match = re.match(r"^(\S+)\s+dev\s+(\S+)(?:\s+lladdr\s+(\S+))?", line)
+            if match and not re.search(r"\b(FAILED|INCOMPLETE)\b", line):
+                add(match.group(1), match.group(2), match.group(3) or "")
+    elif sys.platform == "win32":
+        netsh = shutil.which("netsh.exe") or shutil.which("netsh")
+        if netsh:
+            output = _run_resolution_command([netsh, "interface", "ipv6", "show", "neighbors"], timeout=8)
+            zone = ""
+            for line in output.splitlines():
+                header = re.match(r"^\s*Interface\s+(\d+)\s*:", line, re.IGNORECASE)
+                if header:
+                    zone = header.group(1)
+                    continue
+                fields = line.split()
+                if len(fields) >= 3 and ":" in fields[0] and zone and \
+                        not re.search(r"Unreachable|Incomplete|Permanent", line, re.IGNORECASE):
+                    add(fields[0], zone, fields[1])
+    elif shutil.which("ndp"):
+        output = _run_resolution_command(["ndp", "-an"], timeout=4)
+        for line in output.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) >= 3 and "incomplete" not in fields[1]:
+                add(fields[0].split("%", 1)[0], fields[2], fields[1])
+    return neighbors
+
+
+def discover_ipv6_neighbors(interfaces: list[str], timeout: float = 1.0) -> dict[str, str]:
+    """Find IPv6 hosts on the local links, returning {address: MAC or ""}.
+
+    A /64 cannot be swept, so candidates come from multicast echo replies and
+    the neighbor cache that those replies refresh. Every candidate still goes
+    through the normal fail-closed probe before it is reported as reachable.
+    """
+    candidates: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(len(interfaces), 16))) as pool:
+        for replies in pool.map(lambda name: _multicast_echo_replies(name, timeout), interfaces):
+            for address in replies:
+                candidates.setdefault(address, "")
+    for address, mac in ipv6_neighbor_cache(interfaces).items():
+        if mac or address not in candidates:
+            candidates[address] = mac
+    own = _local_ipv6_addresses()
+    return {address: mac for address, mac in sorted(candidates.items(), key=lambda item: ip_sort_key(item[0]))
+            if address.split("%", 1)[0] not in own and not ipaddress.ip_address(address.split("%", 1)[0]).is_multicast}
+
+
+def _local_ipv6_addresses() -> set[str]:
+    """This machine's own IPv6 addresses, so discovery lists only other hosts."""
+    own: set[str] = set()
+    if sys.platform.startswith("linux") and shutil.which("ip"):
+        output = _run_resolution_command(["ip", "-6", "-o", "addr", "show"], timeout=4)
+        for match in re.finditer(r"inet6\s+([0-9A-Fa-f:]+)/", output):
+            own.add(str(ipaddress.ip_address(match.group(1))))
+        return own
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET6):
+            own.add(str(ipaddress.ip_address(info[4][0].split("%", 1)[0])))
+    except (OSError, ValueError):
+        pass
+    return own
 
 
 # ─────────────────────────────────────────────────────────────────
 # PROGRESS BAR
 # ─────────────────────────────────────────────────────────────────
+_CLEAR_LINE = "\r\033[K"
+
+
+def _line_start() -> str:
+    """Return to column 0, erasing a progress bar drawn on a terminal."""
+    return _CLEAR_LINE if sys.stdout.isatty() else "\r"
+
+
 def _progress_bar(done: int, total: int, alive: int, no_response: int, errors: int, width: int = 38):
+    if not sys.stdout.isatty():
+        return  # a redirected log should hold result lines, not bar redraws
     pct  = done / total if total else 0
     fill = int(pct * width)
     bar  = f"{C.GREEN}{'█' * fill}{C.DIM}{'░' * (width - fill)}{C.RESET}"
     sys.stdout.write(
-        f"\r  [{bar}] {C.BOLD}{pct*100:5.1f}%{C.RESET}  "
+        f"{_CLEAR_LINE}  [{bar}] {C.BOLD}{pct*100:5.1f}%{C.RESET}  "
         f"{C.DIM}{done}/{total}{C.RESET}  "
         f"{C.GREEN}▲{alive}{C.RESET}  {C.RED}▼{no_response}{C.RESET}  {C.YELLOW}!{errors}{C.RESET}   "
     )
@@ -977,10 +1617,19 @@ def _progress_bar(done: int, total: int, alive: int, no_response: int, errors: i
 # ─────────────────────────────────────────────────────────────────
 # SCAN ENGINE
 # ─────────────────────────────────────────────────────────────────
+def _fping_chunk_size(total: int) -> int:
+    """Split large fping discoveries so progress and resume advance in steps.
+
+    Each chunk pays one trailing timeout, so the count is capped at about 16
+    chunks; a /24 is still discovered by a single fping process.
+    """
+    return max(256, math.ceil(total / 16))
+
+
 def run_scan(
     ip_list:      list[str],
     threads:      int         = 20,
-    timeout:      int         = 2,
+    timeout:      float       = 2,
     count:        int         = 2,
     retry:        int         = 0,
     rate:         int         = 0,
@@ -989,11 +1638,13 @@ def run_scan(
     do_dns:       bool        = False,
     resume:       bool        = False,
     tcp_ports:    Optional[list[int]] = None,
-    tcp_timeout:  int         = 2,
+    tcp_timeout:  float       = 2,
+    min_replies:  int         = 2,
+    resumable:    bool        = True,
 ) -> list[dict]:
     """
     Scan all IPs. Returns list of result dicts.
-    Supports: retry, rate-limit, resume (Ctrl+C safe), DNS, TTL.
+    Supports: retry, rate-limit, resume (Ctrl+C safe with both backends), DNS, TTL.
     """
     # ── resume: skip already-done IPs ───────────────────────────
     done_results: list[dict] = []
@@ -1007,30 +1658,50 @@ def run_scan(
             result.setdefault("evidence", "legacy result")
             result.setdefault("probe_error", "")
         ip_list   = [ip for ip in ip_list if ip not in done_ips]
-        print(f"  {C.YELLOW}↺  Resuming — {len(done_results)} already done, "
-              f"{len(ip_list)} remaining{C.RESET}")
+        if not quiet:
+            print(f"  {C.YELLOW}↺  Resuming — {len(done_results)} already done, "
+                  f"{len(ip_list)} remaining{C.RESET}")
+    elif resume and not quiet:
+        print(f"  {C.DIM}No saved partial scan for '{label}'; starting a full scan.{C.RESET}")
+
+    # A zone-less link-local address cannot be routed; report why instead of a silent no-response.
+    zoneless = [ip for ip in ip_list if link_local_needs_zone(ip)]
+    if zoneless:
+        interfaces = ", ".join(ipv6_interfaces()[:6]) or "your interface"
+        done_results = done_results + [
+            _build_probe_result(
+                ip, False, None, [],
+                f"link-local address needs an interface zone, e.g. {ip}%{interfaces.split(',')[0]} "
+                f"(interfaces: {interfaces})",
+            )
+            for ip in zoneless
+        ]
+        ip_list = [ip for ip in ip_list if ip not in set(zoneless)]
 
     total   = len(ip_list)
     if total == 0:
-        print(f"  {C.LIME}✔  All IPs already scanned (resume complete).{C.RESET}")
+        if not quiet and not zoneless:
+            print(f"  {C.LIME}✔  All IPs already scanned (resume complete).{C.RESET}")
         clear_partial(label)
         return done_results
 
     rl        = RateLimiter(rate) if rate > 0 else None
     results:  list[dict] = []
-    done_n    = 0
+    _STOP_EVENT.clear()
     t_start   = time.time()
     interrupted = False
+    use_fping = _use_fping()
+    required = max(1, min_replies)
 
     waves = (total + max(threads, 1) - 1) // max(threads, 1)
-    if _use_fping():
-        # Alive mode makes at most ``count`` attempts; positives then receive a
-        # short independent integrity confirmation through system ping.
-        icmp_est = (count + max(count, 2)) * timeout
+    confirm_est = max(count, required) * timeout
+    if use_fping:
+        # Alive mode makes at most ``count`` attempts; positives then receive
+        # independent integrity confirmations through system ping.
+        icmp_est = count * timeout + confirm_est
     else:
-        # Conservative cross-platform bound for sequential system-ping waits.
-        icmp_est = count * timeout
-    tcp_est = len(tcp_ports or []) * tcp_timeout
+        icmp_est = confirm_est
+    tcp_est = tcp_timeout if tcp_ports else 0
     est_sec = waves * (icmp_est + tcp_est) * (retry + 1)
     rate_str = f"  rate≤{rate}pkt/s" if rate > 0 else ""
     retry_str = f"  retry={retry}" if retry > 0 else ""
@@ -1040,153 +1711,136 @@ def run_scan(
         print(
             f"\n  {C.CYAN}⠿ Scanning {C.BOLD}{total:,}{C.RESET}{C.CYAN} hosts"
             f"  │  threads={C.BOLD}{threads}{C.RESET}{C.CYAN}"
-            f"  timeout={timeout}s  pkt/host={count}"
+            f"  timeout={_format_seconds(timeout)}s  pkt/host={count}  replies≥{required}"
             f"{retry_str}{rate_str}{dns_str}{tcp_str}"
             f"  est≤{est_sec:.0f}s{C.RESET}\n"
         )
 
-    if _use_fping():
-        live_counts = {"alive": 0, "no_response": 0, "errors": 0}
+    counts = {"alive": 0, "no_response": 0, "errors": 0}
 
-        def _batch_progress(result: dict, completed: int, target_total: int) -> None:
-            if result["alive"]:
-                live_counts["alive"] += 1
-                ttl_s = f"TTL={result['ttl']}" if result["ttl"] else "TTL=?"
-                sys.stdout.write(
-                    f"\r  {C.GREEN}✔ {result['ip']:<18}{C.RESET}"
-                    f"  {C.DIM}{'ICMP':<12} {ttl_s:<8}{C.RESET}"
-                    f"  {ttl_color(result['os_guess'])}{result['os_guess']:<16}{C.RESET}\n"
-                )
-            elif result.get("status") == "PROBE ERROR":
-                live_counts["errors"] += 1
-                sys.stdout.write(
-                    f"\r  {C.YELLOW}! {result['ip']:<18} {'PROBE ERROR':<12}{C.RESET}"
-                    f"  {C.DIM}{result.get('probe_error', '')[:44]}{C.RESET}\n"
-                )
-            else:
-                live_counts["no_response"] += 1
-            _progress_bar(
-                completed, target_total, live_counts["alive"],
-                live_counts["no_response"], live_counts["errors"],
+    def _report(result: dict, done: int) -> None:
+        """Print one finished target and advance the progress bar in O(1)."""
+        if result["alive"]:
+            counts["alive"] += 1
+        elif result.get("status") == "PROBE ERROR":
+            counts["errors"] += 1
+        else:
+            counts["no_response"] += 1
+        if quiet:
+            return
+        ip = result["ip"]
+        if result["alive"]:
+            os_g = result["os_guess"]
+            ttl_s = f"TTL={result['ttl']}" if result["ttl"] else "TTL=?"
+            reach_s = "ICMP" if result["icmp_alive"] else f"TCP:{','.join(str(port) for port in result['tcp_open'])}"
+            rtt_s = f"{result['rtt_avg']}ms" if result.get("rtt_avg") is not None else ""
+            dns_s = f"  {C.DIM}{result['hostname'][:28]}{C.RESET}" if result["hostname"] else ""
+            sys.stdout.write(
+                f"{_line_start()}  {C.GREEN}✔ {ip:<18}{C.RESET}"
+                f"  {C.DIM}{reach_s:<12} {ttl_s:<8} {rtt_s:<9}{C.RESET}"
+                f"  {ttl_color(os_g)}{os_g:<16}{C.RESET}"
+                f"  {C.CYAN}[{result['scope']}]{C.RESET}"
+                f"{dns_s}\n"
             )
+        elif result.get("status") == "PROBE ERROR":
+            sys.stdout.write(
+                f"{_line_start()}  {C.YELLOW}! {ip:<18}{C.RESET}"
+                f"  {C.YELLOW}{'PROBE ERROR':<12}{C.RESET}"
+                f"  {C.DIM}{result.get('probe_error', '')[:44]}{C.RESET}\n"
+            )
+        elif not use_fping:
+            # fping mode lists only positives; a /16 of silent hosts would flood the terminal.
+            sys.stdout.write(
+                f"{_line_start()}  {C.RED}✘ {ip:<18}{C.RESET}"
+                f"  {C.DIM}{'NO RESPONSE':<12} {'TTL=?':<8}{C.RESET}"
+                f"  {C.DIM}{'Unknown':<16}{C.RESET}"
+                f"  {C.CYAN}[{result['scope']}]{C.RESET}\n"
+            )
+        _progress_bar(done, total, counts["alive"], counts["no_response"], counts["errors"])
 
-        results = _scan_fping_batch(
-            ip_list, timeout, count, retry, rate, do_dns, tcp_ports, tcp_timeout,
-            None if quiet else _batch_progress,
-        )
-        elapsed = time.time() - t_start
-        if not quiet:
-            print(f"\n  {C.DIM}Scan finished in {elapsed:.1f}s{C.RESET}\n")
-        clear_partial(label)
-        all_results = done_results + results
-        try:
-            all_results.sort(key=lambda result: ipaddress.ip_address(result["ip"]))
-        except Exception:
-            all_results.sort(key=lambda result: result["ip"])
-        return all_results
-
-    # ── Ctrl+C handler: save partial and exit gracefully ────────
+    # ── Ctrl+C handler: stop cleanly and keep finished work for --resume ──
     def _sigint(sig, frame):
         nonlocal interrupted
+        if interrupted:
+            raise KeyboardInterrupt
         interrupted = True
-        sys.stdout.write(f"\n\n  {C.YELLOW}⚠  Interrupted — saving partial results...{C.RESET}\n")
-        sys.stdout.flush()
-
-    old_handler = signal.signal(signal.SIGINT, _sigint)
+        _STOP_EVENT.set()
+        if resumable:
+            sys.stdout.write(f"\n\n  {C.YELLOW}⚠  Interrupted — saving partial results (Ctrl+C again to abort)...{C.RESET}\n")
+            sys.stdout.flush()
 
     try:
-        with ThreadPoolExecutor(max_workers=threads) as pool:
-            futures = {
-                pool.submit(_ping_one, ip, timeout, count, rl, do_dns, tcp_ports, tcp_timeout): ip
-                for ip in ip_list
-            }
-            for fut in as_completed(futures):
+        old_handler = signal.signal(signal.SIGINT, _sigint)
+    except ValueError:  # not in the main thread (embedded use)
+        old_handler = None
+
+    try:
+        if use_fping:
+            chunk_size = _fping_chunk_size(total)
+            for start in range(0, total, chunk_size):
                 if interrupted:
-                    # Cancel remaining futures
-                    for f in futures:
-                        f.cancel()
                     break
-
-                try:
-                    res = fut.result()
-                except Exception as exc:
-                    ip = futures[fut]
-                    classify = ip_classify(ip)
-                    res = {
-                        "ip": ip, "alive": False, "status": "PROBE ERROR",
-                        "evidence": "", "probe_error": str(exc),
-                        "ttl": None, "os_guess": "",
-                        "icmp_alive": False, "tcp_open": [], "hostname": "",
-                        "scope": classify["scope"], "rfc": classify["rfc"],
-                    }
-                    if not quiet:
-                        print(C.warn(f"\n  ⚠  Scan failed for {ip}: {exc}"))
-                ip     = res["ip"]
-                alive  = res["alive"]
-                done_n += 1
-
-                # ── retry logic: retry every target without reachability evidence
-                if not alive and retry > 0:
-                    for _ in range(retry):
-                        res2 = _ping_one(ip, timeout, count, rl, do_dns, tcp_ports, tcp_timeout)
-                        if res2["alive"]:
-                            res = res2
-                            break
-                        if res.get("status") == "PROBE ERROR" and res2.get("status") == "NO RESPONSE":
-                            res = res2
-
-                results.append(res)
-
-                if res["alive"]:
-                    if not quiet:
-                        os_g = res["os_guess"]
-                        ttl_s = f"TTL={res['ttl']}" if res["ttl"] else "TTL=?"
-                        reach_s = "ICMP" if res["icmp_alive"] else f"TCP:{','.join(str(port) for port in res['tcp_open'])}"
-                        dns_s = f"  {C.DIM}{res['hostname'][:28]}{C.RESET}" if res["hostname"] else ""
-                        oscol = ttl_color(os_g)
-                        sys.stdout.write(
-                            f"\r  {C.GREEN}✔ {ip:<18}{C.RESET}"
-                            f"  {C.DIM}{reach_s:<12} {ttl_s:<8}{C.RESET}"
-                            f"  {oscol}{os_g:<16}{C.RESET}"
-                            f"  {C.CYAN}[{res['scope']}]{C.RESET}"
-                            f"{dns_s}\n"
-                        )
-                        sys.stdout.flush()
-                elif not quiet:
-                    if res.get("status") == "PROBE ERROR":
-                        sys.stdout.write(
-                            f"\r  {C.YELLOW}! {ip:<18}{C.RESET}"
-                            f"  {C.YELLOW}{'PROBE ERROR':<12}{C.RESET}"
-                            f"  {C.DIM}{res.get('probe_error', '')[:44]}{C.RESET}\n"
-                        )
-                    else:
-                        sys.stdout.write(
-                            f"\r  {C.RED}✘ {ip:<18}{C.RESET}"
-                            f"  {C.DIM}{'NO RESPONSE':<12} {'TTL=?':<8}{C.RESET}"
-                            f"  {C.DIM}{'Unknown':<16}{C.RESET}"
-                            f"  {C.CYAN}[{res['scope']}]{C.RESET}\n"
-                        )
-                    sys.stdout.flush()
-                if not quiet:
-                    _progress_bar(
-                        done_n,
-                        total,
-                        sum(1 for r in results if r["alive"]),
-                        sum(1 for r in results if r.get("status") == "NO RESPONSE"),
-                        sum(1 for r in results if r.get("status") == "PROBE ERROR"),
+                chunk = ip_list[start:start + chunk_size]
+                if not quiet and total > chunk_size and sys.stdout.isatty():
+                    sys.stdout.write(
+                        f"{_line_start()}  {C.DIM}Discovering {start + 1:,}–{start + len(chunk):,} of {total:,} with fping...{C.RESET}   "
                     )
-
+                    sys.stdout.flush()
+                base = len(results)
+                chunk_results = _scan_fping_batch(
+                    chunk, timeout, count, retry, rate, do_dns, tcp_ports, tcp_timeout,
+                    lambda result, completed, _total, base=base: _report(result, base + completed),
+                    threads=threads, min_replies=required, rate_limiter=rl,
+                )
+                if interrupted:
+                    # The signal also reached fping and ping children, so this
+                    # chunk's evidence is incomplete. It will be rescanned.
+                    break
+                results.extend(chunk_results)
+        else:
+            pool = ThreadPoolExecutor(max_workers=threads)
+            try:
+                futures = {
+                    pool.submit(
+                        _probe_with_retry, ip, timeout, count, retry, rl,
+                        do_dns, tcp_ports, tcp_timeout, required,
+                    ): ip
+                    for ip in ip_list
+                }
+                for fut in as_completed(futures):
+                    if interrupted:
+                        break
+                    try:
+                        res = fut.result()
+                    except Exception as exc:
+                        ip = futures[fut]
+                        res = _build_probe_result(ip, False, None, [], str(exc) or type(exc).__name__)
+                        if not quiet:
+                            print(C.warn(f"\n  ⚠  Scan failed for {ip}: {exc}"))
+                    if interrupted:
+                        # The result may come from a ping the signal cut short.
+                        break
+                    results.append(res)
+                    _report(res, len(results))
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
     finally:
-        signal.signal(signal.SIGINT, old_handler)
+        if old_handler is not None:
+            signal.signal(signal.SIGINT, old_handler)
 
     elapsed = time.time() - t_start
 
+    if interrupted and not resumable:
+        return done_results + results
+
     if interrupted:
-        # Save what we have so far for resume
-        remaining = [ip for ip in ip_list if ip not in {r["ip"] for r in results}]
+        finished = {r["ip"] for r in results}
+        remaining = [ip for ip in ip_list if ip not in finished]
         all_done  = done_results + results
         save_partial(label, all_done, remaining)
-        print(f"  {C.YELLOW}Partial results saved. Re-run with --resume to continue.{C.RESET}\n")
+        if not quiet:
+            print(f"  {C.YELLOW}Partial results saved ({len(all_done)} done, {len(remaining)} remaining). "
+                  f"Re-run the same command with --resume to continue.{C.RESET}\n")
         # Return what we have so alive/dead files are still written
         return all_done
 
@@ -1198,10 +1852,7 @@ def run_scan(
     all_results = done_results + results
 
     # Sort by IP
-    try:
-        all_results.sort(key=lambda r: ipaddress.ip_address(r["ip"]))
-    except Exception:
-        all_results.sort(key=lambda r: r["ip"])
+    all_results.sort(key=lambda r: ip_sort_key(r["ip"]))
 
     return all_results
 
@@ -1235,7 +1886,10 @@ def write_results(
         dead_path.write_text(json.dumps([r for r in dead], indent=2) + "\n", encoding="utf-8")
         error_path.write_text(json.dumps([r for r in errors], indent=2) + "\n", encoding="utf-8")
     elif out_format == "csv":
-        fields = ["ip", "status", "alive", "evidence", "probe_error", "icmp_alive", "tcp_open", "ttl", "os_guess", "hostname", "scope", "rfc"]
+        fields = [
+            "ip", "status", "alive", "evidence", "probe_error", "icmp_alive", "tcp_open",
+            "ttl", "rtt_min", "rtt_avg", "loss_pct", "os_guess", "hostname", "scope", "rfc",
+        ]
         for path, rows in ((alive_path, alive), (dead_path, dead), (error_path, errors)):
             with path.open("w", newline="", encoding="utf-8") as output:
                 writer = csv.DictWriter(output, fieldnames=fields)
@@ -1243,7 +1897,7 @@ def write_results(
                 writer.writerows(
                     {
                         field: ";".join(str(port) for port in row.get("tcp_open", []))
-                        if field == "tcp_open" else row.get(field, "")
+                        if field == "tcp_open" else ("" if row.get(field) is None else row.get(field))
                         for field in fields
                     }
                     for row in rows
@@ -1303,23 +1957,62 @@ def write_results(
 # ─────────────────────────────────────────────────────────────────
 # HISTORY COMPARISON
 # ─────────────────────────────────────────────────────────────────
-def compare_history(label: str, current_alive: list[str], current_dead: list[str]):
+def history_changes(
+    previous: dict,
+    current_alive: list[str],
+    current_dead: list[str],
+    current_errors: Optional[list[str]] = None,
+) -> dict[str, list[str]]:
+    """Classify IP transitions between two scans.
+
+    Only a completed probe with no response counts as offline. A previously
+    reachable host whose probe now failed is indeterminate, not down.
+    """
+    prev_alive = set(previous.get("alive", []))
+    prev_dead  = set(previous.get("dead", []))
+    curr_alive = set(current_alive)
+    curr_dead  = set(current_dead)
+    curr_errors = set(current_errors or [])
+    return {
+        "newly_up": sorted(curr_alive - prev_alive),
+        "newly_down": sorted(prev_alive & curr_dead),
+        "stayed_up": sorted(curr_alive & prev_alive),
+        "stayed_down": sorted(curr_dead & prev_dead),
+        "indeterminate": sorted(prev_alive & curr_errors),
+    }
+
+
+def compare_history(
+    label: str,
+    current_alive: list[str],
+    current_dead: list[str],
+    current_errors: Optional[list[str]] = None,
+    saved_current: bool = True,
+):
+    """Compare this scan with the previous one for the label.
+
+    ``saved_current`` is False with --no-history: the newest stored entry is
+    then the previous scan, not this one.
+    """
     history = load_history(label)
+    if not saved_current:
+        history = history + [{
+            "timestamp": datetime.now().isoformat(),
+            "alive": sorted(current_alive),
+            "dead": sorted(current_dead),
+        }]
     if len(history) < 2:
         print(f"\n  {C.warn('⚠  Not enough history for comparison (need ≥ 2 scans).')}")
         return
 
     prev       = history[-2]
-    prev_alive = set(prev.get("alive", []))
-    curr_alive = set(current_alive)
-    curr_dead  = set(current_dead)
-    prev_dead  = set(prev.get("dead",  []))
     prev_ts    = prev.get("timestamp", "unknown")
-
-    newly_up   = sorted(curr_alive - prev_alive)
-    newly_down = sorted(prev_alive - curr_alive)
-    stayed_up  = sorted(curr_alive & prev_alive)
-    stayed_dn  = sorted(curr_dead  & prev_dead)
+    changes    = history_changes(prev, current_alive, current_dead, current_errors)
+    newly_up   = changes["newly_up"]
+    newly_down = changes["newly_down"]
+    stayed_up  = changes["stayed_up"]
+    stayed_dn  = changes["stayed_down"]
+    unknown    = changes["indeterminate"]
 
     box_w = 60
     div   = f"  {C.PURPLE}{'─' * box_w}{C.RESET}"
@@ -1334,6 +2027,7 @@ def compare_history(label: str, current_alive: list[str], current_dead: list[str
     print(f"  {C.RED}  ↓ Newly DOWN    : {len(newly_down):>4}{C.RESET}")
     print(f"  {C.LIME}  ✔ Stayed ALIVE  : {len(stayed_up):>4}{C.RESET}")
     print(f"  {C.DIM}  ✘ Stayed DEAD   : {len(stayed_dn):>4}{C.RESET}")
+    print(f"  {C.YELLOW}  ? Probe error   : {len(unknown):>4}{C.RESET}  {C.DIM}(was alive; not counted as down){C.RESET}")
     print(div)
 
     if newly_up:
@@ -1364,13 +2058,55 @@ def compare_history(label: str, current_alive: list[str], current_dead: list[str
 # ─────────────────────────────────────────────────────────────────
 # DIFF TWO FILES
 # ─────────────────────────────────────────────────────────────────
-def diff_files(file_a: str, file_b: str):
-    def read_ips(path: str) -> set[str]:
-        p = Path(path)
-        if not p.exists():
-            print(C.err(f"  ✗ File not found: {path}")); sys.exit(1)
-        return {l.strip() for l in p.read_text().splitlines() if l.strip()}
+def read_snapshot_ips(path: str) -> set[str]:
+    """Read the addresses in a txt, csv, or json result file written by PingMe.
 
+    Plain files may also hold hostnames or comments; the first field of each
+    line is used so hand-written snapshots keep working.
+    """
+    p = Path(path).expanduser()
+    if not p.is_file():
+        print(C.err(f"  ✗ File not found: {path}"), file=sys.stderr); sys.exit(EXIT_USAGE)
+    text = p.read_text(encoding="utf-8-sig", errors="replace")
+    stripped = text.lstrip()
+
+    def _canonical(value: object) -> str:
+        token = str(value).strip().strip('"').strip("'")
+        address = _normalise_probe_address(token)
+        return address if address is not None else token
+
+    if stripped.startswith(("[", "{")):
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            data = data.get("results", data.get("alive", []))
+        if isinstance(data, list):
+            found = {
+                _canonical(item.get("ip", "")) if isinstance(item, dict) else _canonical(item)
+                for item in data
+            }
+            return {item for item in found if item}
+
+    lines = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if lines:
+        header = [field.strip().lower() for field in next(csv.reader([lines[0]]))]
+        if "ip" in header:
+            column = header.index("ip")
+            rows = csv.reader(lines[1:])
+            return {_canonical(row[column]) for row in rows if len(row) > column and row[column].strip()}
+
+    found: set[str] = set()
+    for line in lines:
+        first = re.split(r"[\s,]+", line.strip(), maxsplit=1)[0]
+        if first:
+            found.add(_canonical(first))
+    return found
+
+
+def diff_files(file_a: str, file_b: str):
+    read_ips = read_snapshot_ips
     ips_a = read_ips(file_a); ips_b = read_ips(file_b)
     only_a = sorted(ips_a - ips_b); only_b = sorted(ips_b - ips_a)
     common = sorted(ips_a & ips_b)
@@ -1384,7 +2120,7 @@ def diff_files(file_a: str, file_b: str):
     print(f"  {C.DIM}File A: {file_a}  ({len(ips_a)} IPs){C.RESET}")
     print(f"  {C.DIM}File B: {file_b}  ({len(ips_b)} IPs){C.RESET}")
     print(div)
-    print(f"  {C.LIME}  In A only (went offline) : {len(only_a)}")
+    print(f"  {C.RED}  In A only (went offline) : {len(only_a)}{C.RESET}")
     print(f"  {C.GREEN}  In B only (came online)  : {len(only_b)}{C.RESET}")
     print(f"  {C.DIM}  In both                  : {len(common)}{C.RESET}")
     print(div)
@@ -1459,13 +2195,7 @@ def _run_resolution_command(
     if proc.returncode not in accepted_returncodes:
         return ""
 
-    raw = proc.stdout or b""
-    for encoding in ("utf-8", "utf-16", "cp1252", "cp437", "mbcs"):
-        try:
-            return raw.decode(encoding)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return raw.decode(errors="ignore")
+    return _decode_probe_output(proc.stdout or b"")
 
 
 def _resolve_with_windows_tools(hostname: str) -> list[str]:
@@ -1592,10 +2322,22 @@ def _resolve_with_bounded_python(hostname: str) -> list[str]:
     return addresses
 
 
+def is_safe_hostname(hostname: str) -> bool:
+    """Reject names that a resolver command could parse as an option or split.
+
+    Hostnames are passed as arguments to getent, ping, nslookup, and nbtstat.
+    A leading "-" would be read as a flag (for example "-t" makes Windows ping
+    run forever), and whitespace or control characters are never valid.
+    """
+    return bool(hostname) and not hostname.startswith("-") and not any(
+        character.isspace() or ord(character) < 32 for character in hostname
+    )
+
+
 def resolve_hostname(hostname: str) -> list[str]:
     """Resolve names through bounded OS-specific resolver processes."""
     hostname = hostname.strip().strip('"').strip("'")
-    if not hostname:
+    if not is_safe_hostname(hostname):
         return []
 
     if sys.platform.startswith("linux") and shutil.which("getent"):
@@ -1608,6 +2350,8 @@ def resolve_hostname(hostname: str) -> list[str]:
     if not addresses:
         addresses.extend(_resolve_with_windows_tools(hostname))
 
+    if _ADDRESS_FAMILY:
+        addresses = [address for address in addresses if address_family(address) == _ADDRESS_FAMILY]
     return list(dict.fromkeys(addresses))
 
 def show_host_resolution(rows: list[dict], source: str) -> None:
@@ -1652,6 +2396,8 @@ def build_file_status_records(rows: list[dict], results: list[dict]) -> list[dic
         ip_value = str(row.get("ip") or "UNRESOLVED")
         row_type = str(row.get("type", "DNS"))
         excluded = bool(row.get("excluded"))
+        rtt = loss = "-"
+        name = ""
 
         if row_type == "UNRESOLVED" or ip_value == "UNRESOLVED":
             status = "UNRESOLVED"
@@ -1683,6 +2429,11 @@ def build_file_status_records(rows: list[dict], results: list[dict]) -> list[dic
                 ttl_value = result.get("ttl")
                 ttl = str(ttl_value) if ttl_value is not None else "?"
                 os_guess = str(result.get("os_guess") or "Unknown")
+                if result.get("rtt_avg") is not None:
+                    rtt = f"{result['rtt_avg']:g}"
+                if result.get("loss_pct") is not None:
+                    loss = f"{result['loss_pct']}%"
+                name = str(result.get("hostname") or "")
 
         records.append({
             "host": host,
@@ -1690,7 +2441,10 @@ def build_file_status_records(rows: list[dict], results: list[dict]) -> list[dic
             "status": status,
             "method": method,
             "ttl": ttl,
+            "rtt": rtt,
+            "loss": loss,
             "os_guess": os_guess,
+            "name": name,
         })
 
     return records
@@ -1706,27 +2460,38 @@ def _status_counts(records: list[dict]) -> dict[str, int]:
     }
 
 
-def _plain_table(records: list[dict], title: str) -> str:
-    """Return a portable ASCII table with no ANSI escape sequences."""
-    headers = ["HOST", "IP ADDRESS", "STATUS", "METHOD", "TTL", "OS GUESS"]
-    keys = ["host", "ip", "status", "method", "ttl", "os_guess"]
-    minimums = [12, 15, 13, 18, 5, 18]
-    maximums = [40, 48, 16, 24, 8, 24]
+# (header, record key, minimum width, maximum width)
+_STATUS_COLUMNS = [
+    ("HOST", "host", 12, 48),
+    ("IP ADDRESS", "ip", 15, 56),
+    ("STATUS", "status", 11, 13),
+    ("METHOD", "method", 6, 24),
+    ("TTL", "ttl", 3, 5),
+    ("RTT ms", "rtt", 6, 9),
+    ("LOSS", "loss", 4, 5),
+    ("OS GUESS", "os_guess", 8, 24),
+    ("REVERSE DNS", "name", 11, 48),
+]
 
-    widths: list[int] = []
-    for header, key, minimum, maximum in zip(headers, keys, minimums, maximums):
+
+def _status_columns(
+    records: list[dict], hide_host: bool = False, host_header: str = "HOST"
+) -> list[tuple[str, str, int]]:
+    """Choose visible columns and widths; reverse DNS appears only when some name is known."""
+    columns: list[tuple[str, str, int]] = []
+    for header, key, minimum, maximum in _STATUS_COLUMNS:
+        if key == "name" and not any(record.get("name") for record in records):
+            continue
+        if key == "host" and hide_host:
+            continue
+        if key == "host":
+            header = host_header
         longest = max([len(header)] + [len(str(record.get(key, ""))) for record in records])
-        widths.append(min(max(minimum, longest), maximum))
+        columns.append((header, key, min(max(minimum, longest), maximum)))
+    return columns
 
-    line = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
-    output = [title, "", line]
-    output.append("| " + " | ".join(f"{header:<{width}}" for header, width in zip(headers, widths)) + " |")
-    output.append(line)
-    for record in records:
-        values = [str(record.get(key, ""))[:width] for key, width in zip(keys, widths)]
-        output.append("| " + " | ".join(f"{value:<{width}}" for value, width in zip(values, widths)) + " |")
-    output.append(line)
 
+def _status_summary(records: list[dict]) -> str:
     counts = _status_counts(records)
     summary = (
         f"Reachable: {counts['reachable']}  "
@@ -1736,7 +2501,23 @@ def _plain_table(records: list[dict], title: str) -> str:
     )
     if counts["other"]:
         summary += f"  Not scanned/excluded: {counts['other']}"
-    output.extend([summary, ""])
+    return summary
+
+
+def _plain_table(records: list[dict], title: str) -> str:
+    """Return a portable ASCII table with no ANSI escape sequences."""
+    columns = _status_columns(records)
+    line = "+" + "+".join("-" * (width + 2) for _header, _key, width in columns) + "+"
+    output = [title, "", line]
+    output.append("| " + " | ".join(f"{header:<{width}}" for header, _key, width in columns) + " |")
+    output.append(line)
+    for record in records:
+        values = [str(record.get(key, ""))[:width] for _header, key, width in columns]
+        output.append("| " + " | ".join(
+            f"{value:<{width}}" for value, (_header, _key, width) in zip(values, columns)
+        ) + " |")
+    output.append(line)
+    output.extend([_status_summary(records), ""])
     return "\n".join(output)
 
 
@@ -1756,31 +2537,17 @@ def write_hostnames_report(
     return destination
 
 
-def _changes_state_file(label: str) -> Path:
-    directory = _data_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^\w.\-]", "_", label)
-    return directory / f".{safe}_changes.json"
-
-
 def load_changes_state(label: str) -> Optional[dict]:
-    path = _changes_state_file(label)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    data = _read_state("changes", label)
     return data if isinstance(data, dict) else None
 
 
 def save_changes_state(label: str, source: str, records: list[dict]) -> None:
-    path = _changes_state_file(label)
-    path.write_text(json.dumps({
+    _write_json_atomic(_state_path("changes", label), {
         "source": source,
         "timestamp": datetime.now().isoformat(),
         "records": records,
-    }, indent=2), encoding="utf-8")
+    })
 
 
 def _compact_host_table(title: str, records: list[dict]) -> list[str]:
@@ -1792,6 +2559,57 @@ def _compact_host_table(title: str, records: list[dict]) -> list[str]:
         lines.append(f"| {str(record.get('host', ''))[:host_w]:<{host_w}} | {str(record.get('ip', ''))[:ip_w]:<{ip_w}} |")
     lines.append(line)
     return lines
+
+
+def _ip_change_table(title: str, changes: list[dict]) -> list[str]:
+    host_w = min(40, max([12] + [len(str(change["host"])) for change in changes]))
+    ip_w = min(48, max([15] + [len(str(change["old_ip"])) for change in changes]
+                       + [len(str(change["ip"])) for change in changes]))
+    status_w = 13
+    line = "+" + "-" * (host_w + 2) + "+" + "-" * (ip_w + 2) + "+" + "-" * (ip_w + 2) + "+" + "-" * (status_w + 2) + "+"
+    lines = [title, line, f"| {'HOST':<{host_w}} | {'OLD IP':<{ip_w}} | {'NEW IP':<{ip_w}} | {'STATUS NOW':<{status_w}} |", line]
+    for change in changes:
+        lines.append(
+            f"| {str(change['host'])[:host_w]:<{host_w}} | {str(change['old_ip'])[:ip_w]:<{ip_w}} "
+            f"| {str(change['ip'])[:ip_w]:<{ip_w}} | {str(change['status'])[:status_w]:<{status_w}} |"
+        )
+    lines.append(line)
+    return lines
+
+
+def _pair_ip_changes(groups: dict[str, list[dict]]) -> None:
+    """Turn a removed (host, old IP) plus an added (host, new IP) into one IP change.
+
+    Without this, a DHCP renumbering shows up as a target removed from the file
+    and a new one added, which hides that the host itself is unchanged.
+    """
+    def _resolved(record: dict) -> bool:
+        return str(record.get("ip", "")) not in {"", "UNRESOLVED"}
+
+    added: dict[str, list[dict]] = {}
+    for record in groups["new_targets"]:
+        if _resolved(record):
+            added.setdefault(str(record["host"]), []).append(record)
+    removed: dict[str, list[dict]] = {}
+    for record in groups["removed_targets"]:
+        if _resolved(record):
+            removed.setdefault(str(record.get("host", "")), []).append(record)
+
+    paired_new: set[int] = set()
+    paired_old: set[int] = set()
+    for host in added.keys() & removed.keys():
+        for new, old in zip(added[host], removed[host]):
+            groups["ip_changed"].append({
+                "host": host,
+                "old_ip": old.get("ip", ""),
+                "ip": new.get("ip", ""),
+                "old_status": old.get("status", ""),
+                "status": new.get("status", ""),
+            })
+            paired_new.add(id(new))
+            paired_old.add(id(old))
+    groups["new_targets"] = [r for r in groups["new_targets"] if id(r) not in paired_new]
+    groups["removed_targets"] = [r for r in groups["removed_targets"] if id(r) not in paired_old]
 
 
 def create_changes_report(
@@ -1810,6 +2628,7 @@ def create_changes_report(
         "still_online": [],
         "still_offline": [],
         "indeterminate": [],
+        "ip_changed": [],
     }
 
     if not previous:
@@ -1858,6 +2677,7 @@ def create_changes_report(
     for key, old in previous_map.items():
         if key not in current_map:
             groups["removed_targets"].append(old)
+    _pair_ip_changes(groups)
 
     previous_time = str(previous.get("timestamp", "unknown")).replace("T", " ")[:19]
     lines = [
@@ -1868,7 +2688,10 @@ def create_changes_report(
         "",
     ]
 
-    important = groups["newly_online"] or groups["went_offline"] or groups["new_targets"] or groups["removed_targets"]
+    important = (
+        groups["newly_online"] or groups["went_offline"] or groups["new_targets"]
+        or groups["removed_targets"] or groups["ip_changed"]
+    )
     if not important:
         lines.extend([
             "NO CONCLUSIVE CHANGES DETECTED",
@@ -1887,6 +2710,9 @@ def create_changes_report(
         if groups["went_offline"]:
             lines.extend(_compact_host_table("WENT OFFLINE", groups["went_offline"]))
             lines.append("")
+        if groups["ip_changed"]:
+            lines.extend(_ip_change_table("IP ADDRESS CHANGED", groups["ip_changed"]))
+            lines.append("")
         if groups["new_targets"]:
             lines.extend(_compact_host_table("NEW TARGETS ADDED TO FILE", groups["new_targets"]))
             lines.append("")
@@ -1902,6 +2728,7 @@ def create_changes_report(
         f"Still online : {len(groups['still_online'])}",
         f"Still offline: {len(groups['still_offline'])}",
         f"Indeterminate: {len(groups['indeterminate'])}",
+        f"IP changed   : {len(groups['ip_changed'])}",
         f"New targets  : {len(groups['new_targets'])}",
         f"Removed      : {len(groups['removed_targets'])}",
         f"Unresolved   : {current_counts['unresolved']}",
@@ -1916,11 +2743,25 @@ def write_changes_report(
     current_records: list[dict],
     source: str,
     output_file: str = "changes.txt",
+    display: str = "full",
 ) -> Path:
-    report, _groups = create_changes_report(previous, current_records, source)
+    """Save the change report; ``display`` is "full", "summary" (one line), or "none"."""
+    report, groups = create_changes_report(previous, current_records, source)
     destination = Path(output_file).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(report, encoding="utf-8")
+    if display == "none":
+        return destination
+    if display == "summary":
+        if previous:
+            print(
+                f"Changes: newly_online={len(groups['newly_online'])} went_offline={len(groups['went_offline'])} "
+                f"ip_changed={len(groups['ip_changed'])} new={len(groups['new_targets'])} "
+                f"removed={len(groups['removed_targets'])} → {destination}"
+            )
+        else:
+            print(f"Changes: baseline saved → {destination}")
+        return destination
 
     # Keep the terminal output easy to understand while the saved report stays plain.
     print(f"\n  {C.BOLD}{C.MAGENTA}{report.splitlines()[0]}{C.RESET}\n")
@@ -1929,7 +2770,7 @@ def write_changes_report(
             print(f"  {C.GREEN}{C.BOLD}{line}{C.RESET}")
         elif line == "WENT OFFLINE":
             print(f"  {C.RED}{C.BOLD}{line}{C.RESET}")
-        elif line in {"NEW TARGETS ADDED TO FILE", "TARGETS REMOVED FROM FILE", "SUMMARY"}:
+        elif line in {"NEW TARGETS ADDED TO FILE", "TARGETS REMOVED FROM FILE", "IP ADDRESS CHANGED", "SUMMARY"}:
             print(f"  {C.YELLOW}{C.BOLD}{line}{C.RESET}")
         else:
             print(f"  {line}")
@@ -1937,51 +2778,58 @@ def write_changes_report(
     return destination
 
 
-def show_file_scan_status(rows: list[dict], results: list[dict], source: str) -> list[dict]:
-    """Show every file entry, resolved IP, and final reachability in one table."""
+_STATUS_COLORS = {
+    "REACHABLE": "GREEN",
+    "NO RESPONSE": "RED",
+    "UNRESOLVED": "YELLOW",
+    "PROBE ERROR": "YELLOW",
+}
+
+
+def show_file_scan_status(
+    rows: list[dict],
+    results: list[dict],
+    source: str,
+    title: str = "FILE SCAN STATUS",
+    hide_host: bool = False,
+    host_header: str = "HOST",
+) -> list[dict]:
+    """Show every target entry, resolved IP, and final reachability in one table."""
     if not rows:
         return []
 
     records = build_file_status_records(rows, results)
-    host_w = min(40, max(12, max(len(record["host"]) for record in records)))
-    ip_w = min(48, max(15, max(len(record["ip"]) for record in records)))
-    status_w, method_w, ttl_w, os_w = 13, 18, 5, 24
-    widths = [host_w, ip_w, status_w, method_w, ttl_w, os_w]
-    line = "  " + C.PURPLE + "+" + "+".join("-" * (width + 2) for width in widths) + "+" + C.RESET
+    columns = _status_columns(records, hide_host, host_header)
+    line = "  " + C.PURPLE + "+" + "+".join("-" * (width + 2) for _h, _k, width in columns) + "+" + C.RESET
+    bar = " " + C.PURPLE + "|" + C.RESET + " "
 
-    print(f"\n  {C.BOLD}{C.MAGENTA}FILE SCAN STATUS · {source}{C.RESET}")
+    print(f"\n  {C.BOLD}{C.MAGENTA}{title} · {source}{C.RESET}")
     print(line)
-    headers = ["HOST", "IP ADDRESS", "STATUS", "METHOD", "TTL", "OS GUESS"]
-    print("  " + C.PURPLE + "|" + C.RESET + " " + (" " + C.PURPLE + "|" + C.RESET + " ").join(
-        f"{C.BOLD}{header:<{width}}{C.RESET}" for header, width in zip(headers, widths)
-    ) + " " + C.PURPLE + "|" + C.RESET)
+    print("  " + C.PURPLE + "|" + C.RESET + " " + bar.join(
+        f"{C.BOLD}{header:<{width}}{C.RESET}" for header, _key, width in columns
+    ) + bar.rstrip())
     print(line)
 
     for record in records:
-        status = record["status"]
-        if status == "REACHABLE":
-            status_color = C.GREEN
-        elif status == "NO RESPONSE":
-            status_color = C.RED
-        elif status == "UNRESOLVED":
-            status_color = C.YELLOW
-        elif status == "PROBE ERROR":
-            status_color = C.YELLOW
-        else:
-            status_color = C.DIM
-
-        os_guess = record["os_guess"]
-        values = [
-            (record["host"], C.WHITE),
-            (record["ip"], C.CYAN if record["ip"] != "UNRESOLVED" else C.YELLOW),
-            (status, status_color),
-            (record["method"], C.YELLOW),
-            (record["ttl"], C.WHITE),
-            (os_guess, ttl_color(os_guess) if os_guess not in {"-", "Unknown"} else C.DIM),
-        ]
-        print("  " + C.PURPLE + "|" + C.RESET + " " + (" " + C.PURPLE + "|" + C.RESET + " ").join(
-            f"{color}{str(value)[:width]:<{width}}{C.RESET}" for (value, color), width in zip(values, widths)
-        ) + " " + C.PURPLE + "|" + C.RESET)
+        cells = []
+        for _header, key, width in columns:
+            value = str(record.get(key, ""))
+            if key == "status":
+                color = getattr(C, _STATUS_COLORS.get(value, "DIM"))
+            elif key == "ip":
+                color = C.CYAN if value != "UNRESOLVED" else C.YELLOW
+            elif key == "method":
+                color = C.YELLOW
+            elif key == "os_guess":
+                color = ttl_color(value) if value not in {"-", "Unknown"} else C.DIM
+            elif key == "name":
+                color = C.TEAL
+            elif key in {"rtt", "loss"}:
+                color = C.DIM if value == "-" else C.WHITE
+            else:
+                color = C.WHITE
+            cells.append(f"{color}{value[:width]:<{width}}{C.RESET}")
+        print("  " + C.PURPLE + "|" + C.RESET + " " + bar.join(cells) + bar.rstrip())
 
     print(line)
     counts = _status_counts(records)
@@ -1996,7 +2844,14 @@ def show_file_scan_status(rows: list[dict], results: list[dict], source: str) ->
     print(summary + "\n")
     return records
 
-def read_target_file(path: str) -> tuple[list[str], list[dict]]:
+
+def read_target_file(
+    path: str,
+    hostnames_out: str = "hostnames.txt",
+    quiet: bool = False,
+    progress: bool = True,
+) -> tuple[list[str], list[dict]]:
+    """Read and resolve a target file. ``quiet`` hides warnings; ``progress`` hides status lines."""
     p = Path(path)
     if not p.exists():
         print(C.err(f"  ✗ File not found: {path}")); sys.exit(1)
@@ -2011,7 +2866,9 @@ def read_target_file(path: str) -> tuple[list[str], list[dict]]:
     targets: list[str] = []
     mappings: list[dict] = []
     bad: list[str] = []
-    print(f"  {C.DIM}Resolving targets from {path} (deadline: 4s per hostname)...{C.RESET}", flush=True)
+    if progress and not quiet:
+        print(f"  {C.DIM}Resolving targets from {path} (deadline: 4s per hostname)...{C.RESET}", flush=True)
+    unsafe: list[str] = []
 
     for raw_line in lines:
         entry = raw_line.split("#", 1)[0].strip()
@@ -2067,6 +2924,8 @@ def read_target_file(path: str) -> tuple[list[str], list[dict]]:
         except ValueError:
             pass
 
+        if not is_safe_hostname(entry):
+            unsafe.append(entry)
         resolved = resolve_hostname(entry)
         if resolved:
             for address in resolved:
@@ -2087,47 +2946,52 @@ def read_target_file(path: str) -> tuple[list[str], list[dict]]:
     mappings = unique_rows
     targets = list(dict.fromkeys(targets))
 
-    if bad:
+    if bad and not quiet:
         print(f"  {C.YELLOW}⚠  Unresolvable entries in {path}: {len(bad)}{C.RESET}")
         for entry in bad:
-            print(f"     {C.RED}✗ {entry}{C.RESET}")
+            note = "  (rejected: not a valid hostname)" if entry in unsafe else ""
+            print(f"     {C.RED}✗ {entry}{C.RESET}{C.DIM}{note}{C.RESET}")
 
     if not targets:
         # Still show the final file-oriented table so the user can see exactly
         # which hostname failed instead of receiving only a generic error.
-        unresolved_records = show_file_scan_status(mappings, [], path)
-        write_hostnames_report(unresolved_records, path, "hostnames.txt")
-        print(C.err(f"  ✗ No valid IPs or resolvable hostnames found in {path}"))
+        if quiet or not progress:
+            unresolved_records = build_file_status_records(mappings, [])
+        else:
+            unresolved_records = show_file_scan_status(mappings, [], path)
+        write_hostnames_report(unresolved_records, path, hostnames_out, announce=not quiet)
+        print(C.err(f"  ✗ No valid IPs or resolvable hostnames found in {path}"), file=sys.stderr)
         sys.exit(1)
 
-    print(f"  {C.CYAN}Loaded {C.BOLD}{len(targets)}{C.RESET}{C.CYAN} resolved targets from {path}{C.RESET}")
+    if progress and not quiet:
+        print(f"  {C.CYAN}Loaded {C.BOLD}{len(targets)}{C.RESET}{C.CYAN} resolved targets from {path}{C.RESET}")
     return targets, mappings
 
 
-def resolve_host_arguments(hostnames: list[str]) -> list[str]:
-    """Resolve --host values and fail clearly if none resolve."""
+def resolve_host_arguments(hostnames: list[str], quiet: bool = False) -> tuple[list[str], list[dict]]:
+    """Resolve command-line hosts into (addresses, host/IP rows); fail clearly if none resolve."""
     targets: list[str] = []
+    rows: list[dict] = []
     bad: list[str] = []
     for hostname in hostnames:
-        try:
-            address = _normalise_probe_address(hostname)
-            if address is None:
-                raise ValueError("not a unicast host address")
+        address = _normalise_probe_address(hostname)
+        if address is not None:
             targets.append(address)
+            rows.append({"host": hostname, "ip": address, "type": "DIRECT IP"})
             continue
-        except ValueError:
-            pass
         resolved = resolve_hostname(hostname)
         if resolved:
             targets.extend(resolved)
+            rows.extend({"host": hostname, "ip": ip, "type": "DNS"} for ip in resolved)
         else:
             bad.append(hostname)
-    if bad:
+            rows.append({"host": hostname, "ip": "UNRESOLVED", "type": "UNRESOLVED"})
+    if bad and not quiet:
         print(C.warn(f"  ⚠  Could not resolve: {', '.join(bad)}"))
     targets = list(dict.fromkeys(targets))
     if not targets:
-        print(C.err("  ✗ No valid IPs or resolvable hostnames supplied.")); sys.exit(1)
-    return targets
+        print(C.err("  ✗ No valid IPs or resolvable hostnames supplied."), file=sys.stderr); sys.exit(1)
+    return targets, rows
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2157,7 +3021,7 @@ def check_deps(
         print(f"\n  {C.RED}✗ No ping tool found on PATH.{C.RESET}")
         print(f"  {C.YELLOW}Install one of:{C.RESET}")
         print(f"  {C.DIM}  sudo apt install fping   # Debian/Ubuntu/Kali")
-        print(f"       sudo dnf install fping   # RHEL/Fedora")
+        print("       sudo dnf install fping   # RHEL/Fedora")
         print(f"       brew install fping       # macOS{C.RESET}")
         sys.exit(3)
 
@@ -2199,79 +3063,295 @@ def check_deps(
 # SHOW HISTORY LIST
 # ─────────────────────────────────────────────────────────────────
 def show_history_list():
-    d = _data_dir(); d.mkdir(parents=True, exist_ok=True)
-    files = sorted(f for f in d.glob("*.json") if not f.name.startswith("."))
-    if not files:
-        print(f"  {C.YELLOW}No scan history found.{C.RESET}\n"); return
+    d = _data_dir()
+    files = sorted(f for f in d.glob("*.json") if not f.name.startswith(".")) if d.is_dir() else []
+    legacy = _legacy_data_dir()
+    legacy_files = (
+        sorted(f for f in legacy.glob("*.json") if not f.name.startswith("."))
+        if legacy.is_dir() and legacy.resolve() != d.resolve() else []
+    )
+    if not files and not legacy_files:
+        print(f"  {C.YELLOW}No scan history found in {d}.{C.RESET}\n"); return
     box_w = 70
     div   = f"  {C.CYAN}{'─' * box_w}{C.RESET}"
-    print(f"\n  {C.BOLD}{C.CYAN}Stored Scan History:{C.RESET}"); print(div)
-    for f in files:
+    print(f"\n  {C.BOLD}{C.CYAN}Stored Scan History:{C.RESET}  {C.DIM}{d}{C.RESET}"); print(div)
+    for f in files + legacy_files:
         try:
-            data  = json.loads(f.read_text())
+            data  = json.loads(f.read_text(encoding="utf-8"))
             n     = len(data); last = data[-1] if data else {}
             ts    = last.get("timestamp", "?")[:16]
             alive = len(last.get("alive", []))
-            print(f"  {C.LIME}{f.stem:<30}{C.RESET}  {C.DIM}{n} scans  last: {ts}  alive: {alive}{C.RESET}")
+            where = f"  {C.YELLOW}(legacy ./data){C.RESET}" if f in legacy_files else ""
+            print(f"  {C.LIME}{f.stem:<30}{C.RESET}  {C.DIM}{n} scans  last: {ts}  alive: {alive}{C.RESET}{where}")
         except Exception:
             print(f"  {C.RED}{f.stem}  (corrupt){C.RESET}")
-    print(div + "\n")
+    print(div)
+    print(f"  {C.DIM}Clear one with: pingme --clear-history <label>{C.RESET}\n")
 
 
 # ─────────────────────────────────────────────────────────────────
 # CLEAR HISTORY
 # ─────────────────────────────────────────────────────────────────
 def clear_history(label: str):
-    hf = history_file(label)
-    if not hf.exists():
+    """Delete history, resume, and --changes state for a label (new and legacy locations)."""
+    removed = [kind for kind in ("history", "resume", "changes") if _remove_state(kind, label)]
+    if not removed:
         print(C.warn(f"  ⚠  No history found for label: {label}")); return
-    hf.unlink()
-    print(C.ok(f"  ✔  History cleared for: {label}"))
-    # Also clear any leftover resume and simplified comparison state.
-    clear_partial(label)
-    changes_file = _changes_state_file(label)
-    if changes_file.exists():
-        changes_file.unlink()
+    print(C.ok(f"  ✔  Cleared {', '.join(removed)} data for: {label}"))
+
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIG FILE
+# ─────────────────────────────────────────────────────────────────
+CONFIG_TYPES: dict[str, type] = {
+    "threads": int,
+    "timeout": float,
+    "count": int,
+    "retry": int,
+    "rate": int,
+    "min_replies": int,
+    "ping_tool": str,
+    "tcp_ports": str,
+    "tcp_timeout": float,
+    "dns": bool,
+    "out_format": str,
+    "keep": int,
+    "color": str,
+    "data_dir": str,
+    "max_hosts": int,
+    "no_banner": bool,
+    "exit_zero": bool,
+}
+
+CONFIG_TEMPLATE = """\
+# PingMe configuration. Every setting is optional; command-line flags win.
+# Remove the leading '#' to activate a line.
+
+# threads = 20          # concurrent workers
+# timeout = 2           # seconds to wait per ping (fractions like 0.5 work)
+# count = 2             # ping attempts per host
+# min_replies = 2       # replies needed before a host counts as reachable
+# retry = 0             # extra rounds for hosts that did not answer
+# rate = 0              # packets per second, 0 = unlimited
+# ping_tool = "auto"    # auto | fping | ping | ask
+# tcp_ports = "22,80,443,3389"
+# tcp_timeout = 2
+# dns = true            # reverse-resolve IPs to hostnames (default: auto)
+# out_format = "txt"    # txt | csv | json
+# keep = 50             # history entries kept per label, 0 = unlimited
+# color = "auto"        # auto | always | never
+# data_dir = "~/pingme-data"
+# max_hosts = 65536
+# no_banner = false
+# exit_zero = false
+"""
+
+
+def default_config_path() -> Path:
+    override = os.environ.get("PINGME_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA")
+        return (Path(base) if base else Path.home() / "AppData" / "Roaming") / "PingMe" / "config.toml"
+    base = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(base) if base else Path.home() / ".config") / "pingme" / "config.toml"
+
+
+def _strip_toml_comment(line: str) -> str:
+    quote = ""
+    for index, character in enumerate(line):
+        if quote:
+            if character == quote:
+                quote = ""
+        elif character in "\"'":
+            quote = character
+        elif character == "#":
+            return line[:index]
+    return line
+
+
+def _parse_toml_value(raw: str) -> object:
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        return [_parse_toml_value(item) for item in next(csv.reader([inner], skipinitialspace=True)) if item.strip()]
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1]
+    if raw in {"true", "false"}:
+        return raw == "true"
+    for convert in (int, float):
+        try:
+            return convert(raw.replace("_", ""))
+        except ValueError:
+            continue
+    raise ValueError(f"unsupported value: {raw}")
+
+
+def parse_simple_toml(text: str) -> dict:
+    """Read the flat ``key = value`` subset of TOML PingMe uses (Python < 3.11 has no tomllib)."""
+    data: dict = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = _strip_toml_comment(line).strip()
+        if not stripped or stripped == "[pingme]":
+            continue
+        if stripped.startswith("["):
+            raise ValueError(f"line {number}: tables are not supported; use top-level keys")
+        key, separator, value = stripped.partition("=")
+        if not separator:
+            raise ValueError(f"line {number}: expected key = value")
+        try:
+            data[key.strip().strip('"')] = _parse_toml_value(value)
+        except ValueError as exc:
+            raise ValueError(f"line {number}: {exc}") from exc
+    return data
+
+
+def load_config(path: Path) -> dict:
+    """Load and type-check a config file; returns argparse destinations and values."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        raw = parse_simple_toml(text)
+    else:
+        raw = tomllib.loads(text)
+    if isinstance(raw.get("pingme"), dict):
+        raw = raw["pingme"]
+
+    config: dict = {}
+    for key, value in raw.items():
+        dest = key.replace("-", "_")
+        expected = CONFIG_TYPES.get(dest)
+        if expected is None:
+            close = difflib.get_close_matches(dest, CONFIG_TYPES, n=1)
+            hint = f" (did you mean '{close[0]}'?)" if close else ""
+            raise ValueError(f"unknown setting '{key}'{hint}")
+        if dest == "tcp_ports" and isinstance(value, (list, int)) and not isinstance(value, bool):
+            value = ",".join(str(item) for item in value) if isinstance(value, list) else str(value)
+        if expected is float and isinstance(value, int) and not isinstance(value, bool):
+            value = float(value)
+        if not isinstance(value, expected) or (expected is not bool and isinstance(value, bool)):
+            raise ValueError(f"'{key}' must be a {expected.__name__}")
+        config[dest] = value
+    return config
 
 
 # ─────────────────────────────────────────────────────────────────
 # CLI HELP / ARGUMENT PARSER
 # ─────────────────────────────────────────────────────────────────
-HELP_TOPICS = ("targets", "scan", "discovery", "output", "history", "advanced", "examples")
+HELP_TOPICS = (
+    "targets", "scan", "discovery", "output", "history", "config",
+    "exitcodes", "advanced", "examples",
+)
+
+EXIT_OK = 0
+EXIT_NOT_ALL_UP = 1
+EXIT_USAGE = 2
+EXIT_ENVIRONMENT = 3
+EXIT_PROBE_ERRORS = 4
+EXIT_INTERRUPTED = 130
+
+DNS_AUTO_LIMIT = 1024
 
 
 class ColorArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser with ANSI-colored headings, flags, metavars, and examples."""
+    """ArgumentParser with colored help and friendly, suggestion-bearing errors."""
 
     def format_help(self) -> str:
         text = super().format_help()
-        if not sys.stdout.isatty():
+        if not _COLOR_ENABLED:
             return text
 
-        # Section headings.
         text = re.sub(
-            r"(?m)^(usage:|Targets:|Discovery:|Scan Control:|Output:|History:|Advanced:|Help:|options:)$",
+            r"(?m)^(usage:|Targets:|Discovery:|Scan Control:|Output:|History:|Advanced:|Help:|options:|positional arguments:)$",
             lambda m: f"{C.BOLD}{C.MAGENTA}{m.group(1)}{C.RESET}",
             text,
         )
-        # Option flags. Applied after argparse has aligned the plain text.
         text = re.sub(
             r"(?<![\w])(--?[a-zA-Z][\w-]*)(?=[,\s=]|$)",
             lambda m: f"{C.CYAN}{C.BOLD}{m.group(1)}{C.RESET}",
             text,
         )
-        # Common metavars and choice groups.
         text = re.sub(
-            r"\b(CIDR|FILE|HOST|IP|PORTS|SEC|PPS|NAME|N|TOPIC|A|B)\b",
+            r"\b(CIDR|FILE|HOST|IP|PORTS|SEC|PPS|NAME|N|TOPIC|TARGET|MODE|DIR|A|B)\b",
             lambda m: f"{C.YELLOW}{m.group(1)}{C.RESET}",
             text,
         )
         text = re.sub(
-            r"(\{(?:auto|fping|ping|txt|csv|json)[^}]*\})",
+            r"(\{(?:auto|fping|ping|txt|csv|json|always|never)[^}]*\})",
             lambda m: f"{C.ORANGE}{m.group(1)}{C.RESET}",
             text,
         )
         return text
+
+    def error(self, message: str):
+        hint = ""
+        unknown = re.search(r"unrecognized arguments?: (\S+)", message)
+        if unknown:
+            options = [option for action in self._actions for option in action.option_strings]
+            close = difflib.get_close_matches(unknown.group(1).split("=", 1)[0], options, n=1)
+            if close:
+                hint = f"Did you mean {close[0]}?"
+        sys.stderr.write(f"\n  {C.RED}✗ {message}{C.RESET}\n")
+        if hint:
+            sys.stderr.write(f"  {C.YELLOW}{hint}{C.RESET}\n")
+        sys.stderr.write(f"  {C.DIM}Run 'pingme -h' for quick help or 'pingme help examples'.{C.RESET}\n\n")
+        sys.exit(EXIT_USAGE)
+
+
+class _QuickHelpAction(argparse.Action):
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):
+        super().__init__(option_strings, dest=dest, default=default, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print_quick_help()
+        parser.exit()
+
+
+def print_quick_help() -> None:
+    """The short, task-oriented help shown by -h and by a bare 'pingme'."""
+    def section(title: str) -> None:
+        print(f"\n  {C.BOLD}{C.MAGENTA}{title}{C.RESET}")
+
+    def line(left: str, right: str, width: int = 38) -> None:
+        print(f"    {C.CYAN}{left:<{width}}{C.RESET} {right}")
+
+    print(f"\n  {C.BOLD}{C.MAGENTA}PingMe {VERSION}{C.RESET} — find which hosts are up, what they are called, and what changed.")
+    section("USAGE")
+    print(f"    pingme {C.YELLOW}TARGET{C.RESET} [{C.YELLOW}TARGET{C.RESET} ...] [OPTIONS]")
+    print(f"    pingme help {C.YELLOW}TOPIC{C.RESET}")
+
+    section("TARGETS  (mix them freely)")
+    line("192.168.1.10   2001:db8::10", "an IP address (IPv4 or IPv6; fe80::1%eth0)")
+    line("server01   web.example.com", "a hostname (DNS, hosts file, NetBIOS...)")
+    line("192.168.1.0/24", "every host in a subnet")
+    line("hosts.txt", "a file with one target per line")
+
+    section("EVERYDAY EXAMPLES")
+    line("pingme 192.168.1.0/24", "find live hosts and their names")
+    line("pingme hosts.txt --changes", "what came up / went down since last run")
+    line("pingme web01 db01 --tcp-ports 22,443", "also count open ports (for hosts that block ping)")
+    line("pingme --reverse 10.0.0.0/28", "look up hostnames for IPs, no ping")
+    line("pingme 10.0.0.0/24 --watch 60", "rescan every minute and report changes")
+    line("pingme --discover6", "find IPv6 hosts on your local networks")
+    line("pingme --sub 10.0.0.0/22", "subnet calculator only")
+
+    section("COMMON OPTIONS")
+    line("--fast", "quick sweep: 100 threads, 1 s timeout")
+    line("--tcp-ports PORTS", "treat an accepted TCP connection as reachable")
+    line("--dns / --no-dns", f"IP → hostname lookups (auto: on up to {DNS_AUTO_LIMIT:,} targets)")
+    line("--changes", "compare a file scan with the previous one")
+    line("--out-format txt|csv|json", "format for alive/dead/errors files")
+    line("--compact / -q, --quiet", "less terminal output / files only")
+    line("--exclude IP/CIDR ...", "skip addresses")
+
+    section("MORE HELP")
+    print(f"    pingme help {C.CYAN}{' | '.join(HELP_TOPICS)}{C.RESET}")
+    print(f"    pingme {C.CYAN}--help-all{C.RESET}   every option in one list")
+    print(f"\n  {C.DIM}Only scan networks you are authorized to test.{C.RESET}\n")
 
 
 def _topic_header(title: str, description: str) -> None:
@@ -2279,169 +3359,228 @@ def _topic_header(title: str, description: str) -> None:
     print(f"  {C.DIM}{description}{C.RESET}\n")
 
 
-def print_topic_help(topic: str) -> None:
-    """Show focused nested help without changing the existing CLI syntax."""
+def print_topic_help(topic: str) -> int:
+    """Show focused nested help. Returns an exit status."""
     topic = topic.lower().strip()
+    if not topic:
+        print_quick_help()
+        return EXIT_OK
     if topic not in HELP_TOPICS:
         print(C.err(f"  ✗ Unknown help topic: {topic}"))
+        close = difflib.get_close_matches(topic, HELP_TOPICS, n=1)
+        if close:
+            print(C.warn(f"  Did you mean: pingme help {close[0]}"))
         print(f"  {C.DIM}Available topics: {', '.join(HELP_TOPICS)}{C.RESET}\n")
-        return
+        return EXIT_USAGE
 
     if topic == "targets":
-        _topic_header("TARGET SELECTION", "Choose one or more sources of IP addresses or hostnames.")
+        _topic_header("TARGET SELECTION", "Give targets as plain arguments, or use the explicit flags.")
         rows = [
-            ("-s, --sub CIDR", "Analyze a subnet; add --scan to probe its hosts."),
-            ("-f, --file FILE", "Read IPs/hostnames from a file; scanning is implied."),
-            ("--host HOST ...", "Resolve and scan individual hosts or IP addresses."),
-            ("--exclude IP/CIDR ...", "Skip selected IP addresses or complete networks."),
-            ("--max-hosts N", "Safety limit for CIDR expansion; default 65,536."),
+            ("TARGET ...", "IP, hostname, CIDR, or existing file; detected automatically."),
+            ("-s, --sub CIDR", "Subnet calculator; add --scan to probe its hosts."),
+            ("-f, --file FILE", "Read IPs/hostnames from a file (one per line, # comments)."),
+            ("--host HOST ...", "Resolve and scan hosts (use when a name matches a file)."),
+            ("--exclude IP/CIDR ...", "Skip addresses or whole networks."),
+            ("--max-hosts N", "Safety limit for subnet expansion (default 65,536)."),
+            ("--discover6 [IFACE ...]", "Find IPv6 hosts on local links (multicast + neighbor cache)."),
+            ("-4 / -6", "Use only IPv4 or only IPv6 addresses (resolution and scanning)."),
+            ("IPv6 forms", "2001:db8::10, [2001:db8::10], fe80::1%eth0, 2001:db8::/120."),
+            ("File lines", "'host', 'IP', 'IP host', 'host,IP', or 'IP,host'."),
         ]
     elif topic == "scan":
-        _topic_header("SCAN CONTROL", "Tune speed, retries, packet count, and backend behavior.")
+        _topic_header("SCAN CONTROL", "Tune speed, accuracy, and backend behavior.")
         rows = [
-            ("--scan", "Run discovery for --sub targets."),
-            ("-t, --threads N", "Concurrent workers; default 20."),
-            ("--timeout SEC", "Per-packet wait; default 2 seconds."),
-            ("--count N", "Packets sent per host; default 2."),
-            ("--retry N", "Retry hosts that did not respond."),
-            ("--rate PPS", "Global packet-rate limit; 0 means unlimited."),
-            ("--fast", "Use 100 threads, 1-second timeout, and 1 packet."),
-            ("--resume", "Continue an interrupted scan from saved state."),
-            ("--ping-tool auto|fping|ping", "Select the ICMP backend."),
+            ("--scan", "Probe the hosts of --sub (targets given directly are always scanned)."),
+            ("-t, --threads N", "Concurrent workers (default 20, max 1000)."),
+            ("--timeout SEC", "Wait per ping, fractions allowed (default 2)."),
+            ("--count N", "Ping attempts per host (default 2)."),
+            ("--min-replies N", "Replies needed to count as reachable (default 2)."),
+            ("--retry N", "Extra rounds for hosts that did not answer (max 5)."),
+            ("--rate PPS", "Global packets-per-second cap; 0 = unlimited."),
+            ("--fast", "100 threads, 1 s timeout, 1 attempt (positives are still confirmed)."),
+            ("--resume", "Continue a scan interrupted with Ctrl+C."),
+            ("--watch SEC", "Rescan every SEC seconds and print only changes."),
+            ("--ping-tool MODE", "auto | fping | ping | ask (ask = choose interactively)."),
         ]
     elif topic == "discovery":
-        _topic_header("DISCOVERY FEATURES", "Add DNS and TCP checks to standard ICMP discovery.")
+        _topic_header("DISCOVERY FEATURES", "Names, ports, and classification on top of ICMP.")
         rows = [
-            ("--dns", "Perform reverse DNS lookups for reachable hosts."),
-            ("--tcp-ports PORTS", "Check ports such as 22,80,443 or 8000-8010."),
-            ("--tcp-timeout SEC", "TCP connection timeout per port; default 2 seconds."),
+            ("--dns", "Resolve every scanned IP to a hostname (DNS, hosts, mDNS, NetBIOS)."),
+            ("--no-dns", f"Skip name lookups (auto mode resolves up to {DNS_AUTO_LIMIT:,} targets)."),
+            ("-r, --reverse IP/CIDR ...", "Only look up hostnames for addresses; no ping."),
+            ("--tcp-ports PORTS", "Also try ports like 22,80,443 or 8000-8010."),
+            ("--tcp-timeout SEC", "TCP connect timeout (default 2); ports are tried in parallel."),
             ("--ipinfo IP ...", "Classify addresses as public, private, or special-use."),
         ]
     elif topic == "output":
-        _topic_header("OUTPUT", "Control result files, formats, and terminal verbosity.")
+        _topic_header("OUTPUT", "Result files, formats, and terminal verbosity.")
         rows = [
-            ("--alive-out FILE", "Destination for reachable hosts."),
-            ("--dead-out FILE", "Destination for completed probes with no response."),
-            ("--error-out FILE", "Destination for targets whose probes failed to execute."),
-            ("--hostnames-out FILE", "Complete HOST/IP/STATUS/METHOD/TTL/OS report (default: hostnames.txt)."),
-            ("--changes-out FILE", "Saved change summary when --changes is used (default: changes.txt)."),
-            ("--out-format txt|csv|json", "Choose the file format."),
-            ("--quiet", "Write files only; suppress normal terminal output."),
-            ("--compact", "Show only the summary and saved file paths."),
-            ("--verbose", "Show diagnostic tables, progress, and backend details."),
-            ("--no-banner", "Suppress the startup banner."),
-            ("--label NAME", "Set a stable label for history and resume data."),
+            ("--alive-out FILE", "Reachable hosts (default alive.txt)."),
+            ("--dead-out FILE", "Completed probes with no response (default dead.txt)."),
+            ("--error-out FILE", "Probes that failed to run (default errors.txt)."),
+            ("--hostnames-out FILE", "Full HOST/IP/STATUS/RTT/LOSS/OS table (file scans: hostnames.txt)."),
+            ("--changes-out FILE", "Change summary written by --changes (default changes.txt)."),
+            ("--out-format FMT", "txt | csv | json for the alive/dead/errors files."),
+            ("-q, --quiet", "Write files only; no terminal output."),
+            ("--compact", "Summary line and file paths only."),
+            ("--verbose", "Full interface even when output is redirected."),
+            ("--color MODE", "auto | always | never (NO_COLOR is honoured)."),
+            ("--no-banner", "Hide the startup banner."),
         ]
     elif topic == "history":
         _topic_header("HISTORY AND COMPARISON", "Track changes across scans or compare saved snapshots.")
         rows = [
+            ("--changes", "Hostname-aware comparison with the previous file scan."),
+            ("--compare", "IP-only comparison with the previous scan of the label."),
+            ("--diff A B", "Compare two result files (txt, csv, or json)."),
             ("--history", "List stored scan histories."),
-            ("--changes", "Simple hostname-aware comparison with the last file scan."),
-            ("--compare", "Legacy IP-only history comparison."),
-            ("--diff A B", "Compare two plain-text IP snapshot files."),
-            ("--clear-history NAME", "Delete stored history for a label."),
-            ("--no-history", "Do not save the current scan."),
+            ("--clear-history NAME|FILE", "Delete stored data for a label or target file."),
+            ("--no-history", "Do not save this scan."),
+            ("--keep N", f"History entries kept per label (default {DEFAULT_HISTORY_KEEP}; 0 = all)."),
+            ("--label NAME", "Stable name for history/resume data."),
+            ("--data-dir DIR", f"Where state lives (default {_default_data_dir()})."),
+        ]
+    elif topic == "config":
+        _topic_header("CONFIGURATION FILE", "Save your preferred defaults once.")
+        rows = [
+            ("Location", str(default_config_path())),
+            ("--init-config", "Create a commented template at that location."),
+            ("--config FILE", "Use a different config file (or set PINGME_CONFIG)."),
+            ("--no-config", "Ignore the config file for this run."),
+            ("Keys", ", ".join(CONFIG_TYPES)),
+            ("Precedence", "command-line flag > config file > built-in default."),
+        ]
+    elif topic == "exitcodes":
+        _topic_header("EXIT CODES", "For scripts, cron jobs, and monitoring checks.")
+        rows = [
+            ("0", "Hosts/files: every target reachable. Subnets: at least one host found."),
+            ("1", "Hosts/files: a target is down or unresolved. Subnets: nothing found."),
+            ("2", "Usage or configuration error."),
+            ("3", "No usable ping tool is installed."),
+            ("4", "At least one probe failed to run (see errors.txt)."),
+            ("130", "Interrupted with Ctrl+C (use --resume to continue)."),
+            ("--exit-zero", "Always exit 0 after a completed scan."),
         ]
     elif topic == "advanced":
         _topic_header("ADVANCED NOTES", "Operational behavior and safety controls.")
         rows = [
-            ("IPv6", "Supported for individual hosts and practical CIDRs."),
-            ("Reachability", "A host is alive when ICMP responds or a requested TCP port opens."),
-            ("TTL fingerprint", "Qualified OS-family hints are heuristic, never definitive."),
-            ("Fail closed", "Only a direct target reply or accepted TCP connection is reachable."),
+            ("Fail closed", "Reachable only with direct echo replies or an accepted TCP connection."),
+            ("Confirmation", "Replies must come from separate ping processes (--min-replies)."),
+            ("fping", "Used for fast discovery; every positive is re-confirmed with ping."),
+            ("TTL hint", "OS-family guesses are heuristic, never definitive."),
+            ("IPv6", "Hosts, files, CIDRs up to --max-hosts, and --discover6 for /64 LANs."),
+            ("Link-local", "fe80:: addresses need a zone: fe80::1%eth0 (Windows: %12)."),
+            ("State", "History, resume, and baselines live in --data-dir, not the cwd."),
             ("Authorization", "Only scan systems and networks you are authorized to assess."),
         ]
     else:
         _topic_header("EXAMPLES", "Common PingMe workflows.")
         examples = [
-            "pingme --sub 192.168.1.0/24",
-            "pingme --sub 192.168.1.0/24 --scan",
-            "pingme --sub 192.168.1.0/24 --scan --fast",
-            "pingme --file targets.txt --dns",
-            "pingme --host server.local 10.0.0.10 --tcp-ports 22,443",
-            "pingme --file endpoints.txt --changes",
-            "pingme --sub 10.0.0.0/24 --scan --compare --label office",
-            "pingme --ipinfo 8.8.8.8 192.168.1.1",
-            "pingme --diff alive_old.txt alive_new.txt",
+            ("pingme 192.168.1.0/24", "find live hosts and their names"),
+            ("pingme 192.168.1.0/24 --fast", "quicker, less tolerant of slow hosts"),
+            ("pingme targets.txt", "scan a file of hostnames/IPs"),
+            ("pingme targets.txt --changes", "report what changed since last time"),
+            ("pingme server.local 10.0.0.10 --tcp-ports 22,443", "hosts that may block ping"),
+            ("pingme 10.0.0.0/24 --watch 30", "live monitoring"),
+            ("pingme --reverse 10.0.0.1 10.0.0.0/29", "IP → hostname only"),
+            ("pingme --discover6", "find IPv6 hosts on every local link"),
+            ("pingme server01 -6", "scan only the IPv6 addresses of a host"),
+            ("pingme 10.0.0.0/24 --out-format csv --alive-out up.csv", "spreadsheet output"),
+            ("pingme --sub 10.0.0.0/22", "subnet calculator"),
+            ("pingme --ipinfo 8.8.8.8 192.168.1.1", "classify addresses"),
+            ("pingme --diff alive_old.txt alive_new.txt", "compare two result files"),
+            ("pingme --init-config", "create a config file for your defaults"),
         ]
-        for command in examples:
-            print(f"  {C.CYAN}${C.RESET} {C.BOLD}{command}{C.RESET}")
+        width = max(len(command) for command, _ in examples)
+        for command, description in examples:
+            print(f"  {C.CYAN}${C.RESET} {C.BOLD}{command:<{width}}{C.RESET}  {C.DIM}{description}{C.RESET}")
         print()
-        return
+        return EXIT_OK
 
     width = max(len(flag) for flag, _ in rows)
     for flag, description in rows:
         print(f"  {C.CYAN}{C.BOLD}{flag:<{width}}{C.RESET}  {description}")
     print()
+    return EXIT_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
-    examples = (
-        f"{C.BOLD}Nested help:{C.RESET}\n"
-        "  pingme help targets       Target selection and exclusions\n"
-        "  pingme help scan          Threads, retries, speed, and backend\n"
-        "  pingme help discovery     ICMP, TCP, DNS, and IP classification\n"
-        "  pingme help output        Files, formats, and terminal controls\n"
-        "  pingme help history       History, comparison, and diff mode\n"
-        "  pingme help examples      Ready-to-run command examples\n\n"
-        f"{C.BOLD}Quick examples:{C.RESET}\n"
-        "  pingme --sub 192.168.1.0/24\n"
-        "  pingme --sub 192.168.1.0/24 --scan --fast\n"
-        "  pingme --file targets.txt --dns --tcp-ports 22,80,443\n"
+    epilog = (
+        f"{C.BOLD}Topics:{C.RESET} pingme help {' | '.join(HELP_TOPICS)}\n"
+        f"{C.BOLD}Quick help:{C.RESET} pingme -h\n"
     )
 
     p = ColorArgumentParser(
         prog="pingme",
+        usage="pingme [TARGET ...] [OPTIONS]",
         description=(
-            f"{C.BOLD}{C.MAGENTA}PingMe v{VERSION}{C.RESET} — advanced ICMP/TCP host discovery, "
-            "subnet analysis, history, and IP classification."
+            f"{C.BOLD}{C.MAGENTA}PingMe v{VERSION}{C.RESET} — ICMP/TCP host discovery with hostnames, "
+            "change tracking, and subnet tools."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
         add_help=False,
-        epilog=examples,
+        epilog=epilog,
     )
+
+    p.add_argument("targets", nargs="*", metavar="TARGET",
+                   help="IP, hostname, CIDR, or target file (type detected automatically)")
 
     tg = p.add_argument_group("Targets")
     tg.add_argument("-s", "--sub", metavar="CIDR",
-                    help="Analyze a subnet; add --scan to probe its hosts")
+                    help="Subnet calculator; add --scan to probe its hosts")
     tg.add_argument("-f", "--file", metavar="FILE",
-                    help="Scan IPs/hostnames from a file (scan implied)")
+                    help="Scan IPs/hostnames from a file")
     tg.add_argument("--host", metavar="HOST", nargs="+",
                     help="Scan one or more IP addresses or hostnames")
     tg.add_argument("--exclude", metavar="IP/CIDR", nargs="+",
                     help="Skip one or more IP addresses or CIDRs")
     tg.add_argument("--max-hosts", type=int, default=65536, metavar="N",
-                    help="Maximum CIDR targets to expand (default: 65536)")
+                    help="Maximum subnet targets to expand (default: 65536)")
+    tg.add_argument("--discover6", nargs="*", metavar="IFACE",
+                    help="Find IPv6 hosts on local links (all interfaces if none given)")
+    family = tg.add_mutually_exclusive_group()
+    family.add_argument("-4", "--ipv4-only", dest="family", action="store_const", const=4,
+                        help="Resolve and scan IPv4 addresses only")
+    family.add_argument("-6", "--ipv6-only", dest="family", action="store_const", const=6,
+                        help="Resolve and scan IPv6 addresses only")
 
     dg = p.add_argument_group("Discovery")
     dg.add_argument("--scan", action="store_true",
-                    help="Run discovery (required with --sub)")
-    dg.add_argument("--dns", action="store_true",
-                    help="Reverse DNS lookup for reachable hosts")
+                    help="Probe the hosts of --sub")
+    dg.add_argument("--dns", dest="dns", action="store_const", const=True, default=None,
+                    help=f"Resolve every scanned IP to a hostname (auto: up to {DNS_AUTO_LIMIT} targets)")
+    dg.add_argument("--no-dns", dest="dns", action="store_const", const=False,
+                    help="Skip IP → hostname lookups")
+    dg.add_argument("-r", "--reverse", metavar="IP/CIDR", nargs="+",
+                    help="Only look up hostnames for addresses (no ping)")
     dg.add_argument("--tcp-ports", metavar="PORTS",
                     help="TCP checks, e.g. 22,80,443 or 8000-8010")
-    dg.add_argument("--tcp-timeout", type=int, default=2, metavar="SEC",
-                    help="TCP connect timeout per port (default: 2)")
+    dg.add_argument("--tcp-timeout", type=float, default=2, metavar="SEC",
+                    help="TCP connect timeout (default: 2)")
     dg.add_argument("--ipinfo", metavar="IP", nargs="+",
                     help="Classify IP addresses as public/private/special")
 
     sg = p.add_argument_group("Scan Control")
     sg.add_argument("-t", "--threads", type=int, default=20, metavar="N",
                     help="Concurrent workers (default: 20)")
-    sg.add_argument("--timeout", type=int, default=2, metavar="SEC",
-                    help="Per-packet wait seconds (default: 2)")
+    sg.add_argument("--timeout", type=float, default=2, metavar="SEC",
+                    help="Wait per ping in seconds, fractions allowed (default: 2)")
     sg.add_argument("--count", type=int, default=2, metavar="N",
-                    help="Packets per host (default: 2)")
+                    help="Ping attempts per host (default: 2)")
+    sg.add_argument("--min-replies", type=int, default=2, metavar="N",
+                    help="Replies required for REACHABLE (default: 2)")
     sg.add_argument("--retry", type=int, default=0, metavar="N",
-                    help="Retries for non-responsive hosts (default: 0)")
+                    help="Extra rounds for non-responsive hosts (default: 0)")
     sg.add_argument("--rate", type=int, default=0, metavar="PPS",
                     help="Maximum packets/sec; 0 = unlimited")
-    sg.add_argument("--ping-tool", default="auto", choices=["auto", "fping", "ping"],
+    sg.add_argument("--ping-tool", default="auto", choices=["auto", "fping", "ping", "ask"],
                     help="ICMP backend (default: auto)")
     sg.add_argument("--fast", action="store_true",
-                    help="100 threads, 1s timeout, 1 packet")
+                    help="100 threads, 1s timeout, 1 attempt")
     sg.add_argument("--resume", action="store_true",
                     help="Resume an interrupted scan")
+    sg.add_argument("--watch", type=float, metavar="SEC",
+                    help="Rescan every SEC seconds and report changes (Ctrl+C stops)")
 
     og = p.add_argument_group("Output")
     og.add_argument("--alive-out", default="alive.txt", metavar="FILE",
@@ -2450,22 +3589,26 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Non-responsive-host output file (default: dead.txt)")
     og.add_argument("--error-out", default="errors.txt", metavar="FILE",
                     help="Probe-execution-error output file (default: errors.txt)")
-    og.add_argument("--hostnames-out", default="hostnames.txt", metavar="FILE",
-                    help="Complete file-scan table (default: hostnames.txt)")
+    og.add_argument("--hostnames-out", default=None, metavar="FILE",
+                    help="Full status table (file scans default to hostnames.txt)")
     og.add_argument("--changes-out", default="changes.txt", metavar="FILE",
                     help="Change report written by --changes (default: changes.txt)")
     og.add_argument("--out-format", default="txt", choices=["txt", "csv", "json"],
                     help="Output format (default: txt)")
     og.add_argument("--label", metavar="NAME",
-                    help="History/resume label (default: target-derived)")
-    og.add_argument("--quiet", action="store_true",
-                    help="Write files only; suppress normal terminal output")
+                    help="History/resume label (default: derived from targets)")
+    og.add_argument("-q", "--quiet", action="store_true",
+                    help="Write files only; suppress terminal output")
     og.add_argument("--compact", action="store_true",
                     help="Show only the summary and saved file paths")
     og.add_argument("--verbose", action="store_true",
-                    help="Force graphical diagnostic output even when redirected")
+                    help="Full interface even when output is redirected")
+    og.add_argument("--color", default="auto", choices=["auto", "always", "never"],
+                    help="Colored output (default: auto; NO_COLOR honoured)")
     og.add_argument("--no-banner", action="store_true",
                     help="Suppress the ASCII banner")
+    og.add_argument("--exit-zero", action="store_true",
+                    help="Exit 0 after any completed scan")
 
     hg = p.add_argument_group("History")
     hg.add_argument("--history", action="store_true",
@@ -2473,34 +3616,206 @@ def build_parser() -> argparse.ArgumentParser:
     hg.add_argument("--changes", action="store_true",
                     help="Compare this file scan with its previous result")
     hg.add_argument("--compare", action="store_true",
-                    help="Legacy IP-only comparison with previous scan")
+                    help="IP-only comparison with the previous scan")
     hg.add_argument("--diff", metavar=("A", "B"), nargs=2,
-                    help="Compare two alive-host snapshot files")
+                    help="Compare two result files (txt/csv/json)")
     hg.add_argument("--clear-history", metavar="NAME",
-                    help="Delete history for a label")
+                    help="Delete stored data for a label or target file")
     hg.add_argument("--no-history", action="store_true",
                     help="Do not save this scan to history")
+    hg.add_argument("--keep", type=int, default=DEFAULT_HISTORY_KEEP, metavar="N",
+                    help=f"History entries kept per label (default: {DEFAULT_HISTORY_KEEP}; 0 = all)")
+    hg.add_argument("--data-dir", metavar="DIR",
+                    help="State directory (default: per-user data directory)")
 
     ag = p.add_argument_group("Advanced")
-    ag.add_argument("--help-topic", choices=HELP_TOPICS, metavar="TOPIC",
-                    help="Show focused help for one topic")
-    ag.add_argument("--help-all", action="store_true",
-                    help="Show complete grouped help")
+    ag.add_argument("--config", metavar="FILE",
+                    help=f"Config file (default: {default_config_path()})")
+    ag.add_argument("--no-config", action="store_true",
+                    help="Ignore the config file")
+    ag.add_argument("--init-config", action="store_true",
+                    help="Create a commented config template")
 
     help_group = p.add_argument_group("Help")
+    help_group.add_argument("-h", "--help", action=_QuickHelpAction,
+                            help="Quick, task-oriented help")
+    help_group.add_argument("--help-all", action="help",
+                            help="Show every option (this list)")
+    help_group.add_argument("--help-topic", choices=HELP_TOPICS, metavar="TOPIC",
+                            help="Show focused help for one topic")
     help_group.add_argument("--version", action="version",
                             version=f"%(prog)s {VERSION} ({BUILD})",
                             help="Show PingMe version and build")
-    help_group.add_argument("-h", "--help", action="help",
-                            help="Show grouped help and nested-help topics")
 
     return p
+
+
+def _preparse(argv: list[str]) -> argparse.Namespace:
+    """Read the options that must act before the full parser is built."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    pre.add_argument("--no-config", action="store_true")
+    pre.add_argument("--color")
+    namespace, _unknown = pre.parse_known_args(argv)
+    return namespace
+
+
+def _file_label(path: str) -> str:
+    """Stable per-file label: two hosts.txt files in different folders never share state."""
+    resolved = str(Path(path).expanduser().resolve())
+    digest = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:8]
+    return f"{_safe_label(Path(path).stem)}-{digest}"
+
+
+_FILE_LIKE_SUFFIXES = {".txt", ".csv", ".lst", ".list", ".tsv", ".json"}
+
+
+def classify_targets(values: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """Split positional targets into (subnets, files, hosts), or raise ValueError."""
+    subnets: list[str] = []
+    files: list[str] = []
+    hosts: list[str] = []
+    for value in values:
+        if Path(value).expanduser().is_file():
+            files.append(value)
+            continue
+        if "/" in value:
+            try:
+                ipaddress.ip_network(value, strict=False)
+            except ValueError:
+                raise ValueError(f"'{value}' is neither an existing file nor a valid CIDR subnet") from None
+            subnets.append(value)
+            continue
+        if Path(value).suffix.lower() in _FILE_LIKE_SUFFIXES and not _normalise_probe_address(value):
+            raise ValueError(f"target file not found: {value}")
+        hosts.append(value)
+    return subnets, files, hosts
+
+
+def scan_exit_code(results: list[dict], monitored: set[str], unresolved: int) -> int:
+    """Exit status for a completed scan (see 'pingme help exitcodes')."""
+    if any(result.get("status") == "PROBE ERROR" for result in results):
+        return EXIT_PROBE_ERRORS
+    if monitored or unresolved:
+        down = any(result["ip"] in monitored and not result["alive"] for result in results)
+        return EXIT_NOT_ALL_UP if unresolved or down else EXIT_OK
+    return EXIT_OK if any(result["alive"] for result in results) else EXIT_NOT_ALL_UP
+
+
+def show_reverse_lookups(values: list[str], threads: int, max_hosts: int) -> int:
+    """Print an IP → hostname table for addresses and subnets without probing them."""
+    addresses: list[str] = []
+    for value in values:
+        address = _normalise_probe_address(value)
+        if address is not None:
+            addresses.append(address)
+            continue
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            print(C.err(f"  ✗ Not an IP address or CIDR: {value}"), file=sys.stderr)
+            return EXIT_USAGE
+        size = max(network.num_addresses - 2, 0) if network.version == 4 and network.prefixlen <= 30 else network.num_addresses
+        if len(addresses) + size > max_hosts:
+            print(C.err(f"  ✗ {value} expands beyond --max-hosts {max_hosts:,}."), file=sys.stderr)
+            return EXIT_USAGE
+        hosts = network.hosts() if network.version == 4 else iter(network)
+        addresses.extend(str(host) for host in hosts)
+    addresses = list(dict.fromkeys(addresses))
+
+    rows: dict[str, tuple[str, str]] = {}
+    interactive = sys.stdout.isatty()
+    with ThreadPoolExecutor(max_workers=max(1, min(max(threads, 50), 200))) as pool:
+        futures = {pool.submit(reverse_lookup, ip, 1.5, True): ip for ip in addresses}
+        for future in as_completed(futures):
+            rows[futures[future]] = future.result()
+            if interactive:
+                sys.stdout.write(f"{_CLEAR_LINE}  {C.DIM}Looking up names… {len(rows)}/{len(addresses)}{C.RESET}")
+                sys.stdout.flush()
+    if interactive:
+        sys.stdout.write(_CLEAR_LINE)
+
+    named = [(ip, *rows[ip]) for ip in addresses if rows[ip][0]]
+    ip_w = max([15] + [len(ip) for ip in addresses])
+    name_w = max([8] + [len(name) for _ip, name, _source in named])
+    line = f"  {C.CYAN}+{'-' * (ip_w + 2)}+{'-' * (name_w + 2)}+{'-' * 9}+{C.RESET}"
+    print(f"\n  {C.BOLD}{C.MAGENTA}REVERSE LOOKUP · IP → HOSTNAME{C.RESET}")
+    print(line)
+    print(f"  {C.CYAN}|{C.RESET} {C.BOLD}{'IP ADDRESS':<{ip_w}}{C.RESET} {C.CYAN}|{C.RESET} "
+          f"{C.BOLD}{'HOSTNAME':<{name_w}}{C.RESET} {C.CYAN}|{C.RESET} {C.BOLD}{'SOURCE':<7}{C.RESET} {C.CYAN}|{C.RESET}")
+    print(line)
+    # Large ranges list only named addresses; a handful of lookups lists everything.
+    shown = [(ip, *rows[ip]) for ip in addresses] if len(addresses) <= 32 else named
+    for ip, name, source in shown:
+        print(f"  {C.CYAN}|{C.RESET} {ip:<{ip_w}} {C.CYAN}|{C.RESET} "
+              f"{(C.TEAL + name) if name else (C.DIM + '(no name)')}{' ' * (name_w - len(name or '(no name)'))}{C.RESET} "
+              f"{C.CYAN}|{C.RESET} {C.DIM}{source or '-':<7}{C.RESET} {C.CYAN}|{C.RESET}")
+    print(line)
+    print(f"  {C.GREEN}Named: {len(named)}{C.RESET}  {C.DIM}No name: {len(addresses) - len(named)}{C.RESET}\n")
+    return EXIT_OK if named else EXIT_NOT_ALL_UP
+
+
+def _live_rows(results: list[dict]) -> list[dict]:
+    """Rows for the subnet summary table: hosts that answered or failed to probe."""
+    return [
+        {"host": result["ip"], "ip": result["ip"], "type": "DIRECT IP"}
+        for result in results
+        if result["alive"] or result.get("status") == "PROBE ERROR"
+    ]
+
+
+def watch_scans(args: argparse.Namespace, ip_list: list[str], label: str, scan_kwargs: dict, first: list[dict]) -> int:
+    """Rescan on an interval and print one line per status change until Ctrl+C."""
+    interval = args.watch
+    previous = {result["ip"]: result for result in first}
+    print(f"  {C.CYAN}👁  Watching {len(ip_list):,} targets every {_format_seconds(interval)}s — "
+          f"press Ctrl+C to stop.{C.RESET}\n")
+    rounds = 0
+    try:
+        while True:
+            time.sleep(interval)
+            results = run_scan(ip_list, label=label, quiet=True, resume=False, resumable=False, **scan_kwargs)
+            if _STOP_EVENT.is_set():
+                break
+            rounds += 1
+            stamp = datetime.now().strftime("%H:%M:%S")
+            changes = 0
+            for result in results:
+                before = previous.get(result["ip"])
+                old_status = before.get("status") if before else None
+                if old_status == result["status"]:
+                    continue
+                changes += 1
+                if changes == 1:
+                    sys.stdout.write(_line_start())
+                name = f"  {C.DIM}{result['hostname']}{C.RESET}" if result.get("hostname") else ""
+                if result["alive"]:
+                    rtt = f"  {result['rtt_avg']}ms" if result.get("rtt_avg") is not None else ""
+                    print(f"  {C.DIM}{stamp}{C.RESET}  {C.GREEN}▲ UP     {result['ip']:<18}{C.RESET}{rtt}{name}")
+                elif result["status"] == "NO RESPONSE":
+                    print(f"  {C.DIM}{stamp}{C.RESET}  {C.RED}▼ DOWN   {result['ip']:<18}{C.RESET}{name}")
+                else:
+                    print(f"  {C.DIM}{stamp}{C.RESET}  {C.YELLOW}! ERROR  {result['ip']:<18}{C.RESET}  "
+                          f"{C.DIM}{result.get('probe_error', '')[:50]}{C.RESET}")
+            if changes == 0 and sys.stdout.isatty():
+                alive = sum(1 for result in results if result["alive"])
+                sys.stdout.write(f"{_CLEAR_LINE}  {C.DIM}{stamp}  round {rounds}: no changes ({alive} up){C.RESET}   ")
+                sys.stdout.flush()
+            previous = {result["ip"]: result for result in results}
+            write_results(
+                results, alive_file=args.alive_out, dead_file=args.dead_out,
+                error_file=args.error_out, out_format=args.out_format, quiet=True,
+            )
+    except KeyboardInterrupt:
+        pass
+    print(f"\n  {C.DIM}Watch stopped after {rounds} round(s).{C.RESET}\n")
+    return EXIT_OK
 
 
 # ─────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────
-def main():
+def _configure_streams() -> None:
     # Keep output visible immediately when launched through wrappers, symlinks,
     # PowerShell, redirected terminals, or CI.
     try:
@@ -2514,49 +3829,122 @@ def main():
     except (AttributeError, ValueError):
         pass
 
-    if not sys.stdout.isatty():
-        for attr in dir(C):
-            if not attr.startswith("_") and isinstance(getattr(C, attr), str):
-                setattr(C, attr, "")
+
+def _validate_ranges(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    checks = [
+        ("--threads", args.threads, 1, 1000),
+        ("--timeout", args.timeout, 0.1, 30),
+        ("--count", args.count, 1, 20),
+        ("--min-replies", args.min_replies, 1, 20),
+        ("--retry", args.retry, 0, 5),
+        ("--rate", args.rate, 0, 1_000_000),
+        ("--tcp-timeout", args.tcp_timeout, 0.1, 30),
+        ("--max-hosts", args.max_hosts, 1, 2 ** 32),
+        ("--keep", args.keep, 0, 100_000),
+    ]
+    for name, value, low, high in checks:
+        if not low <= value <= high:
+            parser.error(f"{name} must be between {low:g} and {high:,} (got {value:g})")
+    if args.watch is not None and args.watch < 1:
+        parser.error("--watch must be at least 1 second")
+    for name, value, choices in (
+        ("ping_tool", args.ping_tool, ("auto", "fping", "ping", "ask")),
+        ("out_format", args.out_format, ("txt", "csv", "json")),
+        ("color", args.color, ("auto", "always", "never")),
+    ):
+        if value not in choices:
+            parser.error(f"{name} must be one of {', '.join(choices)} (got '{value}')")
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    global _DATA_DIR_OVERRIDE
+    _configure_streams()
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    pre = _preparse(argv)
+    if not colors_wanted(pre.color or "auto"):
+        disable_colors()
+    config: dict = {}
+    if not pre.no_config:
+        config_path = Path(pre.config).expanduser() if pre.config else default_config_path()
+        if pre.config and not config_path.is_file() and "--init-config" not in argv:
+            print(C.err(f"  ✗ Config file not found: {config_path}"), file=sys.stderr)
+            return EXIT_USAGE
+        if config_path.is_file():
+            try:
+                config = load_config(config_path)
+            except (OSError, ValueError) as exc:
+                print(C.err(f"  ✗ Config file {config_path}: {exc}"), file=sys.stderr)
+                return EXIT_USAGE
+
+    if _COLOR_ENABLED and not colors_wanted(pre.color or config.get("color") or "auto"):
+        disable_colors()
 
     # Nested help syntax: pingme help <topic>
-    if len(sys.argv) >= 2 and sys.argv[1] == "help":
-        topic = sys.argv[2] if len(sys.argv) >= 3 else "examples"
-        print_topic_help(topic)
-        return
+    if argv and argv[0] == "help":
+        topics = [value for value in argv[1:] if not value.startswith("-")]
+        return print_topic_help(topics[0] if topics else "")
 
     parser = build_parser()
-    args   = parser.parse_args()
+    parser.set_defaults(**config)
+    args   = parser.parse_args(argv)
 
     if args.help_topic:
-        print_topic_help(args.help_topic)
-        return
-    if args.help_all:
-        parser.print_help()
-        return
+        return print_topic_help(args.help_topic)
 
-    if args.max_hosts < 1:
-        parser.error("--max-hosts must be at least 1")
+    if args.init_config:
+        destination = Path(args.config).expanduser() if args.config else default_config_path()
+        if destination.exists():
+            print(C.warn(f"  ⚠  Config already exists: {destination}"))
+            return EXIT_OK
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+        print(C.ok(f"  ✔  Created {destination}"))
+        print(f"  {C.DIM}Edit it and remove the '#' in front of any setting you want.{C.RESET}")
+        return EXIT_OK
+
+    _validate_ranges(parser, args)
+    if args.data_dir:
+        _DATA_DIR_OVERRIDE = Path(args.data_dir).expanduser()
+    global _ADDRESS_FAMILY
+    _ADDRESS_FAMILY = args.family
     if args.tcp_ports:
         try:
             args.tcp_ports = parse_tcp_ports(args.tcp_ports)
         except ValueError as exc:
             parser.error(str(exc))
-    if (args.file or args.host) and not args.scan:
+
+    try:
+        positional_subs, positional_files, positional_hosts = classify_targets(args.targets)
+    except ValueError as exc:
+        parser.error(str(exc))
+    subnets = ([args.sub] if args.sub else []) + positional_subs
+    files = ([args.file] if args.file else []) + positional_files
+    hosts = list(args.host or []) + positional_hosts
+    if len(files) > 1:
+        parser.error("scan one target file at a time (merge the files, or run pingme once per file)")
+    target_file = files[0] if files else None
+    if args.targets or target_file or hosts or args.discover6 is not None:
         args.scan = True
+
     if args.quiet and (args.compact or args.verbose):
         parser.error("--quiet cannot be combined with --compact or --verbose")
     if args.compact and args.verbose:
         parser.error("--compact and --verbose cannot be combined")
-    if args.changes and not args.file:
-        parser.error("--changes currently requires --file")
+    if args.changes and not target_file:
+        parser.error("--changes needs a target file (for example: pingme hosts.txt --changes)")
+    if args.watch and not args.scan:
+        parser.error("--watch needs scan targets (for example: pingme 10.0.0.0/24 --watch 60)")
+    if args.watch and args.resume:
+        parser.error("--watch and --resume cannot be combined")
+    hostnames_out = args.hostnames_out or ("hostnames.txt" if target_file else None)
     output_options = {
         "--alive-out": args.alive_out,
         "--dead-out": args.dead_out,
         "--error-out": args.error_out,
     }
-    if args.file:
-        output_options["--hostnames-out"] = args.hostnames_out
+    if hostnames_out:
+        output_options["--hostnames-out"] = hostnames_out
     if args.changes:
         output_options["--changes-out"] = args.changes_out
     seen_output_paths: dict[str, str] = {}
@@ -2572,75 +3960,123 @@ def main():
     rich_output = args.verbose or (
         sys.stdout.isatty() and not args.compact and not args.quiet
     )
-    banner(no_banner=args.no_banner or (args.scan and not rich_output) or args.quiet)
+    banner(no_banner=args.no_banner or not rich_output)
 
-    # ── clear history ───────────────────────────────────────────
+    # ── one-shot utilities ──────────────────────────────────────
     if args.clear_history:
-        clear_history(args.clear_history); return
+        label = args.clear_history
+        if Path(label).expanduser().is_file():
+            label = _file_label(label)
+            _LEGACY_LABELS[label] = Path(args.clear_history).stem
+        clear_history(label); return EXIT_OK
 
-    # ── list history ────────────────────────────────────────────
     if args.history:
-        show_history_list(); return
+        show_history_list(); return EXIT_OK
 
-    # ── ip classify ─────────────────────────────────────────────
     if args.ipinfo:
-        show_ipinfo(args.ipinfo); return
+        show_ipinfo(args.ipinfo); return EXIT_OK
 
-    # ── diff ────────────────────────────────────────────────────
+    if args.reverse:
+        return show_reverse_lookups(args.reverse, args.threads, args.max_hosts)
+
     if args.diff:
-        diff_files(args.diff[0], args.diff[1]); return
+        diff_files(args.diff[0], args.diff[1]); return EXIT_OK
 
     # ── need a scan target ──────────────────────────────────────
-    if not args.sub and not args.file and not args.host:
-        parser.print_help()
-        print(f"\n  {C.YELLOW}Tip: use --sub 192.168.1.0/24 --scan, --file targets.txt, or --host example.com{C.RESET}\n")
-        sys.exit(0)
+    if not subnets and not target_file and not hosts and args.discover6 is None:
+        print_quick_help()
+        return EXIT_OK
 
     # ── build IP list ───────────────────────────────────────────
     ip_list: list[str] = []
     file_mappings: list[dict] = []
+    host_rows: list[dict] = []
+    subnet_ips: set[str] = set()
     label = args.label
-    subnet_target_count: Optional[int] = None
+    subnet_target_count = 0
 
-    if args.sub:
-        net = show_subnet_info(args.sub, display=not args.scan or rich_output)
-        subnet_target_count = max(net.num_addresses - 2, 0) if net.version == 4 and net.prefixlen <= 30 else net.num_addresses
+    for cidr in subnets:
+        net = show_subnet_info(cidr, display=not args.scan or rich_output)
+        count = max(net.num_addresses - 2, 0) if net.version == 4 and net.prefixlen <= 30 else net.num_addresses
+        subnet_target_count += count
         if args.scan:
             if subnet_target_count > args.max_hosts:
                 print(C.err(
-                    f"  ✗ {args.sub} expands to {subnet_target_count:,} targets, exceeding "
+                    f"  ✗ {', '.join(subnets)} expands to {subnet_target_count:,}+ targets, exceeding "
                     f"--max-hosts {args.max_hosts:,}. Use a smaller CIDR or raise the limit deliberately."
-                ))
-                sys.exit(1)
-            addresses = net.hosts() if net.version == 4 else iter(net)
-            ip_list = [str(host) for host in addresses]
-        if not label:
-            label = re.sub(r"[/]", "_", args.sub)
+                ), file=sys.stderr)
+                if net.version == 6:
+                    print(f"  {C.YELLOW}IPv6 networks are too large to sweep. To find hosts on your local "
+                          f"link use: pingme --discover6{C.RESET}", file=sys.stderr)
+                return EXIT_USAGE
+            addresses = [str(host) for host in (net.hosts() if net.version == 4 else iter(net))]
+            ip_list.extend(addresses)
+            subnet_ips.update(addresses)
+    if subnets and not label:
+        label = "+".join(re.sub(r"[/]", "_", cidr) for cidr in subnets)
 
-    if args.file:
-        file_targets, file_mappings = read_target_file(args.file)
+    if target_file:
+        file_targets, file_mappings = read_target_file(
+            target_file, hostnames_out or "hostnames.txt", args.quiet, progress=rich_output
+        )
         # Always show the original hostname-to-IP mapping before scanning.
-        # This makes file mode auditable and prevents users from seeing only
-        # anonymous IP addresses during the scan.
         if rich_output:
-            show_host_resolution(file_mappings, args.file)
+            show_host_resolution(file_mappings, target_file)
         ip_list.extend(file_targets)
         if not label:
-            label = Path(args.file).stem
+            label = _file_label(target_file)
+            _LEGACY_LABELS[label] = Path(target_file).stem
 
-    if args.host:
-        ip_list.extend(resolve_host_arguments(args.host))
+    neighbor_rows: list[dict] = []
+    if args.discover6 is not None:
+        interfaces = args.discover6 or ipv6_interfaces()
+        unknown = [name for name in args.discover6 if not interface_exists(name)]
+        if unknown:
+            available = ", ".join(ipv6_interfaces()) or "none found"
+            parser.error(f"unknown interface: {', '.join(unknown)} (IPv6 interfaces: {available})")
+        if not interfaces:
+            print(C.err("  ✗ No active IPv6 interfaces found for --discover6."), file=sys.stderr)
+            return EXIT_ENVIRONMENT
+        if not args.quiet:
+            shown = ", ".join(interfaces[:8]) + (f" (+{len(interfaces) - 8} more)" if len(interfaces) > 8 else "")
+            print(f"  {C.CYAN}Discovering IPv6 neighbors on {shown}...{C.RESET}", flush=True)
+        neighbors = discover_ipv6_neighbors(interfaces, min(args.timeout, 2))
+        for address, mac in neighbors.items():
+            neighbor_rows.append({"host": mac or "-", "ip": address, "type": "IPv6 ND"})
+        ip_list.extend(neighbors)
+        subnet_ips.update(neighbors)
         if not label:
-            label = re.sub(r"[^\w.\-]", "_", "_".join(args.host))
+            label = "ipv6-lan-" + ("+".join(args.discover6) if args.discover6 else "all")
+        if not neighbors and not args.quiet:
+            print(f"  {C.YELLOW}No IPv6 neighbors answered on {', '.join(interfaces)}.{C.RESET} "
+                  f"{C.DIM}Many hosts ignore multicast ping; known addresses can be scanned directly.{C.RESET}")
+
+    if hosts:
+        host_targets, host_rows = resolve_host_arguments(hosts, args.quiet)
+        ip_list.extend(host_targets)
+        if not label:
+            label = re.sub(r"[^\w.\-]", "_", "_".join(hosts))
 
     ip_list = list(dict.fromkeys(ip_list))
+    label = label or "scan"
+
+    if args.family:
+        before = len(ip_list)
+        ip_list = [ip for ip in ip_list if address_family(ip) == args.family]
+        kept = set(ip_list)
+        for row in file_mappings + host_rows:
+            if row.get("ip") not in {"", "UNRESOLVED"} and row["ip"] not in kept:
+                row["excluded"] = True
+        if before != len(ip_list) and rich_output:
+            print(f"  {C.DIM}[-{args.family}] Skipped {before - len(ip_list)} IPv{10 - args.family} address(es){C.RESET}")
 
     unsafe_targets = [ip for ip in ip_list if _normalise_probe_address(ip) is None]
     if unsafe_targets:
-        print(C.warn(
-            f"  ⚠  Skipped {len(unsafe_targets)} non-host destination(s) "
-            "(unspecified, multicast, or limited broadcast)."
-        ))
+        if not args.quiet:
+            print(C.warn(
+                f"  ⚠  Skipped {len(unsafe_targets)} non-host destination(s) "
+                "(unspecified, multicast, or limited broadcast)."
+            ))
         ip_list = [ip for ip in ip_list if _normalise_probe_address(ip) is not None]
 
     # ── apply --exclude ─────────────────────────────────────────
@@ -2648,94 +4084,140 @@ def main():
         excluded_ips, excluded_nets = build_exclude_filter(args.exclude)
         before = len(ip_list)
         ip_list = [ip for ip in ip_list if not is_excluded(ip, excluded_ips, excluded_nets)]
-        if file_mappings:
-            remaining_ips = set(ip_list)
-            for row in file_mappings:
-                row_ip = str(row.get("ip", ""))
-                if row_ip not in {"", "UNRESOLVED"} and row_ip not in remaining_ips:
-                    row["excluded"] = True
+        remaining_ips = set(ip_list)
+        for row in file_mappings + host_rows:
+            row_ip = str(row.get("ip", ""))
+            if row_ip not in {"", "UNRESOLVED"} and row_ip not in remaining_ips:
+                row["excluded"] = True
         skipped = before - len(ip_list)
         if skipped and rich_output:
             print(f"  {C.DIM}[exclude] Skipped {skipped} IPs{C.RESET}")
 
-    if args.scan and not ip_list:
-        print(C.err("  ✗ No scan targets remain after exclusions.")); sys.exit(1)
+    if not args.scan:
+        print(f"  {C.DIM}Tip: add {C.BOLD}--scan{C.RESET}{C.DIM} (or run 'pingme {subnets[0]}') "
+              f"to ping all {subnet_target_count:,} hosts.{C.RESET}\n")
+        return EXIT_OK
+
+    if not ip_list:
+        if args.discover6 is not None and not subnets and not hosts and not target_file:
+            return EXIT_NOT_ALL_UP
+        reason = f"the -{args.family} filter" if args.family else "exclusions"
+        print(C.err(f"  ✗ No scan targets remain after {reason}."), file=sys.stderr)
+        return EXIT_USAGE
 
     # ── scan ────────────────────────────────────────────────────
-    if args.scan:
-        if not args.tcp_ports or _FPING_PATH or _PING_PATH or _PING6_PATH:
-            check_deps(
-                ping_tool=args.ping_tool,
-                verbose=rich_output,
-                interactive=rich_output,
-            )
-
-        if args.fast:
-            args.threads = 100; args.timeout = 1; args.count = 1
-            if rich_output:
-                print(f"  {C.YELLOW}⚡ Fast mode — less accurate on slow/busy hosts.{C.RESET}")
-
-        args.threads = max(1,  min(1000, args.threads))
-        args.timeout = max(1,  min(30,   args.timeout))
-        args.count   = max(1,  min(20,   args.count))
-        args.retry   = max(0,  min(5,    args.retry))
-        args.rate    = max(0,           args.rate)
-        args.tcp_timeout = max(1, min(30, args.tcp_timeout))
-
-        results = run_scan(
-            ip_list,
-            threads = args.threads,
-            timeout = args.timeout,
-            count   = args.count,
-            retry   = args.retry,
-            rate    = args.rate,
-            label   = label,
-            quiet   = not rich_output,
-            do_dns  = args.dns,
-            resume  = args.resume,
-            tcp_ports = args.tcp_ports,
-            tcp_timeout = args.tcp_timeout,
-        )
-
-        alive = [r["ip"] for r in results if r["alive"]]
-        dead  = [r["ip"] for r in results if r.get("status") == "NO RESPONSE"]
-
-        if args.file and file_mappings:
-            if rich_output:
-                status_records = show_file_scan_status(file_mappings, results, args.file)
-            else:
-                status_records = build_file_status_records(file_mappings, results)
-            write_hostnames_report(
-                status_records, args.file, args.hostnames_out, announce=rich_output
-            )
-
-            if args.changes:
-                previous_changes = load_changes_state(label)
-                write_changes_report(previous_changes, status_records, args.file, args.changes_out)
-                save_changes_state(label, args.file, status_records)
-
-        write_results(
-            results,
-            alive_file=args.alive_out,
-            dead_file=args.dead_out,
-            error_file=args.error_out,
-            out_format=args.out_format,
-            quiet=args.quiet,
+    if not args.tcp_ports or _FPING_PATH or _PING_PATH or _PING6_PATH:
+        check_deps(
+            ping_tool="auto" if args.ping_tool == "ask" else args.ping_tool,
             verbose=rich_output,
+            interactive=args.ping_tool == "ask",
         )
 
-        if not args.no_history:
-            save_scan(label, results, announce=rich_output)
+    if args.fast:
+        args.threads = 100; args.timeout = 1; args.count = 1
+        if rich_output:
+            print(f"  {C.YELLOW}⚡ Fast mode — less accurate on slow/busy hosts.{C.RESET}")
 
-        if args.compare:
-            compare_history(label, alive, dead)
+    do_dns = args.dns if args.dns is not None else len(ip_list) <= DNS_AUTO_LIMIT
+    if rich_output and args.dns is None and not do_dns:
+        print(f"  {C.DIM}Hostname lookups skipped for {len(ip_list):,} targets; add --dns to force them.{C.RESET}")
 
-    elif args.sub and not args.scan:
-        print(f"  {C.DIM}Tip: add {C.BOLD}--scan{C.RESET}{C.DIM} to ping all {subnet_target_count or 0:,} hosts.{C.RESET}\n")
+    scan_kwargs = dict(
+        threads = args.threads,
+        timeout = args.timeout,
+        count   = args.count,
+        retry   = args.retry,
+        rate    = args.rate,
+        do_dns  = do_dns,
+        tcp_ports = args.tcp_ports,
+        tcp_timeout = args.tcp_timeout,
+        min_replies = args.min_replies,
+    )
+    results = run_scan(ip_list, label=label, quiet=not rich_output, resume=args.resume, **scan_kwargs)
+    interrupted = _STOP_EVENT.is_set()
 
-    if rich_output or not args.scan:
+    alive = [r["ip"] for r in results if r["alive"]]
+    dead  = [r["ip"] for r in results if r.get("status") == "NO RESPONSE"]
+    errors = [r["ip"] for r in results if r.get("status") == "PROBE ERROR"]
+
+    status_rows = file_mappings + host_rows
+    if status_rows:
+        source = target_file or "command line"
+        title = "FILE SCAN STATUS" if target_file else "SCAN STATUS"
+        if rich_output:
+            status_records = show_file_scan_status(status_rows, results, source, title)
+        else:
+            status_records = build_file_status_records(status_rows, results)
+        if hostnames_out:
+            write_hostnames_report(status_records, source, hostnames_out, announce=rich_output)
+
+        if args.changes and not interrupted:
+            previous_changes = load_changes_state(label)
+            write_changes_report(
+                previous_changes, status_records, target_file, args.changes_out,
+                display="none" if args.quiet else ("full" if rich_output else "summary"),
+            )
+            save_changes_state(label, target_file, status_records)
+    if neighbor_rows and rich_output:
+        show_file_scan_status(neighbor_rows, results, "local links", "IPv6 NEIGHBORS", host_header="MAC ADDRESS")
+    subnet_only = subnet_ips - {row["ip"] for row in neighbor_rows}
+    if subnet_only and rich_output:
+        live = _live_rows([r for r in results if r["ip"] in subnet_only])
+        if live:
+            show_file_scan_status(live, results, ", ".join(subnets), "LIVE HOSTS", hide_host=True)
+        elif not interrupted:
+            print(f"\n  {C.YELLOW}No hosts answered in {', '.join(subnets)}.{C.RESET} "
+                  f"{C.DIM}Hosts that block ping can be found with --tcp-ports 22,80,443,445,3389.{C.RESET}\n")
+
+    write_results(
+        results,
+        alive_file=args.alive_out,
+        dead_file=args.dead_out,
+        error_file=args.error_out,
+        out_format=args.out_format,
+        quiet=args.quiet,
+        verbose=rich_output,
+    )
+
+    if not args.no_history and not interrupted:
+        save_scan(label, results, announce=rich_output, keep=args.keep)
+
+    if args.compare:
+        compare_history(label, alive, dead, errors, saved_current=not args.no_history and not interrupted)
+
+    if interrupted:
+        return EXIT_INTERRUPTED
+
+    if args.watch:
+        watch_scans(args, ip_list, label, scan_kwargs, results)
+
+    if rich_output:
         print()
+
+    if args.exit_zero:
+        return EXIT_OK
+    monitored = {str(row["ip"]) for row in status_rows if not row.get("excluded")} - {"UNRESOLVED"}
+    unresolved = sum(1 for row in status_rows if row.get("ip") == "UNRESOLVED")
+    return scan_exit_code(results, monitored, unresolved)
+
+
+def entrypoint() -> None:
+    """Console entry point: maps interrupts and closed pipes to clean exits."""
+    try:
+        code = main()
+    except KeyboardInterrupt:
+        print(f"\n  {C.YELLOW}Interrupted.{C.RESET}", file=sys.stderr)
+        code = EXIT_INTERRUPTED
+    except BrokenPipeError:
+        # Output piped into head/less that exited early; not an error.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        code = EXIT_OK
+    sys.exit(code)
 
 
 if __name__ == "__main__":
-    main()
+    entrypoint()

@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.2.3" alt="PingMe animated title" />
+<img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=52&duration=1800&pause=650&color=00F7FF&center=true&vCenter=true&width=760&height=100&lines=PINGME;PING+ME;P+I+N+G+M+E;PINGME+v3.3.0" alt="PingMe animated title" />
 
 <img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=19&duration=2400&pause=700&color=BB86FC&center=true&vCenter=true&width=920&height=110&lines=Advanced+Network+Discovery+Scanner;Hostname+%E2%86%92+IP+%E2%86%92+Reachability+Status;hostnames.txt+%C2%B7+changes.txt+%C2%B7+alive.txt+%C2%B7+dead.txt;Linux+%C2%B7+Kali+%C2%B7+macOS+%C2%B7+Windows" alt="PingMe animated subtitle" />
 
 <br/>
 
-[![Version](https://img.shields.io/badge/version-3.2.3-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
+[![Version](https://img.shields.io/badge/version-3.3.0-00F7FF?style=for-the-badge&labelColor=0d1117)](#)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white&labelColor=0d1117)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-BB86FC?style=for-the-badge&labelColor=0d1117)](#)
 [![License](https://img.shields.io/badge/License-MIT-39FF14?style=for-the-badge&labelColor=0d1117)](LICENSE)
@@ -23,8 +23,8 @@
   ██║     ██║██║ ╚████║╚██████╔╝██║ ╚═╝ ██║███████╗
   ╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
 
-  Advanced Ping Scanner v3.2.3
-  Hostname · IP Address · Reachability · TTL · OS Guess
+  Advanced Ping Scanner v3.3.0
+  Hostname · IP Address · Reachability · RTT · Loss · TTL · OS Guess
 ```
 
 </div>
@@ -43,10 +43,10 @@ It accepts:
 - Files containing IPs and hostnames
 - IPv4 and IPv6 targets
 
-PingMe resolves hostnames, scans every resolved address, displays live progress, saves scan history, and presents a final status table showing:
+PingMe resolves hostnames, scans every resolved address, looks up the hostname of every IP, displays live progress, saves scan history, and presents a final status table showing:
 
 ```text
-HOST | IP ADDRESS | STATUS | METHOD | TTL | OS GUESS
+HOST | IP ADDRESS | STATUS | METHOD | TTL | RTT ms | LOSS | OS GUESS | REVERSE DNS
 ```
 
 For file-based scans, PingMe can also maintain five clear reports:
@@ -63,6 +63,18 @@ It is designed for network engineers, system administrators, VAPT teams, penetra
 
 > Which hosts resolved, which IP belongs to each hostname, and which systems are reachable?
 
+### 🆕 What's new in 3.3
+
+- **Just type a target:** `pingme 192.168.1.0/24`, `pingme hosts.txt`, `pingme server01` — no flags needed.
+- **IP → hostname for every address** through DNS, the hosts file, mDNS and NetBIOS, plus `--reverse` for lookups without pinging.
+- **Watch mode** (`--watch 60`) prints a line whenever a host goes up or down.
+- **Lossy hosts no longer look dead:** `--count 5 --min-replies 2` accepts 2 replies out of 5.
+- **Latency and packet loss** columns, and IP-change detection in `changes.txt`.
+- **Friendlier help:** a short `-h`, focused `pingme help <topic>` pages, and "did you mean" suggestions for mistyped options.
+- **Config file** (`pingme --init-config`), `--color`/`NO_COLOR`, fractional timeouts, and meaningful exit codes.
+- **Full IPv6:** `--discover6` finds IPv6 hosts on your LAN, `-4`/`-6` filters, `[addr]` and `fe80::1%eth0` forms, and IPv6-aware `--ipinfo`.
+- **Reliability fixes:** macOS ping, `--rate` hang, Ctrl+C/`--resume` with fping, parallel TCP and fping confirmation, faster progress on large scans. See [RELEASE_NOTES_v3.3.0.md](RELEASE_NOTES_v3.3.0.md).
+
 ---
 
 ## 🎬 Animated Demo
@@ -78,15 +90,15 @@ Example final output:
 ```text
 FILE SCAN STATUS · endpoints.txt
 
-+--------------+-----------------+--------------+----------+-------+------------+
-| HOST         | IP ADDRESS      | STATUS       | METHOD   | TTL   | OS GUESS   |
-+--------------+-----------------+--------------+----------+-------+------------+
-| DSIN10329    | 10.100.6.53     | REACHABLE    | ICMP     | 128   | Windows    |
-| DSIN10343    | 10.100.6.12     | NO RESPONSE  | -        | ?     | Unknown    |
-| web01        | 10.100.6.90     | REACHABLE    | TCP:443  | ?     | Unknown    |
-+--------------+-----------------+--------------+----------+-------+------------+
++-----------+-------------+-------------+---------+-----+--------+------+-----------------------+----------------------+
+| HOST      | IP ADDRESS  | STATUS      | METHOD  | TTL | RTT ms | LOSS | OS GUESS              | REVERSE DNS          |
++-----------+-------------+-------------+---------+-----+--------+------+-----------------------+----------------------+
+| DSIN10329 | 10.100.6.53 | REACHABLE   | ICMP    | 128 | 1.8    | 0%   | Likely Windows (≤128) | dsin10329.corp.local |
+| DSIN10343 | 10.100.6.12 | NO RESPONSE | -       | ?   | -      | 100% | Unknown               |                      |
+| web01     | 10.100.6.90 | REACHABLE   | TCP:443 | ?   | -      | 100% | Unknown               | web01.corp.local     |
++-----------+-------------+-------------+---------+-----+--------+------+-----------------------+----------------------+
 
-Reachable: 2  No response: 1  Unresolved: 0
+Reachable: 2  No response: 1  Probe errors: 0  Unresolved: 0
 ```
 
 ---
@@ -97,17 +109,17 @@ Reachable: 2  No response: 1  Unresolved: 0
 
 | 🌐 Target Handling | 🔍 Discovery | 📊 Reporting |
 |:---:|:---:|:---:|
-| CIDR, IP, hostname, file | ICMP with `ping` or `fping` | Hostname → IP resolution table |
-| IPv4 and IPv6 | Optional TCP reachability | Reachable / no-response status |
-| Duplicate removal | Reverse DNS | TTL and OS guess |
-| Inline comments in files | Retry and rate limiting | `hostnames.txt`, `changes.txt`, alive/dead reports |
+| CIDR, IP, hostname, file — auto-detected | ICMP with `ping` or `fping` | Hostname → IP resolution table |
+| IPv4 and IPv6 | Parallel TCP reachability | Reachable / no-response status |
+| Duplicate removal | IP → hostname (DNS, mDNS, NetBIOS) | RTT, packet loss, TTL, OS guess |
+| Inline comments in files | Retry, rate limiting, `--min-replies` | `hostnames.txt`, `changes.txt`, alive/dead reports |
 
 | 📜 History | ⚙️ CLI Experience | 🛡️ Safety |
 |:---:|:---:|:---:|
-| Automatic scan history | Nested help topics | CIDR expansion limit |
-| Simple `--changes` tracking | Colored flags and output | Validated ports and ranges |
+| Automatic, rotated scan history | Quick help + nested topics | CIDR expansion limit |
+| `--changes` incl. IP changes | "Did you mean" suggestions | Validated ports and ranges |
 | Resume interrupted scans | Bash/Zsh/Fish/PowerShell completion | Thread and timeout limits |
-| Snapshot diff mode | Cross-platform installer | Graceful error handling |
+| `--watch` live monitoring | Config file, `NO_COLOR` | Scripting-friendly exit codes |
 
 </div>
 
@@ -195,7 +207,7 @@ pingme --help
 Expected version:
 
 ```text
-pingme 3.2.3
+pingme 3.3.0 (reliable-cross-platform)
 ```
 
 ---
@@ -265,6 +277,21 @@ pingme --help-topic output
 ---
 
 ## 📖 Usage
+
+### 0. Just give it a target
+
+PingMe detects what each argument is, so most scans need no flags at all:
+
+```bash
+pingme 192.168.1.10          # one IP
+pingme server01              # a hostname
+pingme 192.168.1.0/24        # every host in a subnet
+pingme endpoints.txt         # a target file
+pingme web01 10.0.0.0/28     # mix them
+```
+
+An existing file always wins over a hostname of the same name; use `--host NAME` to force a hostname.
+Run `pingme -h` for the short help or `pingme help examples` for more recipes.
 
 ### 1. Subnet information only
 
@@ -424,16 +451,25 @@ Still online : 6
 Still offline: 1
 ```
 
+When a host keeps its name but gets a new address (for example after a DHCP renewal):
+
+```text
+IP ADDRESS CHANGED
++-----------+--------------+--------------+---------------+
+| HOST      | OLD IP       | NEW IP       | STATUS NOW    |
++-----------+--------------+--------------+---------------+
+| DSIN10661 | 10.100.6.161 | 10.100.6.172 | REACHABLE     |
++-----------+--------------+--------------+---------------+
+```
+
 When nothing changed:
 
 ```text
 CHANGES SINCE LAST SCAN · endpoints.txt
 
-No changes detected.
+NO CONCLUSIVE CHANGES DETECTED
 
-Online     : 7
-Offline    : 2
-Unresolved : 0
+All conclusively tested hosts have the same status as the previous scan.
 ```
 
 Custom report names:
@@ -478,23 +514,96 @@ A host is marked reachable when:
 Packet-summary counters are not accepted as proof. This prevents Windows
 `Destination host unreachable` packets from being counted as live targets.
 
-### 6. Reverse DNS
+### 6. IP → hostname (reverse lookup)
+
+For scans of up to 1,024 targets, PingMe looks up the hostname of every scanned IP automatically and shows it in the **REVERSE DNS** column. It uses:
+
+1. The system resolver: DNS PTR records, `/etc/hosts`, and NSS providers such as winbind (through bounded `getent` on Linux).
+2. For private or link-local hosts that answered: **mDNS** (`avahi-resolve-address`, e.g. `printer.local`) and **NetBIOS** (`nmblookup -A` on Linux/macOS with Samba, `nbtstat -A` on Windows). These name most Windows PCs and LAN devices that have no DNS record.
 
 ```bash
-pingme --host 10.10.10.10 --dns
-pingme -f endpoints.txt --dns
+pingme 192.168.1.0/24            # names shown automatically
+pingme 10.0.0.0/20 --dns         # force lookups above 1,024 targets
+pingme endpoints.txt --no-dns    # skip lookups
 ```
 
-### 7. IPv6
+Look up names **without pinging**:
 
 ```bash
-pingme --host 2001:db8::10
-pingme --sub 2001:db8:1234::/120 --scan
+pingme --reverse 10.10.10.10
+pingme -r 192.168.1.0/24         # lists every address that has a name
 ```
 
-Large IPv6 networks are protected by `--max-hosts`.
+```text
+REVERSE LOOKUP · IP → HOSTNAME
++-----------------+-------------+---------+
+| IP ADDRESS      | HOSTNAME    | SOURCE  |
++-----------------+-------------+---------+
+| 192.168.1.1     | _gateway    | dns     |
+| 192.168.1.20    | DESKTOP-42  | netbios |
+| 192.168.1.31    | nas.local   | mdns    |
++-----------------+-------------+---------+
+```
 
-### 8. IP classification
+Tip: `sudo apt install samba-common-bin avahi-utils` enables the NetBIOS and mDNS lookups on Debian/Kali.
+
+### 7. Watch mode (live monitoring)
+
+```bash
+pingme 10.0.0.0/24 --watch 60
+pingme endpoints.txt --watch 30 --tcp-ports 443
+```
+
+PingMe scans once, shows the normal report, then rescans every N seconds and prints one line per change:
+
+```text
+09:14:02  ▼ DOWN   10.0.0.23           fileserver.corp.local
+09:15:02  ▲ UP     10.0.0.23   1.9ms   fileserver.corp.local
+```
+
+`alive.txt`/`dead.txt` are refreshed each round. Press Ctrl+C to stop.
+
+### 8. IPv6
+
+Every feature works with IPv6: hosts, files, subnets, TCP checks, hostname lookups, `--changes`, and `--watch`.
+
+```bash
+pingme 2001:db8::10                    # an address
+pingme [2001:db8::10]                  # bracketed form is accepted too
+pingme fe80::1%wlan0                   # link-local needs the interface (Windows: fe80::1%12)
+pingme 2001:db8:1234::/120             # small IPv6 subnets can be swept
+pingme server01 -6                     # only the IPv6 addresses of a dual-stack host
+pingme endpoints.txt -4                # only IPv4
+```
+
+**Finding IPv6 hosts on your LAN.** A /64 holds 18 quintillion addresses, so it cannot be swept. Use neighbor discovery instead:
+
+```bash
+pingme --discover6                     # every active interface
+pingme --discover6 wlan0 eth0          # chosen interfaces
+```
+
+PingMe pings the all-nodes and all-routers multicast groups (`ff02::1`, `ff02::2`) on each link and reads the OS neighbor cache (`ip -6 neigh`, `ndp -an`, or `netsh interface ipv6 show neighbors`). Every candidate is then probed normally, so only confirmed hosts are REACHABLE:
+
+```text
+IPv6 NEIGHBORS · local links
++-------------------+---------------------------------+-----------+--------+-----+--------+------+-----------------------+
+| MAC ADDRESS       | IP ADDRESS                      | STATUS    | METHOD | TTL | RTT ms | LOSS | OS GUESS              |
++-------------------+---------------------------------+-----------+--------+-----+--------+------+-----------------------+
+| 5c:a6:e6:cc:0e:fb | fe80::5ea6:e6ff:fecc:efb%wlan0  | REACHABLE | ICMP   | 64  | 1.45   | 0%   | Likely Unix (≤64)     |
+| e6:d4:87:71:a9:38 | fe80::e4d4:87ff:fe71:a938%wlan0 | REACHABLE | ICMP   | 254 | 3.75   | 0%   | Likely network (≤255) |
++-------------------+---------------------------------+-----------+--------+-----+--------+------+-----------------------+
+```
+
+Some hosts (notably Windows) ignore multicast echo requests; they are still found when they appear in the neighbor cache, and any known address can be scanned directly.
+
+`--ipinfo` understands IPv6 special ranges (documentation, ULA, 6to4, Teredo, NAT64, IPv4-mapped), shows the embedded IPv4 address, and reveals the MAC address behind EUI-64 interface IDs:
+
+```bash
+pingme --ipinfo 64:ff9b::808:808 fe80::34de:75ff:fe8e:8955
+```
+
+### 9. IP classification
 
 ```bash
 pingme --ipinfo 8.8.8.8
@@ -537,8 +646,10 @@ dead.txt
 Stores the complete current file-scan report:
 
 ```text
-HOST | IP ADDRESS | STATUS | METHOD | TTL | OS GUESS
+HOST | IP ADDRESS | STATUS | METHOD | TTL | RTT ms | LOSS | OS GUESS | REVERSE DNS
 ```
+
+The REVERSE DNS column appears when at least one name was found. For `--host` and subnet scans the table is shown on screen; pass `--hostnames-out FILE` to save it too.
 
 ### `changes.txt`
 
@@ -547,6 +658,9 @@ Stores only the changes since the previous run using the same target file:
 ```text
 NEWLY ONLINE
 WENT OFFLINE
+IP ADDRESS CHANGED
+NEW TARGETS ADDED TO FILE
+TARGETS REMOVED FROM FILE
 ```
 
 ### `alive.txt`
@@ -568,6 +682,8 @@ pingme -f endpoints.txt --out-format txt
 ```bash
 pingme -f endpoints.txt --out-format csv
 ```
+
+CSV and JSON rows include `ip, status, evidence, probe_error, tcp_open, ttl, rtt_min, rtt_avg, loss_pct, os_guess, hostname, scope, rfc`.
 
 ### JSON
 
@@ -641,6 +757,64 @@ pingme -f endpoints.txt --resume
 
 ```bash
 pingme --diff alive_monday.txt alive_friday.txt
+pingme --diff monday.csv friday.json     # csv and json results work too
+```
+
+### Where history is stored
+
+History, resume data, and `--changes` baselines live in a per-user directory, so running PingMe from different folders shares the same history:
+
+| Platform | Default location |
+|---|---|
+| Linux | `~/.local/share/pingme` (or `$XDG_DATA_HOME/pingme`) |
+| macOS | `~/Library/Application Support/PingMe` |
+| Windows | `%LOCALAPPDATA%\PingMe` |
+
+Override it with `--data-dir DIR` or `PINGME_DATA_DIR`. History keeps the newest 50 scans per label (`--keep N`, `0` = all).
+Baselines saved by older versions in `./data` are still read, so upgrading does not lose your `--changes` history.
+Target files are labelled by name plus a short hash of their full path, so two `hosts.txt` files in different folders never share a baseline. `pingme --clear-history endpoints.txt` accepts the file path directly.
+
+---
+
+## ⚙️ Configuration File
+
+Save your preferred defaults once:
+
+```bash
+pingme --init-config          # creates a commented template
+pingme help config            # shows the location and every key
+```
+
+Example `~/.config/pingme/config.toml` (Windows: `%APPDATA%\PingMe\config.toml`):
+
+```toml
+threads = 50
+timeout = 1.5
+count = 4
+min_replies = 2
+tcp_ports = "22,80,443,445,3389"
+out_format = "csv"
+```
+
+Command-line flags always win over the config file. Use `--config FILE` (or `PINGME_CONFIG`) for another file and `--no-config` to ignore it. Unknown keys are reported with a suggestion.
+
+---
+
+## 🚦 Exit Codes
+
+| Code | Meaning |
+|---:|---|
+| `0` | Hosts/files: every target reachable. Subnets: at least one host found. |
+| `1` | Hosts/files: a target is down or unresolved. Subnets: nothing answered. |
+| `2` | Usage or configuration error. |
+| `3` | No usable ping tool is installed. |
+| `4` | At least one probe failed to run (see `errors.txt`). |
+| `130` | Interrupted with Ctrl+C; rerun with `--resume`. |
+
+Use `--exit-zero` when a wrapper expects 0 after every completed scan.
+
+```bash
+pingme critical-servers.txt --quiet || notify-send "PingMe" "A critical server is down"
 ```
 
 ---
@@ -650,6 +824,9 @@ pingme --diff alive_monday.txt alive_friday.txt
 ### Targets and modes
 
 ```text
+TARGET [TARGET ...]
+    IP, hostname, CIDR, or existing file. Detected automatically; implies a scan.
+
 -s, --sub CIDR
     Show subnet information. Add --scan to scan it.
 
@@ -662,36 +839,49 @@ pingme --diff alive_monday.txt alive_friday.txt
 --ipinfo IP [IP ...]
     Classify addresses as public, private, loopback, and more.
 
+-r, --reverse IP/CIDR [...]
+    Look up hostnames for addresses without pinging them.
+
+--discover6 [IFACE ...]
+    Find IPv6 hosts on local links (multicast echo + neighbor cache).
+
+-4, --ipv4-only / -6, --ipv6-only
+    Resolve and scan only one address family.
+
 --diff FILE_A FILE_B
     Compare two host snapshot files.
 
 --history
     List stored scan history.
 
---clear-history LABEL
-    Delete history for one label.
+--clear-history LABEL|FILE
+    Delete history, resume, and baseline data for a label or target file.
 ```
 
 ### Discovery and scan control
 
 ```text
 --scan
-    Start scanning a CIDR. Implied by --file and --host.
+    Start scanning a --sub CIDR. Implied by --file, --host, and plain targets.
 
 -t, --threads N
     Number of concurrent workers. Default: 20.
 
 --timeout SEC
-    Per-packet wait time. Default: 2.
+    Wait per ping; fractions such as 0.5 are allowed. Default: 2.
 
 --count N
-    Packets sent per host. Default: 2.
+    Ping attempts per host. Default: 2.
+
+--min-replies N
+    Replies needed before a host is REACHABLE. Default: 2.
+    Example: --count 5 --min-replies 2 tolerates a lossy Wi-Fi link.
 
 --tcp-ports PORTS
     TCP ports or ranges, such as 22,80,443 or 8000-8010.
 
 --tcp-timeout SEC
-    TCP connection timeout. Default: 2.
+    TCP connection timeout. Default: 2. All ports of a host are tried in parallel.
 
 --retry N
     Retry hosts that did not respond.
@@ -699,17 +889,20 @@ pingme --diff alive_monday.txt alive_friday.txt
 --rate PPS
     Maximum packet rate. 0 means unlimited.
 
---dns
-    Perform reverse DNS for reachable hosts.
+--dns / --no-dns
+    Force or skip IP → hostname lookups. Default: automatic (on up to 1,024 targets).
 
 --resume
-    Continue an interrupted scan.
+    Continue an interrupted scan (works with both fping and ping).
 
---ping-tool auto|fping|ping
-    Select the ICMP backend.
+--watch SEC
+    Rescan every SEC seconds and print only changes.
+
+--ping-tool auto|fping|ping|ask
+    Select the ICMP backend. "ask" chooses interactively.
 
 --fast
-    Use 100 threads, one-second timeout, and one packet.
+    Use 100 threads, one-second timeout, and one attempt. Positives are still confirmed.
 
 --exclude IP/CIDR [...]
     Skip selected IP addresses or networks.
@@ -731,8 +924,8 @@ pingme --diff alive_monday.txt alive_friday.txt
     Output path for inconclusive probe-execution failures.
 
 --hostnames-out FILE
-    Save the complete file-scan report containing HOST, IP ADDRESS,
-    STATUS, METHOD, TTL, and OS GUESS. Default: hostnames.txt.
+    Save the complete status table (HOST, IP ADDRESS, STATUS, METHOD, TTL,
+    RTT, LOSS, OS GUESS, REVERSE DNS). Default for file scans: hostnames.txt.
 
 --changes-out FILE
     Save newly-online and went-offline changes. Default: changes.txt.
@@ -747,7 +940,7 @@ pingme --diff alive_monday.txt alive_friday.txt
 --label NAME
     Custom history label.
 
---quiet
+-q, --quiet
     Write result files without normal terminal output.
 
 --compact
@@ -759,20 +952,41 @@ pingme --diff alive_monday.txt alive_friday.txt
 --no-banner
     Hide the ASCII banner.
 
+--color auto|always|never
+    Colored output. NO_COLOR is honoured in auto mode.
+
+--exit-zero
+    Exit 0 after any completed scan.
+
 --no-history
     Do not store the scan.
 
 --compare
-    Advanced history comparison using the selected history label.
+    IP-only comparison with the previous scan of the label.
+    Probe errors are reported separately, never as "went offline".
+
+--keep N
+    History entries kept per label. Default: 50. 0 keeps everything.
+
+--data-dir DIR
+    State directory. Default: per-user data directory.
+```
+
+### Configuration
+
+```text
+--config FILE      Use another config file.
+--no-config        Ignore the config file.
+--init-config      Create a commented template.
 ```
 
 ### Help
 
 ```text
--h, --help
---help-all
---help-topic TOPIC
-help TOPIC
+-h, --help           Quick, task-oriented help
+--help-all           Every option
+pingme help TOPIC    targets | scan | discovery | output | history | config | exitcodes | advanced | examples
+--help-topic TOPIC   Same as "pingme help TOPIC"
 --version
 ```
 
@@ -807,8 +1021,27 @@ pingme -f production.txt \
   --threads 20 \
   --timeout 6 \
   --count 8 \
+  --min-replies 2 \
   --retry 1 \
   --dns
+```
+
+### Lossy Wi-Fi or VPN link
+
+```bash
+pingme 192.168.1.0/24 --count 5 --min-replies 2 --timeout 1.5
+```
+
+### Name every device on the LAN
+
+```bash
+pingme --reverse 192.168.1.0/24
+```
+
+### Monitoring from cron
+
+```bash
+*/5 * * * * pingme /etc/pingme/critical.txt --changes --quiet || /usr/local/bin/alert-oncall
 ```
 
 ### Rate-limited customer assessment
@@ -863,9 +1096,33 @@ pingme -f endpoints.txt \
 
 ```bash
 # Help
-pingme --help
+pingme -h
 pingme --help-all
 pingme help examples
+
+# Just scan something
+pingme 192.168.1.0/24
+pingme endpoints.txt
+pingme server01 10.0.0.5
+
+# IP → hostname only
+pingme --reverse 192.168.1.0/24
+
+# IPv6 hosts on the local network
+pingme --discover6
+
+# Only IPv6 / only IPv4
+pingme server01 -6
+pingme endpoints.txt -4
+
+# Watch for changes every minute
+pingme 10.0.0.0/24 --watch 60
+
+# Tolerate packet loss (2 of 5)
+pingme endpoints.txt --count 5 --min-replies 2
+
+# Create a config file
+pingme --init-config
 
 # Version
 pingme --version
@@ -938,10 +1195,13 @@ pingme --ipinfo 8.8.8.8 192.168.1.1
 | Count | `2` | Confirms responses without excessive delay |
 | TCP timeout | `2s` | Keeps fallback checks practical |
 | Maximum CIDR targets | `65,536` | Prevents accidental huge expansion |
+| Minimum replies | `2` | Two independent echo replies before REACHABLE |
+| History kept | `50` scans per label | Bounded disk use |
+| Reverse lookups | automatic up to `1,024` targets | Names without slowing huge sweeps |
 
-A target is reachable only after two independent validated direct ICMP echo confirmations or a configured TCP port accepts a connection. With `fping`, PingMe performs one batch discovery process and then validates positive candidates serially with separate system `ping` processes; malformed or inconsistent replies go to `errors.txt`, never `alive.txt`.
+A target is reachable only after `--min-replies` (default two) independent validated direct ICMP echo replies, or when a configured TCP port accepts a connection. With `--count` higher than `--min-replies`, lost packets are tolerated (for example 2 of 5). With `fping`, PingMe runs batch discovery (split into steps on very large scans so progress and `--resume` advance), then validates positive candidates **in parallel** with separate system `ping` processes; malformed or inconsistent replies go to `errors.txt`, never `alive.txt`.
 
-Interactive scans show the graphical subnet/backend interface, live progress, reachable-host events, and final tables. When both backends exist, `auto` asks which one to use. Use `--compact` for a two-line summary or `--quiet` for file-only automation; redirected output becomes compact automatically.
+Interactive scans show the graphical subnet/backend interface, live progress, reachable-host events, and final tables. `auto` picks fping when installed without prompting; use `--ping-tool ask` to choose interactively. Use `--compact` for a short summary or `--quiet` for file-only automation; redirected output becomes compact automatically.
 
 ---
 
@@ -949,30 +1209,34 @@ Interactive scans show the graphical subnet/backend interface, live progress, re
 
 ```text
 pingme/
-├── pingme.py
-├── install.py
+├── pingme.py                 # the whole scanner (no dependencies)
+├── install.py                # launcher + shell completion installer
+├── pyproject.toml            # pipx/pip packaging and ruff config
 ├── repair-windows.ps1
 ├── README.md
-├── RELEASE_NOTES_v3.2.3.md
+├── RELEASE_NOTES_v3.3.0.md
 ├── PingMe_v3.0_Manual.pdf
 ├── LICENSE
+├── .github/workflows/ci.yml  # Linux/macOS/Windows tests
 ├── examples/
 │   └── targets.txt
-├── tests/
-│   └── smoke_test.py
-└── data/
-    └── scan-history.json
+└── tests/
+    ├── smoke_test.py
+    ├── test_reachability.py
+    └── test_improvements.py
 ```
 
-Generated during file scans:
+Generated during file scans (in the current directory):
 
 ```text
-hostnames.txt   # Complete HOST/IP/STATUS/METHOD/TTL/OS report
-changes.txt     # Newly online and went-offline changes
+hostnames.txt   # Complete HOST/IP/STATUS/METHOD/TTL/RTT/LOSS/OS/REVERSE DNS report
+changes.txt     # Newly online, went offline, IP changes
 alive.txt       # Currently reachable IPs
 dead.txt        # Currently non-responsive IPs
-data/<label>.json
+errors.txt      # Probes that failed to run
 ```
+
+History and baselines go to the per-user data directory (see "Where history is stored").
 
 ---
 
@@ -987,7 +1251,7 @@ Targets
    └── Target file
           │
           ▼
-Hostname resolution
+Hostname resolution (bounded, per-OS)
           │
           ▼
 IPv4 / IPv6 address list
@@ -998,13 +1262,13 @@ ICMP discovery ──────┐
 TCP fallback ────────┘
           │
           ▼
-TTL and OS estimation
+TTL, RTT, loss, OS estimation + IP → hostname lookup
           │
           ▼
 Live scan output
           │
           ▼
-HOST | IP | STATUS | METHOD | TTL | OS
+HOST | IP | STATUS | METHOD | TTL | RTT | LOSS | OS | REVERSE DNS
           │
           ▼
 hostnames.txt / changes.txt / alive.txt / dead.txt + history
@@ -1086,7 +1350,29 @@ Use TCP fallback:
 pingme -f endpoints.txt --tcp-ports 22,80,443,445,3389
 ```
 
-Firewalls commonly block ICMP.
+Firewalls commonly block ICMP. On a lossy link, allow a few lost packets:
+
+```bash
+pingme -f endpoints.txt --count 5 --min-replies 2
+```
+
+### No hostnames in the REVERSE DNS column
+
+Many LAN devices have no DNS PTR record. Install the NetBIOS and mDNS helpers, then try again:
+
+```bash
+sudo apt install samba-common-bin avahi-utils
+pingme --reverse 192.168.1.0/24
+```
+
+### I mistyped an option
+
+PingMe suggests the closest match:
+
+```text
+✗ unrecognized arguments: --tpc-ports
+Did you mean --tcp-ports?
+```
 
 ### `changes.txt` shows a first-scan baseline
 

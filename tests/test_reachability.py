@@ -140,22 +140,21 @@ class BackendTests(unittest.TestCase):
         self.assertNotIn("-c", command)
         self.assertEqual(run_mock.call_args.kwargs["input"], b"10.0.0.1\n10.0.0.2\n")
 
-    def test_batch_candidates_are_confirmed_serially_and_fail_closed(self) -> None:
+    def test_batch_candidates_are_confirmed_in_parallel_and_fail_closed(self) -> None:
         addresses = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+
+        def confirm(ip: str, _timeout: float, _count: int):
+            if ip == "10.0.0.1":
+                return (True, 64)
+            raise pingme.ProbeExecutionError("invalid ICMP reply payload")
+
         with (
             patch.object(pingme, "_fping_batch_alive", return_value=set(addresses[:2])),
             patch.object(pingme, "_PING_PATH", "ping"),
-            patch.object(
-                pingme,
-                "_ping_via_system",
-                side_effect=[
-                    (True, 64),
-                    (True, 64),
-                    pingme.ProbeExecutionError("invalid ICMP reply payload"),
-                ],
-            ) as confirm_mock,
+            patch.object(pingme, "_ping_via_system", side_effect=confirm) as confirm_mock,
         ):
-            results = pingme._scan_fping_batch(addresses, 1, 2, 0, 0, False, None, 1)
+            results = pingme._scan_fping_batch(addresses, 1, 2, 0, 0, False, None, 1, threads=4)
+        # Two confirmations for the good host; the integrity error aborts the other at once.
         self.assertEqual(confirm_mock.call_count, 3)
         self.assertEqual([row["status"] for row in results], [
             "REACHABLE", "PROBE ERROR", "NO RESPONSE"
