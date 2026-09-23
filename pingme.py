@@ -3287,7 +3287,8 @@ def build_file_status_records(rows: list[dict], results: list[dict]) -> list[dic
                 os_guess = str(result.get("os_guess") or "Unknown")
                 if result.get("rtt_avg") is not None:
                     rtt = f"{result['rtt_avg']:g}"
-                if result.get("loss_pct") is not None:
+                # ICMP loss says nothing about a host that answered only ARP or TCP.
+                if result.get("loss_pct") is not None and (result.get("icmp_alive") or not result.get("alive")):
                     loss = f"{result['loss_pct']}%"
                 name = str(result.get("hostname") or "")
                 mac = str(result.get("mac") or "")
@@ -3359,36 +3360,6 @@ def _status_columns(
     return columns
 
 
-def _status_summary(records: list[dict]) -> str:
-    counts = _status_counts(records)
-    summary = (
-        f"Reachable: {counts['reachable']}  "
-        f"No response: {counts['no_response']}  "
-        f"Probe errors: {counts['probe_error']}  "
-        f"Unresolved: {counts['unresolved']}"
-    )
-    if counts["other"]:
-        summary += f"  Not scanned/excluded: {counts['other']}"
-    return summary
-
-
-def _plain_table(records: list[dict], title: str) -> str:
-    """Return a portable ASCII table with no ANSI escape sequences."""
-    columns = _status_columns(records)
-    line = "+" + "+".join("-" * (width + 2) for _header, _key, width in columns) + "+"
-    output = [title, "", line]
-    output.append("| " + " | ".join(f"{header:<{width}}" for header, _key, width in columns) + " |")
-    output.append(line)
-    for record in records:
-        values = [str(record.get(key, ""))[:width] for _header, key, width in columns]
-        output.append("| " + " | ".join(
-            f"{value:<{width}}" for value, (_header, _key, width) in zip(values, columns)
-        ) + " |")
-    output.append(line)
-    output.extend([_status_summary(records), ""])
-    return "\n".join(output)
-
-
 def _host_name(record: dict) -> str:
     """Best hostname for a record: the name from the target list, else reverse DNS."""
     host = str(record.get("host") or "")
@@ -3400,18 +3371,261 @@ def _host_name(record: dict) -> str:
     return str(record.get("name") or "")
 
 
-def _names_table(records: list[dict], title: str) -> str:
-    """IP ADDRESS | HOSTNAME only, one row per resolved address."""
-    rows = list(dict.fromkeys(
-        (str(r.get("ip", "")), _host_name(r) or "-") for r in records if r.get("ip") != "UNRESOLVED"
-    ))
-    ip_w = max([len("IP ADDRESS")] + [len(ip) for ip, _name in rows])
-    name_w = max([len("HOSTNAME")] + [len(name) for _ip, name in rows])
-    line = f"+{'-' * (ip_w + 2)}+{'-' * (name_w + 2)}+"
-    output = [title, "", line, f"| {'IP ADDRESS':<{ip_w}} | {'HOSTNAME':<{name_w}} |", line]
-    output += [f"| {ip:<{ip_w}} | {name:<{name_w}} |" for ip, name in rows]
-    output += [line, f"{len(rows)} addresses", ""]
-    return "\n".join(output)
+def _is_local_address(ip: str) -> bool:
+    """True when ``ip`` belongs to this machine (it can be bound to)."""
+    try:
+        address = ipaddress.ip_address(ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as probe:
+            probe.bind((ip, 0))
+        return True
+    except OSError:
+        return False
+
+
+_HIGH_LATENCY_MS = 500
+_VENDOR_SUFFIX = re.compile(
+    r"[\s,.]+(co\.?,?\s*ltd|ltd|inc|corp|corporation|company|co|llc|gmbh|limited|s\.?a|b\.?v|ag|plc)\.?$",
+    re.IGNORECASE,
+)
+
+
+def _clean_vendor(vendor: str) -> str:
+    """Drop legal suffixes so one manufacturer reads the same everywhere."""
+    previous = None
+    while vendor != previous:
+        previous, vendor = vendor, _VENDOR_SUFFIX.sub("", vendor).strip(" ,.")
+    return vendor
+
+
+def _report_os_hint(ttl: str) -> str:
+    """OS family from the observed TTL, rounded up to the usual initial value."""
+    if not ttl.isdigit() or int(ttl) <= 0:
+        return ""
+    value = int(ttl)
+    if value <= 32:
+        return "Embedded / unknown"
+    return "Unix-like" if value <= 64 else "Windows" if value <= 128 else "Network device"
+
+
+def _default_gateways() -> set[str]:
+    """IPv4 default gateways from the Linux routing table (empty elsewhere)."""
+    try:
+        lines = Path("/proc/net/route").read_text().splitlines()[1:]
+    except OSError:
+        return set()
+    gateways = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) > 2 and fields[1] == "00000000" and fields[2] != "00000000":
+            gateways.add(socket.inet_ntoa(int(fields[2], 16).to_bytes(4, "little")))
+    return gateways
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def live_host_rows(records: list[dict]) -> list[dict]:
+    """One row per reachable IP address, with every name that pointed at it."""
+    rows: dict[str, dict] = {}
+    for record in records:
+        if record.get("status") != "REACHABLE":
+            continue
+        ip = str(record["ip"])
+        name = _host_name(record)
+        row = rows.get(ip)
+        if row is None:
+            method = str(record.get("method") or "-")
+            detected = ("ARP reply (ICMP blocked)" if method == "ARP/ND"
+                        else f"TCP {method[4:]} (ICMP blocked)" if method.startswith("TCP:") else method)
+            vendor = _clean_vendor(str(record.get("vendor") or ""))
+            ttl = "" if record.get("ttl") in (None, "?") else str(record.get("ttl"))
+            row = rows[ip] = {
+                "ip": ip,
+                "hostname": [],
+                "reverse_dns": str(record.get("name") or ""),
+                "detected_by": detected,
+                "ttl": ttl,
+                "rtt_ms": "" if record.get("rtt") in (None, "-") else str(record.get("rtt")),
+                "mac": str(record.get("mac") or ""),
+                "vendor": "Randomized MAC" if vendor.startswith("Private") else vendor,
+                "os_hint": _report_os_hint(ttl),
+                "scanner": _is_local_address(ip),
+            }
+            if row["scanner"]:
+                row["vendor"] = row["vendor"] or "This scanner"
+        if name and name not in row["hostname"]:
+            row["hostname"].append(name)
+    ordered = sorted(rows.values(), key=lambda row: ip_sort_key(row["ip"]))
+    for row in ordered:
+        row["hostname"] = ", ".join(row["hostname"])
+    return ordered
+
+
+def _text_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    widths = [max([len(header)] + [len(row[index]) for row in rows]) for index, header in enumerate(headers)]
+    line = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    body = [line, "| " + " | ".join(f"{h:<{w}}" for h, w in zip(headers, widths)) + " |", line]
+    body += ["| " + " | ".join(f"{v:<{w}}" for v, w in zip(row, widths)) + " |" for row in rows]
+    return body + [line]
+
+
+def _wrap_list(items: list[str], width: int = 96, indent: str = "  ") -> list[str]:
+    lines, current = [], ""
+    for item in items:
+        piece = item if not current else f", {item}"
+        if current and len(indent + current + piece) > width:
+            lines.append(indent + current + ",")
+            current = item
+        else:
+            current += piece
+    return lines + ([indent + current] if current else [])
+
+
+def _report_notes(rows: list[dict], meta: dict) -> list[str]:
+    notes: list[str] = []
+    gateways = [row["ip"] for row in rows if row["ip"] in _default_gateways()]
+    if gateways:
+        notes.append(f"{', '.join(gateways)} {'is' if len(gateways) == 1 else 'are'} the scanner's default gateway (router).")
+    scanner = [row["ip"] for row in rows if row["scanner"]]
+    if scanner:
+        notes.append(f"{', '.join(scanner)} {'is' if len(scanner) == 1 else 'are addresses of'} "
+                     "the scanning machine itself, not discovered assets." if len(scanner) > 1 else
+                     f"{scanner[0]} is the scanning machine itself, not a discovered asset.")
+    filtered = [row["ip"] for row in rows if "ICMP blocked" in row["detected_by"]]
+    if filtered:
+        one = len(filtered) == 1
+        notes.append(f"{_plural(len(filtered), 'host')} {'drops' if one else 'drop'} ICMP echo and "
+                     f"{'was' if one else 'were'} found only by ARP or TCP: "
+                     f"{', '.join(filtered)}. Firewalled hosts like these on other subnets are invisible "
+                     "to ping; add --tcp-ports to find them.")
+    randomized = [row["ip"] for row in rows if row["vendor"] == "Randomized MAC"]
+    if randomized:
+        one = len(randomized) == 1
+        notes.append(f"{_plural(len(randomized), 'host')} {'uses a' if one else 'use'} randomized (private) MAC "
+                     f"{'address' if one else 'addresses'}, typically phones and laptops: {', '.join(randomized)}. "
+                     f"{'Its' if one else 'Their'} MAC will change between scans, so match "
+                     f"{'it' if one else 'them'} by hostname or re-scan to confirm identity.")
+    slow = [row["ip"] for row in rows if row["rtt_ms"] and float(row["rtt_ms"]) >= _HIGH_LATENCY_MS]
+    if slow:
+        notes.append(f"High latency (>= {_HIGH_LATENCY_MS} ms): {', '.join(slow)}. Usually a Wi-Fi client in "
+                     "power-save mode; such devices may be missed by a single scan.")
+    return notes
+
+
+_REPORT_LIMITATIONS = [
+    "Point-in-time result: devices that were off, asleep, or disconnected during the scan are not listed.",
+    "Hosts that drop ICMP are detected only on the local network segment (ARP) or with --tcp-ports.",
+    "OS hints come from the reply TTL only; they are indicative, not a fingerprint.",
+]
+
+
+def render_hosts_report(records: list[dict], meta: dict, names_only: bool = False) -> str:
+    """Professional live-host report: header, live hosts only, notes, and limitations."""
+    rows = live_host_rows(records)
+    counts = _status_counts(records)
+    title = "PingMe Live Host Report" + (" (names)" if names_only else "")
+    header = [title, "=" * len(title), ""]
+    fields = [
+        ("Scope", meta.get("scope", "")),
+        ("Scan started", meta.get("started", "")),
+        ("Duration", meta.get("duration", "")),
+        ("Scanner", meta.get("scanner", "")),
+        ("Method", meta.get("method", "")),
+        ("Result", f"{_plural(len(rows), 'live host')}; {counts['no_response']} no response; "
+                   f"{_plural(counts['probe_error'], 'probe error')}; {counts['unresolved']} unresolved"),
+    ]
+    header += [f"{label:<13}: {value}" for label, value in fields if value]
+    out = header + ["", "LIVE HOSTS"]
+    if not rows:
+        out += ["  No host answered."]
+    elif names_only:
+        out += _text_table(["#", "IP ADDRESS", "HOSTNAME"],
+                           [[str(n), row["ip"], row["hostname"] or "-"] for n, row in enumerate(rows, 1)])
+    else:
+        columns = [
+            ("#", None), ("IP ADDRESS", "ip"), ("HOSTNAME", "hostname"), ("DETECTED BY", "detected_by"),
+            ("TTL", "ttl"), ("RTT ms", "rtt_ms"), ("MAC ADDRESS", "mac"), ("VENDOR", "vendor"),
+            ("OS HINT", "os_hint"),
+        ]
+        if any(row["reverse_dns"] and row["reverse_dns"] not in row["hostname"].split(", ") for row in rows):
+            columns.insert(3, ("REVERSE DNS", "reverse_dns"))
+        columns = [(h, k) for h, k in columns if k is None or any(row[k] for row in rows)]
+        out += _text_table([h for h, _k in columns], [
+            [str(n) if k is None else (row[k] or "-") for h, k in columns] for n, row in enumerate(rows, 1)
+        ])
+
+    if meta.get("list_missing"):
+        down = list(dict.fromkeys(
+            f"{r['host']} ({r['ip']})" if r["host"] != r["ip"] else r["ip"]
+            for r in records if r.get("status") in {"NO RESPONSE", "PROBE ERROR"}))
+        unresolved = list(dict.fromkeys(r["host"] for r in records if r.get("status") == "UNRESOLVED"))
+        if down:
+            out += ["", f"IN-SCOPE TARGETS WITHOUT RESPONSE ({len(down)})"] + _wrap_list(down)
+        if unresolved:
+            out += ["", f"UNRESOLVED NAMES ({len(unresolved)})"] + _wrap_list(unresolved)
+
+    notes = _report_notes(rows, meta)
+    if notes:
+        out += ["", "NOTES"] + [f"  - {note}" for note in notes]
+    out += ["", "LIMITATIONS"] + [f"  - {item}" for item in _REPORT_LIMITATIONS] + [""]
+    return "\n".join(out)
+
+
+def _source_address(results: list[dict]) -> str:
+    """Local address the scan traffic left from (no packet is sent)."""
+    for result in results:
+        ip = str(result.get("ip", "")).split("%", 1)[0]
+        try:
+            family = socket.AF_INET6 if ipaddress.ip_address(ip).version == 6 else socket.AF_INET
+            with socket.socket(family, socket.SOCK_DGRAM) as probe:
+                probe.connect((ip, 9))
+                return probe.getsockname()[0]
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
+def _interface_for(address: str) -> str:
+    """Interface that owns a local address (Linux ``ip``; empty when unknown)."""
+    if not address or not shutil.which("ip"):
+        return ""
+    try:
+        output = subprocess.run(["ip", "-o", "addr", "show"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) > 3 and fields[3].split("/", 1)[0] == address:
+            return fields[1]
+    return ""
+
+
+def scan_report_meta(args: argparse.Namespace, scope: str, results: list[dict], started_at: float) -> dict:
+    """Evidence header for the live-host report: when, from where, and how the scan ran."""
+    timeout = "auto" if args.timeout is None else f"{_format_seconds(args.timeout)} s"
+    method = (f"ICMP echo via {_PING_TOOL} engine ({args.count} attempts, {args.min_replies} replies "
+              f"required, timeout {timeout})")
+    if args.arp:
+        method += " + ARP/ND replies"
+    if args.tcp_ports:
+        method += f" + TCP connect {args.tcp_ports}"
+    source = _source_address(results)
+    return {
+        "scope": f"{scope} ({len(results):,} addresses)",
+        "started": datetime.fromtimestamp(started_at).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z (UTC%z)"),
+        "duration": f"{time.time() - started_at:.1f} s",
+        "scanner": f"{socket.gethostname()}"
+                   + (f" ({', '.join(filter(None, [source, _interface_for(source)]))})" if source else "")
+                   + f", PingMe {VERSION}",
+        "method": method,
+    }
 
 
 def write_hostnames_report(
@@ -3421,15 +3635,29 @@ def write_hostnames_report(
     announce: bool = True,
     names_only: bool = False,
     title: str = "FILE SCAN STATUS",
+    meta: Optional[dict] = None,
 ) -> Path:
-    """Save the host status table (or just IP | HOSTNAME with ``names_only``)."""
+    """Save the live-host report; .csv and .json extensions give machine-readable rows."""
     destination = Path(output_file).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    table = _names_table if names_only else _plain_table
-    report = table(records, f"{title} · {source}")
-    destination.write_text(report, encoding="utf-8")
+    meta = {"scope": source, "list_missing": title.startswith("FILE"), **(meta or {})}
+    suffix = destination.suffix.lower()
+    if suffix in {".csv", ".json"}:
+        rows = live_host_rows(records)
+        keys = ["ip", "hostname"] if names_only else [
+            "ip", "hostname", "reverse_dns", "detected_by", "ttl", "rtt_ms", "mac", "vendor", "os_hint", "scanner"]
+        rows = [{key: ("yes" if row[key] else "no") if key == "scanner" else row[key] for key in keys} for row in rows]
+        if suffix == ".json":
+            destination.write_text(json.dumps({"meta": meta, "live_hosts": rows}, indent=2), encoding="utf-8")
+        else:
+            with destination.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=keys)
+                writer.writeheader()
+                writer.writerows(rows)
+    else:
+        destination.write_text(render_hosts_report(records, meta, names_only), encoding="utf-8")
     if announce:
-        print(f"  {C.CYAN}[report] host details → {destination}{C.RESET}")
+        print(f"  {C.CYAN}[report] live hosts → {destination}{C.RESET}")
     return destination
 
 
@@ -5042,7 +5270,7 @@ def print_topic_help(topic: str) -> int:
             ("--alive-out FILE", "Reachable hosts (default alive.txt)."),
             ("--dead-out FILE", "Completed probes with no response (default dead.txt)."),
             ("--error-out FILE", "Probes that failed to run (default errors.txt)."),
-            ("--hostnames-out FILE", "Full HOST/IP/STATUS/RTT/LOSS/OS table (file scans: hostnames.txt)."),
+            ("--hostnames-out FILE", "Live-host report with scan details and notes (.csv/.json for data; file scans: hostnames.txt)."),
             ("--names-only", "Hostnames file lists only IP ADDRESS | HOSTNAME."),
             ("--changes-out FILE", "Change summary written by --changes (default changes.txt)."),
             ("--out-format FMT", "txt | csv | json for the alive/dead/errors files."),
@@ -5986,11 +6214,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                   f"{C.DIM}Hosts that block ping can be found with --tcp-ports 22,80,443,445,3389.{C.RESET}\n")
 
     if hostnames_out and not interrupted:
+        scope = target_file or ", ".join(subnets + hosts) or label
         write_hostnames_report(
             status_records if status_rows else records_for_results(results, []),
-            target_file or ", ".join(subnets + hosts) or label,
-            hostnames_out, announce=rich_output, names_only=args.names_only,
+            scope, hostnames_out, announce=rich_output, names_only=args.names_only,
             title="FILE SCAN STATUS" if target_file else "SCAN STATUS",
+            meta=scan_report_meta(args, scope, results, started_at),
         )
 
     write_results(

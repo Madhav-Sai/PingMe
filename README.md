@@ -725,18 +725,57 @@ alive.txt
 dead.txt
 ```
 
-### `hostnames.txt`
+### `hostnames.txt` — live host report
 
-Stores the complete current file-scan report:
+A report you can attach to an assessment: scan evidence, **live hosts only** (one row per IP), notes, and limitations.
 
 ```text
-HOST | IP ADDRESS | STATUS | METHOD | TTL | RTT ms | LOSS | OS GUESS | REVERSE DNS
+PingMe Live Host Report
+=======================
+
+Scope        : 10.10.11.0/24 (254 addresses)
+Scan started : 2026-09-23 17:43:11 IST (UTC+0530)
+Duration     : 8.2 s
+Scanner      : IT-Serv (10.10.11.30, wlan0), PingMe 3.3.0
+Method       : ICMP echo via native engine (3 attempts, 2 replies required, timeout 2 s) + ARP/ND replies
+Result       : 8 live hosts; 246 no response; 0 probe errors; 0 unresolved
+
+LIVE HOSTS
++---+--------------+----------+--------------------------+-----+--------+-------------------+----------------------+--------------------+
+| # | IP ADDRESS   | HOSTNAME | DETECTED BY              | TTL | RTT ms | MAC ADDRESS       | VENDOR               | OS HINT            |
++---+--------------+----------+--------------------------+-----+--------+-------------------+----------------------+--------------------+
+| 1 | 10.10.11.1   | _gateway | ICMP                     | 64  | 3.41   | 50:91:e3:ba:c0:98 | TP-Link Systems      | Unix-like          |
+| 2 | 10.10.11.30  | IT-Serv  | ICMP                     | 64  | 0.16   | -                 | This scanner         | Unix-like          |
+| 3 | 10.10.11.41  | -        | ICMP                     | 255 | 37.47  | 34:fc:99:a1:46:e5 | SJIT                 | Network device     |
+| 4 | 10.10.11.70  | -        | ICMP                     | 32  | 401.52 | da:c0:89:9a:84:29 | Randomized MAC       | Embedded / unknown |
+| 5 | 10.10.11.86  | -        | ICMP                     | 64  | 114.86 | 1a:89:1e:f9:a0:0e | Randomized MAC       | Unix-like          |
+| 6 | 10.10.11.116 | -        | ICMP                     | 64  | 7.06   | b0:19:21:ff:cb:ea | TP-Link Systems      | Unix-like          |
+| 7 | 10.10.11.182 | -        | ARP reply (ICMP blocked) | -   | -      | 3c:84:6a:26:6f:0b | TP-LINK TECHNOLOGIES | -                  |
+| 8 | 10.10.11.215 | -        | ICMP                     | 64  | 36.87  | 4a:5d:5d:49:2a:34 | Randomized MAC       | Unix-like          |
++---+--------------+----------+--------------------------+-----+--------+-------------------+----------------------+--------------------+
+
+NOTES
+  - 10.10.11.1 is the scanner's default gateway (router).
+  - 10.10.11.30 is the scanning machine itself, not a discovered asset.
+  - 1 host drops ICMP echo and was found only by ARP or TCP: 10.10.11.182. ...
+  - 3 hosts use randomized (private) MAC addresses ...
+
+LIMITATIONS
+  - Point-in-time result: devices that were off, asleep, or disconnected during the scan are not listed.
+  - Hosts that drop ICMP are detected only on the local network segment (ARP) or with --tcp-ports.
+  - OS hints come from the reply TTL only; they are indicative, not a fingerprint.
 ```
 
-The REVERSE DNS column appears when at least one name was found. For `--host` and subnet scans the table is shown on screen; pass `--hostnames-out FILE` (alias `--hostfile-out`) to save it too. Add `--names-only` to save just `IP ADDRESS | HOSTNAME`:
+- File scans (`-f`) also list **in-scope targets without response** and **unresolved names**, so the report shows what was tested but not reached.
+- Empty columns are dropped; several names for one IP are merged (`web01, www`).
+- `--names-only` keeps just `# | IP ADDRESS | HOSTNAME`.
+- A `.csv` or `.json` file name writes machine-readable rows instead: `--hostnames-out live.csv`.
+- Written automatically for file scans; add `--hostnames-out FILE` (alias `--hostfile-out`) for subnet and host scans.
 
 ```bash
-pingme -f hosts.txt --hostnames-out hostnames.txt --names-only
+pingme 10.10.11.0/24 --hostnames-out hostnames.txt
+pingme -f scope.txt --hostnames-out names.txt --names-only
+pingme 10.10.11.0/24 --hostnames-out live.csv
 ```
 
 ### `changes.txt`
@@ -1038,9 +1077,9 @@ TARGET [TARGET ...]
     Output path for inconclusive probe-execution failures.
 
 --hostnames-out FILE
-    Save the complete status table (HOST, IP ADDRESS, STATUS, METHOD, TTL,
-    RTT, LOSS, OS GUESS, REVERSE DNS). Default for file scans: hostnames.txt.
-    Works for every scan type. Alias: --hostfile-out.
+    Save the live-host report: scan details, live hosts only, notes, and
+    limitations. .csv/.json names write data rows. Default for file scans:
+    hostnames.txt. Works for every scan type. Alias: --hostfile-out.
 
 --names-only
     Make the hostnames file list only IP ADDRESS | HOSTNAME.

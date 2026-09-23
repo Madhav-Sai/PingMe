@@ -263,18 +263,28 @@ class StateTests(StateDirTestCase):
                          ["2026-01-01_00-00-02", "2026-01-01_00-00-03", "2026-01-01_00-00-04"])
         self.assertEqual((snapshots[-1] / "alive.txt").read_text(encoding="utf-8"), "10.0.0.1\n")
 
-    def test_names_only_report_lists_ip_and_hostname(self) -> None:
+    def test_report_lists_live_hosts_only_with_notes(self) -> None:
+        base = {"ttl": "64", "rtt": "1.2", "loss": "0%", "os_guess": "Likely Unix (≤64)", "mac": "", "vendor": ""}
         records = [
-            {"host": "web01", "ip": "10.0.0.1", "name": ""},
-            {"host": "web01", "ip": "10.0.0.1", "name": ""},
-            {"host": "10.0.0.2", "ip": "10.0.0.2", "name": "printer.lan"},
-            {"host": "gone", "ip": "UNRESOLVED", "name": ""},
+            {**base, "host": "web01", "ip": "10.0.0.1", "status": "REACHABLE", "method": "ICMP", "name": ""},
+            {**base, "host": "www", "ip": "10.0.0.1", "status": "REACHABLE", "method": "ICMP", "name": ""},
+            {**base, "host": "10.0.0.2", "ip": "10.0.0.2", "status": "REACHABLE", "method": "ARP/ND", "name": "cam.lan",
+             "ttl": "?", "rtt": "-", "mac": "aa:bb:cc:00:00:02", "vendor": "Private (randomized MAC)"},
+            {**base, "host": "db01", "ip": "10.0.0.3", "status": "NO RESPONSE", "method": "-", "name": ""},
+            {**base, "host": "gone", "ip": "UNRESOLVED", "status": "UNRESOLVED", "method": "-", "name": ""},
         ]
-        table = pingme._names_table(records, "T")
-        self.assertIn("| IP ADDRESS | HOSTNAME    |", table)
-        self.assertEqual(table.count("web01"), 1)
-        self.assertIn("printer.lan", table)
-        self.assertNotIn("UNRESOLVED", table)
+        report = pingme.render_hosts_report(records, {"scope": "hosts.txt", "list_missing": True})
+        live = report.split("LIVE HOSTS", 1)[1].split("IN-SCOPE", 1)[0]
+        self.assertIn("web01, www", live)
+        self.assertEqual(live.count("10.0.0.1"), 1)
+        self.assertNotIn("10.0.0.3", live)
+        self.assertIn("ARP reply (ICMP blocked)", live)
+        self.assertIn("db01 (10.0.0.3)", report.split("WITHOUT RESPONSE", 1)[1])
+        self.assertIn("UNRESOLVED NAMES (1)", report)
+        self.assertIn("randomized", report.split("NOTES", 1)[1])
+        names = pingme.render_hosts_report(records, {"scope": "hosts.txt"}, names_only=True)
+        self.assertIn("| # | IP ADDRESS | HOSTNAME   |", names)
+        self.assertNotIn("DETECTED BY", names)
 
     def test_legacy_cwd_state_is_still_read(self) -> None:
         legacy = Path(self._tmp.name) / "legacy"
